@@ -1,0 +1,6 @@
+node_modules/
+runs/
+bench.config.json
+*.local.json
+secrets*
+.env

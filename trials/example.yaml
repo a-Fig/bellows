@@ -1,0 +1,20 @@
+# bellows trial spec — see src/types.ts (TrialSpec) for the full schema.
+trial: keel-vs-naive-easy1
+problems: easy-1
+model: token-router:deepseek/deepseek-v4-flash
+thinkingLevel: medium
+budget: 70000
+protectTokens: 20000
+arms:
+  - conductor: keel
+  - conductor: compaction-naive
+seeds: 3
+caps:
+  costUsd: 5
+  turns: 200
+  minutes: 90
+parallel: 3
+room:
+  # until the agent-trials room-create endpoint is deployed, list room ids:
+  pool: []
+  create: false

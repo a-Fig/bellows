@@ -1,0 +1,24 @@
+{
+  "name": "bellows",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Conductor benchmarking rig for Accordion: parallel pi runs, full harness telemetry, A/B trials on agent-trials SlopCode.",
+  "type": "module",
+  "bin": {
+    "bellows": "./bin/bellows.mjs"
+  },
+  "scripts": {
+    "test": "vitest run"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "ws": "^8.18.0",
+    "yaml": "^2.5.0"
+  },
+  "devDependencies": {
+    "vite-node": "^2.1.0",
+    "vitest": "^2.1.0"
+  }
+}
