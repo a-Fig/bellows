@@ -1,0 +1,22 @@
+# First live smoke trial: one arm, one seed, builtin conductor (deterministic,
+# no LLM cost in the conductor itself), tight caps. Proves the whole pipeline:
+# pi RPC + accordion extension + headless host + platform + collector + report.
+trial: smoke-builtin
+problems: xjq
+model: token-router:deepseek/deepseek-v4-flash
+thinkingLevel: medium
+budget: 25000
+protectTokens: 10000
+arms:
+  - conductor: builtin
+seeds: 1
+caps:
+  costUsd: 1.5
+  turns: 60
+  minutes: 30
+parallel: 1
+room:
+  pool:
+    - 882d0ab6-772a-4ee1-9cd4-27cd35824491   # bellows-smoke-1
+    - 7c305b25-4c75-4ade-91d2-ed4f58f6ce35   # bellows-smoke-2
+  create: false

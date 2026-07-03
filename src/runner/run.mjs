@@ -22,6 +22,7 @@ import { harvestLeaderboard, normalizeLabel } from "./platform.mjs";
 
 const STALL_TIMEOUT_MS = 10 * 60 * 1000; // 10 min without any event
 const STATS_POLL_MIN_INTERVAL_MS = 5_000; // don't hammer get_session_stats
+const MAX_FAILED_STATS_POLLS = 6; // ~30s+ of cost blindness -> stop the run
 
 /**
  * Execute one run end to end.
@@ -88,6 +89,9 @@ export async function executeRun(args) {
       PI_CODING_AGENT_DIR: agentDir,
       ACCORDION_HOME: accordionHome,
     };
+    // A parent-shell PI_CODING_AGENT_SESSION_DIR would redirect the session
+    // JSONL outside agentDir and blind the collector — force the default layout.
+    delete piEnv.PI_CODING_AGENT_SESSION_DIR;
     pi = new PiRpc({ piCommand: "pi", cwd: workspaceDir, env: piEnv }).start();
 
     const piLog = fs.createWriteStream(path.join(runDir, "pi-rpc.log"), { flags: "a" });
@@ -240,6 +244,7 @@ function driveUntilDone({ pi, spec, log, label }) {
       resolve({ status, statusDetail });
     };
 
+    let failedStatsPolls = 0;
     const maybePollCost = async () => {
       if (statsInFlight) return;
       const now = Date.now();
@@ -249,7 +254,18 @@ function driveUntilDone({ pi, spec, log, label }) {
       const stats = await pi.getSessionStats();
       statsInFlight = false;
       if (settled) return;
-      if (stats && typeof stats.cost === "number" && stats.cost >= spec.caps.costUsd) {
+      if (!stats || typeof stats.cost !== "number") {
+        // The cost cap must never silently disable itself: after repeated failed
+        // polls we cannot see spend, so stop the run instead of running capless.
+        failedStatsPolls++;
+        log(`[${label}] WARN: get_session_stats gave no cost (${failedStatsPolls} consecutive)`);
+        if (failedStatsPolls >= MAX_FAILED_STATS_POLLS) {
+          finish("error", `cost cap blind: ${failedStatsPolls} consecutive failed stats polls`);
+        }
+        return;
+      }
+      failedStatsPolls = 0;
+      if (stats.cost >= spec.caps.costUsd) {
         log(`[${label}] cost cap hit: $${stats.cost.toFixed(4)} >= $${spec.caps.costUsd}`);
         finish("aborted-cost", `cost $${stats.cost.toFixed(4)} >= cap $${spec.caps.costUsd}`);
       }

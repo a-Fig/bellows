@@ -70,8 +70,12 @@ describe("buildSettings", () => {
       thinkingLevel: "medium",
       accordionRepo: "C:/acc",
     });
-    expect(s.provider).toBe("token-router");
-    expect(s.model).toBe("deepseek/deepseek-v4-flash");
+    // pi reads defaultProvider/defaultModel (settings-manager.d.ts); a top-level
+    // provider/model key is silently ignored and pi falls back to any keyed model.
+    expect(s.defaultProvider).toBe("token-router");
+    expect(s.defaultModel).toBe("deepseek/deepseek-v4-flash");
+    expect(s.provider).toBeUndefined();
+    expect(s.model).toBeUndefined();
     expect(s.defaultThinkingLevel).toBe("medium");
     expect(s.compaction).toEqual({ enabled: false });
     expect(s.extensions[0]).toContain("extension/accordion.ts");

@@ -68,9 +68,12 @@ export function renderClient(clientTmpl, base, apiKey) {
  */
 export function buildSettings({ model, thinkingLevel, accordionRepo }) {
   const { provider, modelId } = splitModel(model);
+  // pi's Settings has no top-level provider/model keys — findInitialModel reads
+  // defaultProvider/defaultModel (settings-manager.d.ts). Wrong keys are silently
+  // ignored and pi falls back to "first model with a valid API key".
   return {
-    provider,
-    model: modelId,
+    defaultProvider: provider,
+    defaultModel: modelId,
     defaultThinkingLevel: thinkingLevel,
     compaction: { enabled: false },
     extensions: [path.join(accordionRepo, "extension", "accordion.ts").split(path.sep).join("/")],

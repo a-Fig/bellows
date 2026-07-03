@@ -4,6 +4,12 @@ import path from "node:path";
 /**
  * Recursively find all .json files under dir.
  */
+/**
+ * Per-run artifact dirs never contain RunRecords, and agent/ holds copied pi
+ * credentials (auth.json, models.json) — don't even read those into memory.
+ */
+const SKIP_DIRS = new Set(["agent", "workspace", "accordion-home", "node_modules"]);
+
 async function walkJsonFiles(dir) {
   let entries;
   try {
@@ -15,6 +21,7 @@ async function walkJsonFiles(dir) {
   for (const entry of entries) {
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
+      if (SKIP_DIRS.has(entry.name)) continue;
       out.push(...(await walkJsonFiles(full)));
     } else if (entry.isFile() && entry.name.endsWith(".json")) {
       out.push(full);

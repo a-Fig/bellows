@@ -264,8 +264,8 @@ export function planDryRun(spec, config) {
   // settings.json (redacted) — same for every run of this trial.
   const { provider, modelId } = splitModelSafe(spec.model);
   const settings = {
-    provider,
-    model: modelId,
+    defaultProvider: provider,
+    defaultModel: modelId,
     defaultThinkingLevel: spec.thinkingLevel,
     compaction: { enabled: false },
     extensions: [path.join(config.accordionRepo, "extension", "accordion.ts").split(path.sep).join("/")],

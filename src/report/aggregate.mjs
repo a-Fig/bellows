@@ -14,7 +14,19 @@ export function conductorOf(run) {
   return run.fingerprint?.conductorId ?? "unknown";
 }
 
+/**
+ * A run without a platform row can't contribute score data. Note the distinct
+ * cases: cap-aborted runs (status aborted-*) AND completed runs whose
+ * leaderboard harvest failed (platform outage). Render labels them differently
+ * via `scorelessKind`, but both are excluded from checkpoint aggregates.
+ */
 export const isAborted = (run) => run.platform === null;
+
+/** Why a run has no score: "aborted" | "harvest-failed" | null (has a score). */
+export const scorelessKind = (run) => {
+  if (run.platform !== null) return null;
+  return run.status === "completed" ? "harvest-failed" : "aborted";
+};
 
 /**
  * Aggregate a group's runs into one row per conductor.

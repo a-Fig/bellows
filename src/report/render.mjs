@@ -1,6 +1,6 @@
 import { esc, fmtNum, fmtUsd, fmtPct, fmtDuration, fmtTs } from "./format.mjs";
 import { turnSparkline, budgetLineChart } from "./svg.mjs";
-import { aggregateGroup, isAborted } from "./aggregate.mjs";
+import { aggregateGroup, isAborted, scorelessKind } from "./aggregate.mjs";
 import { HARD_FIELDS, SOFT_FIELDS } from "./grouping.mjs";
 import { REPORT_CSS } from "./css.mjs";
 
@@ -88,7 +88,9 @@ function renderRunDetail(run) {
   const aborted = isAborted(run);
   const statusClass = `status-${run.status}`;
   const scoreText = aborted
-    ? `<span class="badge badge-aborted">harness telemetry only — no platform score</span>`
+    ? scorelessKind(run) === "harvest-failed"
+      ? `<span class="badge badge-aborted">completed but score harvest failed — harness telemetry only</span>`
+      : `<span class="badge badge-aborted">harness telemetry only — no platform score</span>`
     : `checkpoints ${fmtNum(run.platform.checkpointsSolved)}/${fmtNum(run.platform.checkpointsAttempted)}`;
 
   return `<details class="run-detail">
