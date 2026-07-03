@@ -1,0 +1,81 @@
+/**
+ * Aggregation of runs within a comparison group, bucketed per conductor.
+ */
+
+export function median(nums) {
+  const xs = nums.filter((n) => typeof n === "number" && Number.isFinite(n)).sort((a, b) => a - b);
+  if (xs.length === 0) return null;
+  const mid = Math.floor(xs.length / 2);
+  return xs.length % 2 === 0 ? (xs[mid - 1] + xs[mid]) / 2 : xs[mid];
+}
+
+/** Conductor id a run belongs to — from fingerprint.conductorId. */
+export function conductorOf(run) {
+  return run.fingerprint?.conductorId ?? "unknown";
+}
+
+export const isAborted = (run) => run.platform === null;
+
+/**
+ * Aggregate a group's runs into one row per conductor.
+ * Score aggregates (checkpoints solved/attempted) only consider runs with
+ * a non-null platform result; cost/token/wallclock aggregates include all
+ * runs, including aborted ones ("harness telemetry only").
+ */
+export function aggregateGroup(group) {
+  const byConductor = new Map();
+  for (const run of group.runs) {
+    const cid = conductorOf(run);
+    if (!byConductor.has(cid)) byConductor.set(cid, []);
+    byConductor.get(cid).push(run);
+  }
+
+  const rows = [];
+  for (const [conductorId, runs] of byConductor) {
+    const scored = runs.filter((r) => !isAborted(r));
+    const completed = runs.filter((r) => r.status === "completed");
+
+    const checkpointsSolved = median(scored.map((r) => r.platform.checkpointsSolved));
+    const checkpointsAttempted = median(scored.map((r) => r.platform.checkpointsAttempted));
+    const costUsd = median(runs.map((r) => r.usage?.costUsd));
+    const totalTokens = median(runs.map((r) => r.usage?.totalTokens));
+    const wallClockS = median(runs.map((r) => r.timing?.wallClockS));
+
+    const cacheShares = runs
+      .map((r) => {
+        const u = r.usage;
+        if (!u) return null;
+        const denom = u.input + u.cacheRead + u.cacheWrite;
+        return denom > 0 ? u.cacheRead / denom : null;
+      })
+      .filter((v) => v !== null);
+    const cacheReadShare = median(cacheShares);
+
+    rows.push({
+      conductorId,
+      runsCount: runs.length,
+      scoredCount: scored.length,
+      abortedCount: runs.length - scored.length,
+      completionRate: runs.length > 0 ? completed.length / runs.length : null,
+      checkpointsSolved,
+      checkpointsAttempted,
+      costUsd,
+      totalTokens,
+      wallClockS,
+      cacheReadShare,
+      runs,
+    });
+  }
+
+  // Winner-ish ordering: checkpoints solved desc, then cost asc (nulls last).
+  rows.sort((a, b) => {
+    const as = a.checkpointsSolved ?? -Infinity;
+    const bs = b.checkpointsSolved ?? -Infinity;
+    if (bs !== as) return bs - as;
+    const ac = a.costUsd ?? Infinity;
+    const bc = b.costUsd ?? Infinity;
+    return ac - bc;
+  });
+
+  return rows;
+}
