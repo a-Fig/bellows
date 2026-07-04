@@ -139,6 +139,8 @@ export function validateTrialSpec(raw) {
     if (!Number.isFinite(caps.costUsd) || caps.costUsd <= 0) errs.push("caps.costUsd: required positive number");
     if (!Number.isInteger(caps.turns) || caps.turns <= 0) errs.push("caps.turns: required positive integer");
     if (!Number.isFinite(caps.minutes) || caps.minutes <= 0) errs.push("caps.minutes: required positive number");
+    if (caps.totalTokens !== undefined && (!Number.isInteger(caps.totalTokens) || caps.totalTokens <= 0))
+      errs.push("caps.totalTokens: must be a positive integer when set");
   }
 
   const room = raw.room;
@@ -166,7 +168,7 @@ export function validateTrialSpec(raw) {
     protectTokens: raw.protectTokens,
     arms: raw.arms.map((a) => ({ conductor: a.conductor, name: a.name || a.conductor })),
     seeds: raw.seeds || 1,
-    caps: { costUsd: caps.costUsd, turns: caps.turns, minutes: caps.minutes },
+    caps: { costUsd: caps.costUsd, turns: caps.turns, minutes: caps.minutes, totalTokens: caps.totalTokens },
     parallel: raw.parallel || 1,
     room: {
       pool: Array.isArray(room.pool) ? room.pool.slice() : [],

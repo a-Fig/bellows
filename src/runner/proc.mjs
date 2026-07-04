@@ -50,8 +50,12 @@ export function spawnSafe(command, args, options = {}) {
   const resolved = resolveCommand(command);
   if (process.platform === "win32" && resolved.toLowerCase().endsWith(".cmd")) {
     // Run the .cmd through cmd.exe with an explicitly quoted command line.
+    // With /s, cmd strips the FIRST and LAST quote chars of the line after /c —
+    // a line with several quoted segments (e.g. "C:\Program Files\...\npx.cmd"
+    // ... "C:\...\host.jsonl") gets mangled unless the whole line is wrapped in
+    // one extra outer quote pair, which /s then strips verbatim.
     const line = [winQuote(resolved), ...args.map(winQuote)].join(" ");
-    return spawn(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", line], {
+    return spawn(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", `"${line}"`], {
       ...options,
       shell: false,
       windowsVerbatimArguments: true,

@@ -14,6 +14,7 @@ caps:
   costUsd: 1.5
   turns: 60
   minutes: 30
+  totalTokens: 1500000   # backstop: token-router prices at $0, dollar cap is inert
 parallel: 1
 room:
   pool:

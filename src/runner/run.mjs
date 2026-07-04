@@ -145,6 +145,24 @@ export async function executeRun(args) {
     const s = collectSession(sessionFile);
     usage = s.usage;
     turns = s.turns;
+    // Custom providers (e.g. token-router entries with no cost rates) make pi
+    // price every message at $0. If the config carries fallback pricing for
+    // this model, estimate the real spend and mark it as an estimate.
+    if (usage.costUsd === 0 && usage.totalTokens > 0) {
+      const modelId = spec.model.slice(spec.model.indexOf(":") + 1);
+      const p = config.pricing?.[modelId];
+      if (p) {
+        usage.costUsd =
+          (usage.input / 1e6) * (p.inputPerMtok ?? 0) +
+          (usage.output / 1e6) * (p.outputPerMtok ?? 0) +
+          (usage.cacheRead / 1e6) * (p.cacheReadPerMtok ?? 0) +
+          (usage.cacheWrite / 1e6) * (p.cacheWritePerMtok ?? 0);
+        usage.costEstimated = true;
+        log(`[${label}] provider priced run at $0 — estimated $${usage.costUsd.toFixed(4)} from config.pricing`);
+      } else {
+        log(`[${label}] WARN: provider priced ${usage.totalTokens} tokens at $0 and no config.pricing entry for "${modelId}" — cost data is missing`);
+      }
+    }
   } catch (e) {
     log(`[${label}] session collect error: ${e.message}`);
     usage = emptyUsage();
@@ -245,6 +263,7 @@ function driveUntilDone({ pi, spec, log, label }) {
     };
 
     let failedStatsPolls = 0;
+    let warnedZeroCost = false;
     const maybePollCost = async () => {
       if (statsInFlight) return;
       const now = Date.now();
@@ -268,6 +287,18 @@ function driveUntilDone({ pi, spec, log, label }) {
       if (stats.cost >= spec.caps.costUsd) {
         log(`[${label}] cost cap hit: $${stats.cost.toFixed(4)} >= $${spec.caps.costUsd}`);
         finish("aborted-cost", `cost $${stats.cost.toFixed(4)} >= cap $${spec.caps.costUsd}`);
+        return;
+      }
+      // Zero-priced custom providers make the dollar cap inert — the token cap
+      // is the backstop. Warn once so a capless run is never silent.
+      const totalTokens = stats.tokens && typeof stats.tokens.total === "number" ? stats.tokens.total : null;
+      if (stats.cost === 0 && totalTokens !== null && totalTokens > 100_000 && !warnedZeroCost) {
+        warnedZeroCost = true;
+        log(`[${label}] WARN: provider reports $0 at ${totalTokens} tokens — dollar cap is inert${spec.caps.totalTokens ? "" : " and no caps.totalTokens is set"}`);
+      }
+      if (spec.caps.totalTokens && totalTokens !== null && totalTokens >= spec.caps.totalTokens) {
+        log(`[${label}] token cap hit: ${totalTokens} >= ${spec.caps.totalTokens}`);
+        finish("aborted-cost", `totalTokens ${totalTokens} >= cap ${spec.caps.totalTokens}`);
       }
     };
 
@@ -329,8 +360,10 @@ function driveUntilDone({ pi, spec, log, label }) {
 
 /** Spawn the headless host child pointing at the shared accordion home. */
 export function spawnHost({ config, arm, spec, accordionHome, hostTelemetryFile, runDir, log }) {
+  // Invoke vite-node's entry directly with node.exe — no npx/.cmd shim, so
+  // Windows paths with spaces never pass through cmd.exe quote handling.
   const hostArgs = [
-    "vite-node",
+    path.join(BELLOWS_ROOT, "node_modules", "vite-node", "vite-node.mjs"),
     "--config",
     "vite-node.config.ts",
     "src/host/main.ts",
@@ -347,7 +380,7 @@ export function spawnHost({ config, arm, spec, accordionHome, hostTelemetryFile,
     hostTelemetryFile,
   ];
   const hostLog = fs.createWriteStream(path.join(runDir, "host-stderr.log"), { flags: "a" });
-  const child = spawnSafe("npx", hostArgs, {
+  const child = spawnSafe(process.execPath, hostArgs, {
     cwd: BELLOWS_ROOT,
     env: { ...process.env },
     windowsHide: true,

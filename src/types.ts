@@ -42,6 +42,12 @@ export interface TrialSpec {
     turns: number;
     /** Wall-clock ceiling per run, minutes. */
     minutes: number;
+    /**
+     * Hard total-token ceiling per run. The backstop cap when the provider
+     * prices at $0 (custom models.json entries without cost rates make the
+     * dollar cap inert). Strongly recommended for token-router models.
+     */
+    totalTokens?: number;
   };
   /** Max runs in flight at once. Default 1. */
   parallel?: number;
@@ -131,6 +137,8 @@ export interface UsageTotals {
   cacheWrite: number;
   totalTokens: number;
   costUsd: number;
+  /** True when costUsd came from config.pricing (provider reported $0). */
+  costEstimated?: boolean;
   assistantTurns: number;
   toolCalls: number;
 }
@@ -209,4 +217,12 @@ export interface BenchConfig {
   piAgentDir?: string;
   /** Output root for run records + artifacts. Default: ./runs. */
   runsDir?: string;
+  /**
+   * Fallback $/Mtok rates by modelId, used when pi reports $0 cost (custom
+   * providers without cost rates). Resulting costUsd is marked costEstimated.
+   */
+  pricing?: Record<
+    string,
+    { inputPerMtok?: number; outputPerMtok?: number; cacheReadPerMtok?: number; cacheWritePerMtok?: number }
+  >;
 }
