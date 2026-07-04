@@ -85,7 +85,13 @@ export class RemoteConductorClient implements Conductor {
 	private lastRev = 0;
 	private greeted = false;
 	private suppressUpdate = false;
-	/** True after an unexpected drop — conduct() then holds (never fabricates state). */
+	/**
+	 * True after an unexpected drop. (m7/m6, PM decision): conduct() no longer
+	 * holds the last state once dead — `desired` is cleared to `[]` on the same
+	 * disconnect, so a dead conductor's last fold batch cannot outlive it. Kept
+	 * as a readable flag mirroring Accordion's RemoteRunner.isDead for tests and
+	 * any future caller that wants to distinguish "dead" from "never attached."
+	 */
 	private _dead = false;
 	get isDead(): boolean {
 		return this._dead;
@@ -175,11 +181,20 @@ export class RemoteConductorClient implements Conductor {
 			if (this.ws !== ws) return;
 			this.ws = null;
 			if (!this.manualClose) {
-				// Unexpected drop: hold the last state rather than fabricating raw or stale
-				// commands. The host's main loop decides whether to detach/continue the run —
-				// we must NEVER throw or crash the pi run because a conductor process died.
+				// Unexpected drop (m7/m6, PM decision): mirror Accordion's RemoteRunner --
+				// clear the desired state to [] so conduct() reports raw rather than
+				// perpetuating a stale fold against a dead conductor, and surface a loud,
+				// non-error info event (never buried in errors[]) marking the death point.
 				this._dead = true;
-				this.opts.telemetry.emit({ t: "error", at: Date.now(), message: `conductor "${this.id}" disconnected` });
+				this.desired = [];
+				this.opts.telemetry.emit({
+					t: "info",
+					at: Date.now(),
+					message: `conductor "${this.id}" died -- cleared to raw`,
+				});
+				// Re-run the conductor pass immediately so the store reflects raw NOW,
+				// exactly like RemoteRunner's disconnect handler (this.store.refold()).
+				this.host?.requestRerun();
 				if (!this.greeted) {
 					this.connectedReject?.(new Error(`conductor "${this.id}" closed before greeting`));
 				}
@@ -222,10 +237,11 @@ export class RemoteConductorClient implements Conductor {
 				this.greeted = true;
 				// The host-level "attach" HostEvent is emitted once by main.ts when the store
 				// itself attaches (pi hello). This is the LATER, conductor-side greet — surface
-				// it as an informational error-channel note (no dedicated HostEvent kind for it)
-				// so it is never silently dropped from telemetry.
+				// it as a non-error info note (M3: greet/status/disconnect are healthy, chatty
+				// events, not failures — folding them into errors[] made a healthy run look
+				// error-laden) so it is recorded but never counted as an error.
 				this.opts.telemetry.emit({
-					t: "error",
+					t: "info",
 					at: Date.now(),
 					message: `conductor "${this.id}" greeted: label=${this.label} locks=${(this.locks ?? []).join(",") || "(none)"} wants=${this.wants}`,
 				});
@@ -246,7 +262,7 @@ export class RemoteConductorClient implements Conductor {
 				break;
 			case "conductor/status":
 				this.opts.telemetry.emit({
-					t: "error", // status has no dedicated HostEvent kind; surface via message so it is never silently dropped
+					t: "info", // healthy chatty status note (M3) -- recorded, never counted as an error
 					at: Date.now(),
 					message: `status: ${m.text ?? ""}`,
 				});

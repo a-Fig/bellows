@@ -143,6 +143,50 @@ describe("spawnExternalConductor (echo-conductor fixture)", () => {
       }),
     ).rejects.toThrow(/no launch\.json found/);
   });
+
+  it("M2: rejects AND kills the spawned process when the heartbeat never appears", async () => {
+    const accordionHome = fs.mkdtempSync(path.join(tmpdir(), "bellows-exthome-"));
+    homes.push(accordionHome);
+    const runDir = fs.mkdtempSync(path.join(tmpdir(), "bellows-extrun-"));
+    homes.push(runDir);
+
+    // hang-conductor spawns fine but never writes a heartbeat file, so this hits
+    // the real CONDUCTOR_HEARTBEAT_TIMEOUT_MS (20s) path in waitForConductorHeartbeat.
+    let caught = null;
+    try {
+      await spawnExternalConductor({
+        config: { accordionRepo: FIXTURE_DIR },
+        conductorId: "hang-conductor",
+        accordionHome,
+        runDir,
+        log: () => {},
+        label: "test/hang/1",
+      });
+    } catch (e) {
+      caught = e;
+    }
+
+    expect(caught).toBeTruthy();
+    expect(caught.message).toMatch(/did not advertise a fresh heartbeat/);
+
+    // Before the M2 fix, spawnExternalConductor's caller (executeRun) never got a
+    // handle to the child on this rejection path, so nothing tore it down and the
+    // process leaked. The fix kills it (and, on win32, its subtree) before
+    // rethrowing and stamps the pid + post-kill exitCode onto the error so this
+    // is verifiable without reaching into module internals.
+    expect(typeof caught.killedPid).toBe("number");
+    expect(caught.killedExitCode).not.toBeNull();
+
+    // Cross-check against the OS: signaling the pid must now fail (ESRCH / no
+    // such process), proving it is genuinely dead, not just marked so.
+    let stillAlive = true;
+    try {
+      process.kill(caught.killedPid, 0);
+    } catch {
+      stillAlive = false;
+    }
+    expect(stillAlive, "the killed conductor pid must no longer exist").toBe(false);
+  }, 30_000);
 });
 
 describe("spawnHost — CLI arg contract for external vs in-process arms", () => {

@@ -7,7 +7,7 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSafe } from "./proc.mjs";
+import { spawnSafe, killTree } from "./proc.mjs";
 import { parseConductorArm } from "./config.mjs";
 
 /** Bellows repo root — the host's vite-node config and bench.config.json live here. */
@@ -79,6 +79,8 @@ export async function executeRun(args) {
   let host = null;
   /** @type {import("node:child_process").ChildProcess | null} */
   let externalConductor = null;
+  /** @type {import("node:fs").WriteStream | null} */
+  let externalConductorLog = null;
 
   try {
     const prov = provisionRun({
@@ -122,6 +124,7 @@ export async function executeRun(args) {
         label,
       });
       externalConductor = spawned.child;
+      externalConductorLog = spawned.conductorLog;
       conductorUrl = spawned.url;
     }
     if (arm !== "none") {
@@ -169,14 +172,25 @@ export async function executeRun(args) {
     }
     // The external conductor is killed AFTER the host so the host's WS close is a
     // clean session-end rather than racing a dropped conductor connection.
+    // m4: killTree so a conductor's own grandchildren (e.g. a Python probe) don't
+    // survive the run on win32, where a plain kill() only signals this one PID.
     try {
       if (externalConductor && externalConductor.exitCode === null && !externalConductor.killed) {
-        externalConductor.kill("SIGTERM");
+        killTree(externalConductor, "SIGTERM");
         await waitProc(externalConductor, 5_000);
-        if (externalConductor.exitCode === null) externalConductor.kill("SIGKILL");
+        if (externalConductor.exitCode === null) killTree(externalConductor, "SIGKILL");
       }
     } catch (e) {
       log(`[${label}] external conductor teardown error: ${e.message}`);
+    }
+    // n9 (adversarial review): close the conductor's log write stream on every
+    // teardown path — it was left open for the run's duration on the success path.
+    if (externalConductorLog) {
+      try {
+        await new Promise((resolve) => externalConductorLog.end(resolve));
+      } catch (e) {
+        log(`[${label}] external conductor log close error: ${e.message}`);
+      }
     }
   }
 
@@ -494,7 +508,19 @@ export function loadConductorLaunchSpec(accordionRepo, conductorId) {
   return { dir, launch };
 }
 
-/** Bind to port 0, read back the OS-assigned free port, then close. */
+/**
+ * Bind to port 0, read back the OS-assigned free port, then close.
+ *
+ * m5 (adversarial review): this has an inherent TOCTOU race — the port is free
+ * at the instant we close our probe socket, but nothing reserves it between
+ * that close and the conductor process's own bind a moment later. Another
+ * process (or a concurrent `parallel: N` run on this machine) can grab it
+ * first. We accept the race rather than engineering around it: a lost race
+ * surfaces cleanly as `waitForConductorHeartbeat`'s timeout (M2 now guarantees
+ * that failure kills the spawned process rather than leaking it), not a silent
+ * hang or a crash. See TUTORIAL.md's external-conductors section for the
+ * user-facing note.
+ */
 export function getFreePort() {
   return new Promise((resolve, reject) => {
     const srv = net.createServer();
@@ -518,7 +544,7 @@ export function getFreePort() {
  * @param {string} args.runDir
  * @param {(m:string)=>void} args.log
  * @param {string} args.label
- * @returns {Promise<{child: import("node:child_process").ChildProcess, url: string}>}
+ * @returns {Promise<{child: import("node:child_process").ChildProcess, url: string, conductorLog: import("node:fs").WriteStream}>}
  */
 export async function spawnExternalConductor({ config, conductorId, accordionHome, runDir, log, label }) {
   const { dir, launch } = loadConductorLaunchSpec(config.accordionRepo, conductorId);
@@ -551,14 +577,38 @@ export async function spawnExternalConductor({ config, conductorId, accordionHom
   });
 
   const heartbeatPath = path.join(accordionHome, ".accordion", "conductors", `${conductorId}.json`);
-  const url = await waitForConductorHeartbeat({
-    heartbeatPath,
-    conductorId,
-    child,
-    getSpawnErr: () => spawnErr,
-  });
-  log(`[${label}] external conductor "${conductorId}" ready at ${url}`);
-  return { child, url };
+  try {
+    const url = await waitForConductorHeartbeat({
+      heartbeatPath,
+      conductorId,
+      child,
+      getSpawnErr: () => spawnErr,
+    });
+    log(`[${label}] external conductor "${conductorId}" ready at ${url}`);
+    // Success: the conductor keeps running for the rest of the trial, so the log
+    // stream must stay open — hand it back so the caller can close it exactly
+    // once, alongside the process kill, when the run actually tears down (n9).
+    return { child, url, conductorLog };
+  } catch (e) {
+    // M2 (adversarial review): a heartbeat that never appears must not leave the
+    // spawned process orphaned — executeRun's finally block only tears down
+    // `externalConductor`, which is still null here because we haven't returned
+    // yet (the caller never got a handle to kill). Kill it ourselves before
+    // rethrowing so a conductor that hangs/crashes before advertising a heartbeat
+    // doesn't leak a process (and, on win32, its whole subtree — see killTree).
+    const pid = child.pid;
+    killTree(child, "SIGTERM");
+    await waitProc(child, 5_000);
+    if (child.exitCode === null) killTree(child, "SIGKILL");
+    // n9: this is the ONLY path where spawnExternalConductor itself owns
+    // teardown end to end, so close the log stream here before rethrowing.
+    await new Promise((resolve) => conductorLog.end(resolve));
+    // Expose the pid + exit state on the error so a caller/test can verify the
+    // process actually died rather than assuming it from a nonexistent handle.
+    e.killedPid = pid;
+    e.killedExitCode = child.exitCode;
+    throw e;
+  }
 }
 
 /** Poll a conductor's heartbeat JSON until it appears fresh, or throw on timeout/crash. */

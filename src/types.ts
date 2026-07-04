@@ -168,6 +168,11 @@ export type HostEvent =
   | { t: "plan"; at: number; rev: number; ops: number; groups: number }
   | { t: "complete"; at: number; costUsd: number | null; latencyMs: number }  // host.complete() relay use
   | { t: "error"; at: number; message: string }
+  // Non-error informational note (e.g. a remote conductor's greet/status, or a
+  // clean "died — cleared to raw" notice). Recorded for the report but NEVER
+  // folded into RunRecord.errors — a healthy chatty remote conductor should not
+  // read as error-laden. See M3/m7 in the adversarial review.
+  | { t: "info"; at: number; message: string }
   | { t: "detach"; at: number; reason: string };
 
 export interface ConductorTelemetry {
@@ -183,6 +188,8 @@ export interface ConductorTelemetry {
   /** Spend attributed to host.complete() calls (LLM conductors). */
   completeCostUsd: number;
   errors: string[];
+  /** Non-error informational notes (greet/status/disconnect, "died — cleared to raw", ...). */
+  infos: string[];
 }
 
 // ---------------------------------------------------------------------------

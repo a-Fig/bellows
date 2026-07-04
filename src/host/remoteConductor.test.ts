@@ -34,6 +34,7 @@ import { readFileSync, mkdtempSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { MockExtension, makeBlocks } from "./mock-extension.mjs";
+import { foldHostTelemetry } from "../runner/collect.mjs";
 
 const HOST_DIR = fileURLToPath(new URL(".", import.meta.url));
 const REPO_ROOT = path.resolve(HOST_DIR, "../..");
@@ -199,6 +200,12 @@ class FakeConductor {
 		this.nextCommands = null;
 	}
 
+	/** Send an arbitrary message to the host over the connected socket. */
+	sendRaw(msg: unknown): void {
+		if (!this.client) throw new Error("fake conductor: no client connected");
+		this.client.send(JSON.stringify(msg));
+	}
+
 	waitForUpdate(pred: (u: any) => boolean, ms: number): Promise<any> {
 		const existing = this.updates.find(pred);
 		if (existing) return Promise.resolve(existing);
@@ -225,6 +232,78 @@ class FakeConductor {
 		}
 	}
 }
+
+describe("B1 regression — a conductor that never becomes ready must not crash the host", () => {
+	it("host/client stays alive when the conductor accepts the WS connection then closes WITHOUT sending conductor/hello", async () => {
+		const home = mkdtempSync(path.join(tmpdir(), "bellows-remote-b1-nohelo-"));
+		const telemetryOut = path.join(home, "telemetry.jsonl");
+		const mock = await new MockExtension({ accordionHome: home }).start();
+
+		// A bare WS server that accepts the connection but never replies with
+		// conductor/hello, then closes it almost immediately — this is exactly the
+		// "close before greeting" rejection path in remoteConductor.ts's `ready`
+		// promise (~line 184). Before the B1 fix, main.ts never handled this
+		// rejection, so Node's unhandled-rejection default would kill the whole
+		// host process — which would kill the pi run.
+		const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+		servers.push(wss);
+		await new Promise((resolve) => wss.on("listening", resolve));
+		const port = (wss.address() as { port: number }).port;
+		const url = `ws://127.0.0.1:${port}`;
+		wss.on("connection", (ws) => {
+			// Never send conductor/hello — close right away.
+			ws.close();
+		});
+
+		const host = spawnHost({ accordionHome: home, conductorUrl: url, conductorId: "no-hello-conductor", budget: 30_000, protect: 5_000, telemetryOut });
+
+		try {
+			await waitFor(() => mock.client !== null, 60_000, "host <-pi extension connect");
+
+			// Give the close-before-greeting rejection plenty of time to fire and
+			// (pre-fix) crash the process.
+			await new Promise((r) => setTimeout(r, 1500));
+			expect(host.exitCode, "the host must still be alive after a conductor closes before greeting").toBeNull();
+
+			// The host must still be answering syncs — conduct() is pass-through
+			// (null/no commands applied) since the conductor never attached.
+			const r = mock.sync(makeBlocks(5), { full: true });
+			const p = await mock.waitForPlan(r, 8000);
+			expect(p.ops.length + p.groups.length).toBe(0);
+		} finally {
+			await mock.close().catch(() => {});
+		}
+	}, 30_000);
+
+	it("host/client stays alive on a dial timeout (nothing listening at the conductor URL)", async () => {
+		const home = mkdtempSync(path.join(tmpdir(), "bellows-remote-b1-timeout-"));
+		const telemetryOut = path.join(home, "telemetry.jsonl");
+		const mock = await new MockExtension({ accordionHome: home }).start();
+
+		// Bind then immediately close a port so nothing is listening there.
+		const probe = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+		await new Promise((resolve) => probe.on("listening", resolve));
+		const port = (probe.address() as { port: number }).port;
+		await new Promise((resolve) => probe.close(resolve));
+		const url = `ws://127.0.0.1:${port}`;
+
+		const host = spawnHost({ accordionHome: home, conductorUrl: url, conductorId: "unreachable-conductor", budget: 30_000, protect: 5_000, telemetryOut });
+
+		try {
+			await waitFor(() => mock.client !== null, 60_000, "host <-pi extension connect");
+
+			// Give the dial/connect-refused error (and, pre-fix, the crash) time to happen.
+			await new Promise((r) => setTimeout(r, 1500));
+			expect(host.exitCode, "the host must still be alive after a dial failure to an unreachable conductor").toBeNull();
+
+			const r = mock.sync(makeBlocks(5), { full: true });
+			const p = await mock.waitForPlan(r, 8000);
+			expect(p.ops.length + p.groups.length).toBe(0);
+		} finally {
+			await mock.close().catch(() => {});
+		}
+	}, 30_000);
+});
 
 describe("RemoteConductorClient — protocol unit tests (fake conductor server)", () => {
 	it("hello exchange: host/hello arrives, conductor greets, host attaches", async () => {
@@ -326,6 +405,46 @@ describe("RemoteConductorClient — protocol unit tests (fake conductor server)"
 			fake.close();
 		}
 	}, 30_000);
+
+	it("M3: a conductor/status message is recorded as t:'info', and folded RunRecord errors[] stays empty", async () => {
+		const home = mkdtempSync(path.join(tmpdir(), "bellows-remote-status-"));
+		const telemetryOut = path.join(home, "telemetry.jsonl");
+		const mock = await new MockExtension({ accordionHome: home }).start();
+		const fake = await new FakeConductor().start();
+
+		const host = spawnHost({ accordionHome: home, conductorUrl: fake.url, conductorId: "fake-conductor", budget: 30_000, protect: 5_000, telemetryOut });
+
+		try {
+			await waitFor(() => mock.client !== null, 60_000, "connect");
+			await waitFor(() => fake.hostHello !== null, 10_000, "greeted");
+
+			fake.sendRaw({ type: "conductor/status", text: "warming up the model" });
+
+			await waitFor(
+				() => readTelemetry(telemetryOut).some((e) => e.t === "info" && typeof e.message === "string" && e.message.includes("warming up the model")),
+				5000,
+				"info telemetry for conductor/status",
+			);
+
+			const tel = readTelemetry(telemetryOut);
+			// Never duplicated onto the error channel.
+			expect(tel.some((e) => e.t === "error" && typeof e.message === "string" && e.message.includes("warming up the model"))).toBe(false);
+
+			// The greet itself (already emitted before this point) must also be info, not error.
+			expect(tel.some((e) => e.t === "info" && typeof e.message === "string" && e.message.includes("greeted"))).toBe(true);
+			expect(tel.some((e) => e.t === "error" && typeof e.message === "string" && e.message.includes("greeted"))).toBe(false);
+
+			// End-to-end through the real collector: folding this telemetry stream into a
+			// ConductorTelemetry must leave errors[] empty even though the conductor has
+			// been plenty chatty (greet + status).
+			const folded = foldHostTelemetry(readFileSync(telemetryOut, "utf8"), "fake-conductor");
+			expect(folded.errors).toEqual([]);
+			expect(folded.infos.length).toBeGreaterThanOrEqual(2); // greet + status
+		} finally {
+			await mock.close().catch(() => {});
+			fake.close();
+		}
+	}, 30_000);
 });
 
 describe("RemoteConductorClient — end to end through the REAL AccordionStore", () => {
@@ -389,7 +508,7 @@ describe("RemoteConductorClient — end to end through the REAL AccordionStore",
 		}
 	}, 30_000);
 
-	it("holds the last applied state (never fabricates) when the conductor goes silent, and survives a disconnect without crashing the run", async () => {
+	it("holds the last applied state while the conductor is silent but still connected", async () => {
 		const home = mkdtempSync(path.join(tmpdir(), "bellows-remote-hold-"));
 		const telemetryOut = path.join(home, "telemetry.jsonl");
 		const mock = await new MockExtension({ accordionHome: home }).start();
@@ -413,10 +532,13 @@ describe("RemoteConductorClient — end to end through the REAL AccordionStore",
 				if (p.ops.some((o: any) => o.id === targetId)) folded = p;
 				else await new Promise((res) => setTimeout(res, 150));
 			}
-			expect(folded, "precondition: the block must be folded before we test the hold/disconnect").not.toBeNull();
+			expect(folded, "precondition: the block must be folded before we test the hold").not.toBeNull();
 
-			// The conductor goes silent (stops replying to context/update): the host must
-			// HOLD the last applied state, not clear it — the fold must still be on the wire.
+			// The conductor goes silent but stays CONNECTED (stops replying to
+			// context/update): the host must HOLD the last applied state, not clear
+			// it — the fold must still be on the wire. This is distinct from an
+			// actual WS drop (covered below and in the m7 test), which now clears to
+			// raw instead of holding.
 			fake.stopReplying();
 			let stillFolded = false;
 			for (let i = 0; i < 6; i++) {
@@ -425,19 +547,64 @@ describe("RemoteConductorClient — end to end through the REAL AccordionStore",
 				if (p.ops.some((o: any) => o.id === targetId)) stillFolded = true;
 				await new Promise((res) => setTimeout(res, 100));
 			}
-			expect(stillFolded, "a silent conductor must hold the last applied state").toBe(true);
+			expect(stillFolded, "a silent-but-connected conductor must hold the last applied state").toBe(true);
+		} finally {
+			await mock.close().catch(() => {});
+			fake.close();
+		}
+	}, 30_000);
 
-			// Now the conductor process disconnects entirely — the host must NOT crash the
-			// run; it should keep running (still answering syncs) rather than exiting.
+	it("m7/m6: an unexpected WS drop clears the desired state to raw, keeps the host alive, and emits an info (not error) death notice", async () => {
+		const home = mkdtempSync(path.join(tmpdir(), "bellows-remote-died-"));
+		const telemetryOut = path.join(home, "telemetry.jsonl");
+		const mock = await new MockExtension({ accordionHome: home }).start();
+		const fake = await new FakeConductor().start();
+
+		const host = spawnHost({ accordionHome: home, conductorUrl: fake.url, conductorId: "fake-conductor", budget: 30_000, protect: 5_000, telemetryOut });
+
+		try {
+			await waitFor(() => mock.client !== null, 60_000, "connect");
+			await waitFor(() => fake.hostHello !== null, 10_000, "greeted");
+
+			// Get a real fold batch applied first (the "connected conductor sends a
+			// fold batch" precondition from the required-tests list).
+			const blocks = makeBlocks(40);
+			const targetId = "r:call-0";
+			fake.replyWith([{ kind: "fold", ids: [targetId] }]);
+			mock.sync(blocks, { full: true });
+
+			let folded: any = null;
+			for (let i = 0; i < 12 && !folded; i++) {
+				const r = mock.sync([], { full: false });
+				const p = await mock.waitForPlan(r, 8000);
+				if (p.ops.some((o: any) => o.id === targetId)) folded = p;
+				else await new Promise((res) => setTimeout(res, 150));
+			}
+			expect(folded, "precondition: the block must be folded before the conductor dies").not.toBeNull();
+
+			// Now the conductor process disconnects entirely (WS drop) — the host must
+			// NOT crash the run; it should keep running (still answering syncs) rather
+			// than exiting, AND the store must clear back to raw (no fold survives).
 			fake.close();
 			await new Promise((res) => setTimeout(res, 500));
 			expect(host.exitCode).toBeNull();
-			const r = mock.sync([], { full: false });
-			const p = await mock.waitForPlan(r, 8000);
-			expect(p).toBeTruthy(); // the host is still alive and answering syncs
+
+			let clearedToRaw = false;
+			for (let i = 0; i < 10 && !clearedToRaw; i++) {
+				const r = mock.sync([], { full: false });
+				const p = await mock.waitForPlan(r, 8000);
+				if (!p.ops.some((o: any) => o.id === targetId)) clearedToRaw = true;
+				else await new Promise((res) => setTimeout(res, 150));
+			}
+			expect(clearedToRaw, "the fold must be cleared back to raw after the conductor dies").toBe(true);
 
 			const tel = readTelemetry(telemetryOut);
-			expect(tel.some((e) => e.t === "error" && typeof e.message === "string" && e.message.includes("disconnected"))).toBe(true);
+			// The death notice must be a non-error "info" event (M3/m7) — never folded
+			// into RunRecord.errors[] — and must name the "cleared to raw" semantics.
+			const deathNotice = tel.find((e) => e.t === "info" && typeof e.message === "string" && e.message.includes("cleared to raw"));
+			expect(deathNotice, "expected an info-level death notice mentioning 'cleared to raw'").toBeTruthy();
+			// And it must NOT also appear as an error-kind event.
+			expect(tel.some((e) => e.t === "error" && typeof e.message === "string" && e.message.includes("cleared to raw"))).toBe(false);
 		} finally {
 			await mock.close().catch(() => {});
 			fake.close();

@@ -78,7 +78,10 @@ What bellows does differently for an `external:<id>` arm:
    **A conductor with no `portEnv` binds its hardcoded default port and therefore
    cannot appear in more than one arm/run at a time on the same machine** — bellows
    logs a warning and runs it anyway (useful for a quick single-arm check, unsafe for
-   `parallel > 1` trials or two trials sharing a conductor).
+   `parallel > 1` trials or two trials sharing a conductor). Note the free-port pick
+   is TOCTOU: the port is only free at the instant bellows checks it, and another
+   process (or a concurrent `parallel: N` run) can grab it before the conductor binds.
+   A lost race surfaces as a clean heartbeat-timeout failure, not a hang or crash.
 4. It polls `<accordionHome>/.accordion/conductors/<id>.json` for a fresh heartbeat
    (the `ConductorEntry` shape from Accordion's `registry.ts`: `id`, `url`, `pid`,
    `heartbeatAt`, stale after 15s) for up to ~20s, then fails the run with a clear
@@ -88,7 +91,15 @@ What bellows does differently for an `external:<id>` arm:
    (conductor wire protocol v3; the conductor process hosts the server, same topology
    as Accordion's own remote-conductor support) rather than instantiating it in-process.
 6. The conductor process is killed alongside pi and the host when the run ends —
-   success, cap, crash, or teardown — so nothing is left running after a trial.
+   success, cap, crash, or teardown — so nothing is left running after a trial
+   (on Windows this is a `taskkill /T` process-tree kill, so a conductor's own
+   subprocesses — e.g. a GPU/Python probe — are reaped too, not just the direct child).
+7. **If the external conductor dies mid-run** (unexpected WS drop), the host clears
+   its desired state to raw — the run continues with unfolded context from that
+   point on, exactly as if no conductor were attached — and records a prominent
+   `"conductor died — cleared to raw"` telemetry note (with conductor id and
+   timestamp) so the death point is visible in the report and the run is never
+   silently left folding against a conductor that is no longer there.
 
 `test/fixtures/conductors/echo-conductor/` is a minimal reference implementation of
 this contract (folds the largest non-protected `tool_result` block; no GPU/Python

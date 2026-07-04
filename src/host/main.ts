@@ -258,6 +258,17 @@ async function main(): Promise<number> {
 			},
 		});
 		client.connect();
+		// B1 (adversarial review): `ready` rejects on dial exception, dial timeout,
+		// protocol mismatch, or close-before-greeting. Node kills the whole process on
+		// an unhandled rejection — that is EXACTLY the failure this design must never
+		// allow (a dead/misbehaving external conductor must never take down the host,
+		// which would take down the pi run with it). Route the rejection to telemetry
+		// and otherwise swallow it: remoteConductor.conduct() already returns `null`
+		// (pass-through / raw) whenever nothing has been applied, so a client that
+		// never gets past hello simply leaves the run on raw context.
+		client.ready.catch((e: Error) => {
+			tel.emit({ t: "error", at: Date.now(), message: `remote conductor "${client.id}" never became ready: ${e.message}` });
+		});
 		remoteConductor = client;
 		return client;
 	}
