@@ -189,6 +189,27 @@ and agent dir for forensics.
 Nothing here is Windows-specific: clone bellows + Accordion on the homeserver, `npm install`
 both, copy `~/.pi/agent` credentials, set the key env var, and the same commands work.
 
+Setup checklist, learned the hard way on the first real install (each item below was a
+separate live failure — the worker claims a run, fails it cleanly, and the platform shows
+the exact error, so work down this list when a fresh box fails its first run):
+
+1. **`piAgentDir` needs `models.json`, not just `auth.json`** — run provisioning hard-fails
+   with `Required credential models.json not found` without it. Copy both from a working
+   box, plus any provider keys the trial models need in `auth.json` (e.g. `tokenrouter`
+   for `token-router:*` models). Merge keys into an existing `auth.json`; don't overwrite.
+2. **`npm install` in BOTH `app/` and `extension/` of the Accordion clone** (and
+   `npx svelte-kit sync` in `app/`). The per-run pi loads
+   `<accordionRepo>/extension/accordion.ts` — a bare clone is missing `ws` and pi exits 1
+   with `Failed to load extension`. The `app/` install + sync is what lets conductor
+   advertisement compile `store.svelte.ts` under vite-node.
+3. **The bench Accordion clone is what runs, not the machine's other checkouts** — bellows
+   points pi at `bench.config.json → accordionRepo`; keep it a dedicated clone so
+   `pullBeforeClaim` never fights a browser-served install, and keep any *globally
+   registered* accordion extension (the machine's own `~/.pi/agent/settings.json`) at a
+   compatible commit — 50 commits stale caused wire-version confusion during bring-up.
+4. **No GPU → no `gpu-probe` cap** (and skip `external-conductors` unless the box has the
+   attention-folder Python probe stack). Trials that need them route to a capable worker.
+
 ## Worker mode (`bellows worker`)
 
 `bellows run` schedules a trial you already know the shape of. `bellows worker` is the other
