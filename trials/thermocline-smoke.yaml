@@ -1,0 +1,22 @@
+# Thermocline external-conductor smoke: first end-to-end run of the WS driver
+# (launch.json spawn -> heartbeat discovery -> protocol v3 -> folds on the pi wire).
+# Budget deliberately small (20k) so the wire crosses thermocline's 80% warm-water
+# line and the HOLD -> PREPARE -> COMMIT machine actually fires. Single arm, single
+# instance: no portEnv needed (main checkout predates the portEnv manifests).
+trial: thermocline-smoke
+problems: xjq
+model: token-router:deepseek/deepseek-v4-flash
+thinkingLevel: medium
+budget: 20000
+protectTokens: 5000
+arms:
+  - conductor: external:thermocline
+seeds: 1
+caps:
+  costUsd: 2            # inert for token-router ($0 pricing) — validation requires it
+  turns: 40
+  minutes: 25
+  totalTokens: 2000000
+parallel: 1
+room:
+  create: true
