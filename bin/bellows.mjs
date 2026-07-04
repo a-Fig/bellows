@@ -7,9 +7,11 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { loadBenchConfig, loadTrialSpec } from "../src/runner/config.mjs";
 import { runTrial, planDryRun, resolveRunsRoot } from "../src/runner/schedule.mjs";
 import { runWorkerLoop } from "../src/worker/loop.mjs";
+import { makeShutdownSignalHandler } from "../src/worker/shutdownSignal.mjs";
 
 function log(msg) {
   process.stderr.write(msg + "\n");
@@ -149,17 +151,21 @@ async function cmdWorker(args) {
       `  "worker": { "platformUrl": "...", "name": "<worker-name>", "caps": ["in-process"] }`);
     process.exit(2);
   }
-  const apiKey = process.env.AGENT_TRIALS_API_KEY;
+  // m4 (adversarial review, PM decision): honor config.platformApiKeyEnv exactly
+  // like cmdRun does, rather than hardcoding AGENT_TRIALS_API_KEY. The intended
+  // deployment is the same key/account creating rooms and running the worker,
+  // so both paths must resolve the key the same way — a config pointing
+  // platformApiKeyEnv at a different env var previously had no effect on the
+  // worker, silently falling back to a var that may not even be set.
+  const apiKey = process.env[config.platformApiKeyEnv];
   if (!apiKey) {
-    log(`error: AGENT_TRIALS_API_KEY is not set. Export it (never commit it) before running the worker.`);
+    log(`error: platform api key env var ${config.platformApiKeyEnv} is not set. ` +
+      `Export it (never commit it) before running the worker.`);
     process.exit(2);
   }
 
   const abortController = new AbortController();
-  const onSignal = (sig) => {
-    log(`[worker] received ${sig} — finishing the in-flight run (if any) then exiting`);
-    abortController.abort();
-  };
+  const onSignal = makeShutdownSignalHandler({ abortController, log });
   process.on("SIGINT", () => onSignal("SIGINT"));
   process.on("SIGTERM", () => onSignal("SIGTERM"));
 
@@ -193,7 +199,14 @@ async function main() {
   }
 }
 
-main().catch((e) => {
-  log(`fatal: ${e.stack || e.message}`);
-  process.exit(1);
-});
+// Only run the CLI when this file is the actual entrypoint, not when some
+// future test or tool imports it. Node-20-compatible equivalent of
+// `import.meta.main` (added in Node 24, after this package's engines >=20
+// floor) — compare the resolved module path against argv[1].
+const isEntrypoint = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+if (isEntrypoint) {
+  main().catch((e) => {
+    log(`fatal: ${e.stack || e.message}`);
+    process.exit(1);
+  });
+}

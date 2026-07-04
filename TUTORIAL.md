@@ -242,8 +242,13 @@ Add a `worker` section to `bench.config.json`:
 - **`parallel`** — reserved for running multiple claimed runs concurrently. Only `1` is
   supported today; any other value is rejected at startup with a clear error.
 
-The API key is **never** read from `bench.config.json` — only from the
-`AGENT_TRIALS_API_KEY` environment variable, exactly like `bellows run`.
+The API key **value** is never read from `bench.config.json` — only from the
+environment variable named by the top-level `platformApiKeyEnv` field
+(`AGENT_TRIALS_API_KEY` in the example config above), exactly like `bellows run`'s
+`platformApiKeyEnv`-driven lookup. (Fixed in an adversarial-review pass — the
+worker used to hardcode `AGENT_TRIALS_API_KEY` regardless of what
+`platformApiKeyEnv` said; harmless as long as you never repoint that field, but
+a footgun otherwise.)
 
 ### What the worker advertises on every claim
 
