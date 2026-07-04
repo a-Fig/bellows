@@ -171,6 +171,7 @@ export function foldHostTelemetry(text, fallbackConductorId = "") {
   /** @type {Array<[number,number,number]>} */
   const budgetSeries = [];
   const errors = [];
+  const infos = [];
 
   for (const e of events) {
     switch (e.t) {
@@ -197,6 +198,11 @@ export function foldHostTelemetry(text, fallbackConductorId = "") {
       case "error":
         if (e.message) errors.push(String(e.message));
         break;
+      case "info":
+        // M3: healthy chatty events (greet/status/disconnect) — recorded, but never
+        // folded into errors[], so a healthy remote conductor doesn't read as error-laden.
+        if (e.message) infos.push(String(e.message));
+        break;
       default:
         break;
     }
@@ -212,6 +218,7 @@ export function foldHostTelemetry(text, fallbackConductorId = "") {
     heldPlanReplies,
     completeCostUsd: round6(completeCostUsd),
     errors,
+    infos,
   };
 }
 

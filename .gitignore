@@ -5,3 +5,4 @@ bench.config.json
 secrets*
 .env
 report.html
+vite-node.config.ts.timestamp-*.mjs

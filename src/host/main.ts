@@ -40,6 +40,7 @@ import {
 	type CompletionResult,
 	type Conductor,
 } from "./accordion";
+import { RemoteConductorClient } from "./remoteConductor";
 
 // The pi-wire protocol version the host pins. Matches Accordion's protocol.ts (v5). Kept
 // as a literal so a checkout on a DIFFERENT protocol version hard-fails loudly on hello,
@@ -57,7 +58,12 @@ const COMPLETION_TIMEOUT_MS = 120_000;
 // ── CLI parsing ───────────────────────────────────────────────────────────────
 interface Args {
 	accordionHome: string;
-	conductor: string;
+	/** In-process conductor id (IN_PROCESS_CONDUCTORS). Mutually exclusive with conductorUrl/conductorId. */
+	conductor: string | null;
+	/** ws:// URL of an already-running external conductor process (bellows spawned it). */
+	conductorUrl: string | null;
+	/** The external conductor's stable id, for telemetry + error messages. */
+	conductorId: string | null;
 	budget: number;
 	protect: number;
 	telemetryOut: string;
@@ -84,9 +90,25 @@ function parseArgs(argv: string[]): Args {
 		if (!Number.isFinite(n)) throw new Error(`bellows host: --${k} must be a number (got ${v})`);
 		return n;
 	};
+
+	const conductor = map.get("conductor") ?? null;
+	const conductorUrl = map.get("conductor-url") ?? null;
+	const conductorId = map.get("conductor-id") ?? null;
+	if (conductor && (conductorUrl || conductorId)) {
+		throw new Error("bellows host: pass either --conductor OR --conductor-url/--conductor-id, not both");
+	}
+	if (!conductor && !conductorUrl) {
+		throw new Error("bellows host: missing required --conductor (or --conductor-url + --conductor-id)");
+	}
+	if (conductorUrl && !conductorId) {
+		throw new Error("bellows host: --conductor-url requires --conductor-id");
+	}
+
 	return {
 		accordionHome: need("accordion-home"),
-		conductor: need("conductor"),
+		conductor,
+		conductorUrl,
+		conductorId,
 		budget: num("budget", need("budget")),
 		protect: num("protect", need("protect")),
 		telemetryOut: need("telemetry-out"),
@@ -148,16 +170,23 @@ async function main(): Promise<number> {
 
 	const acc = await loadAccordion();
 
-	// Resolve the requested conductor id up front so a bad id fails before we dial.
-	const found = acc.IN_PROCESS_CONDUCTORS.find((c) => c.id === args.conductor);
-	if (!found) {
-		const ids = acc.IN_PROCESS_CONDUCTORS.map((c) => c.id).join(", ");
-		tel.emit({ t: "error", at: Date.now(), message: `unknown conductor "${args.conductor}" (available: ${ids})` });
-		await tel.close();
-		throw new Error(`bellows host: unknown conductor "${args.conductor}" — available: ${ids}`);
+	// Resolve the requested conductor up front so a bad id/URL fails before we dial the
+	// pi session. Exactly one of `entry` (in-process) or `remoteUrl` (external) is set —
+	// parseArgs already enforced that --conductor and --conductor-url are mutually exclusive.
+	let entry: (typeof acc.IN_PROCESS_CONDUCTORS)[number] | null = null;
+	if (args.conductor) {
+		const found = acc.IN_PROCESS_CONDUCTORS.find((c) => c.id === args.conductor);
+		if (!found) {
+			const ids = acc.IN_PROCESS_CONDUCTORS.map((c) => c.id).join(", ");
+			tel.emit({ t: "error", at: Date.now(), message: `unknown conductor "${args.conductor}" (available: ${ids})` });
+			await tel.close();
+			throw new Error(`bellows host: unknown conductor "${args.conductor}" — available: ${ids}`);
+		}
+		entry = found;
 	}
-	// Non-null const so the narrowing survives inside the WS closures created below.
-	const entry = found;
+	// `entry` is non-null exactly when args.conductor was set — capture in a const so
+	// narrowing survives inside the WS closures created below (mirrors the original code).
+	const inProcEntry = entry;
 
 	// ── discover + dial (retry until timeout) ──────────────────────────────────
 	let session: SessionEntry | null = null;
@@ -183,6 +212,73 @@ async function main(): Promise<number> {
 	let helloSeen = false;
 	let attached = false;
 	let syncs = 0;
+	// The live external-conductor client, if args.conductorUrl was given — kept so the
+	// unfoldRequest/recallRequest handlers can forward host/event, and so the deferred
+	// conduct can send host/commandResult with the store's clamp reports after applying
+	// the remote's last batch. Null for an in-process conductor (no wire round-trip).
+	let remoteConductor: RemoteConductorClient | null = null;
+
+	/** Build a fresh conductor instance for a (re)attach — in-process id or external URL. */
+	function buildConductor(meta?: { title?: string; model?: string; cwd?: string }): Conductor {
+		// A rebuild (e.g. a `full` sync reset) must not leak the previous client's WS —
+		// a single-connection conductor would otherwise see two live host connections.
+		try {
+			remoteConductor?.close();
+		} catch {
+			/* ignore */
+		}
+		if (inProcEntry) {
+			remoteConductor = null;
+			return maybeSlowWrap(inProcEntry.create() as unknown as Conductor);
+		}
+		const client = new RemoteConductorClient({
+			url: args.conductorUrl!,
+			id: args.conductorId!,
+			session: {
+				title: meta?.title || "bellows run",
+				model: meta?.model || "",
+				cwd: meta?.cwd || "",
+			},
+			budget: args.budget,
+			contextWindow: null,
+			telemetry: tel,
+			// Apply synchronously against the REAL store so host/commandResult carries the
+			// actual clamp report (ClampReport is only ever produced by AccordionStore's
+			// applyCommands — never fabricated client-side). Guarded on `store === s` /
+			// `remoteConductor === client` so a stale callback from a torn-down attach (a
+			// `full` reset, or a swap) can't touch a store/conductor it no longer owns.
+			onApply: () => {
+				if (remoteConductor !== client) return;
+				const s = store;
+				if (!s || s.conductor !== client) return;
+				try {
+					s.refold();
+				} catch (e) {
+					const msg = e instanceof Error ? e.message : String(e);
+					tel.emit({ t: "error", at: Date.now(), message: `remote conductor apply: ${msg}` });
+				}
+				client.sendCommandResult(s.lastReports);
+				// Keep the sync-reply cache in step so the next `sync`'s IMMEDIATE reply
+				// (the 250ms-window crux) reflects this batch, exactly like the deferred
+				// in-process path does after its own refold().
+				lastPlan = computePlan();
+			},
+		});
+		client.connect();
+		// B1 (adversarial review): `ready` rejects on dial exception, dial timeout,
+		// protocol mismatch, or close-before-greeting. Node kills the whole process on
+		// an unhandled rejection — that is EXACTLY the failure this design must never
+		// allow (a dead/misbehaving external conductor must never take down the host,
+		// which would take down the pi run with it). Route the rejection to telemetry
+		// and otherwise swallow it: remoteConductor.conduct() already returns `null`
+		// (pass-through / raw) whenever nothing has been applied, so a client that
+		// never gets past hello simply leaves the run on raw context.
+		client.ready.catch((e: Error) => {
+			tel.emit({ t: "error", at: Date.now(), message: `remote conductor "${client.id}" never became ready: ${e.message}` });
+		});
+		remoteConductor = client;
+		return client;
+	}
 	// NB: aggregate ConductorTelemetry (plansSent, totalFoldOps, heldPlanReplies,
 	// conductLatencyMs, completeCostUsd, budgetSeries) is NOT computed here — the report
 	// collector (src/runner/collect.mjs) folds the HostEvent JSONL stream this host emits
@@ -355,14 +451,14 @@ async function main(): Promise<number> {
 						store.setContextWindow(meta.contextWindow);
 					}
 					// Attach the requested conductor now that the store exists.
-					store.attach(maybeSlowWrap(entry.create() as unknown as Conductor));
+					store.attach(buildConductor(meta));
 					attached = true;
 					lastPlan = { ops: [], groups: [] };
 					tel.emit({
 						t: "attach",
 						at: Date.now(),
 						sessionId: typeof msg.sessionId === "string" ? msg.sessionId : session!.sessionId,
-						conductor: args.conductor,
+						conductor: args.conductor ?? args.conductorId ?? "",
 						budget: args.budget,
 						protectTokens: args.protect,
 					});
@@ -387,7 +483,7 @@ async function main(): Promise<number> {
 						store.setBudget(args.budget);
 						store.setProtect(args.protect);
 						if (prevWindow !== null) store.setContextWindow(prevWindow);
-						store.attach(maybeSlowWrap(entry.create() as unknown as Conductor));
+						store.attach(buildConductor());
 						lastPlan = { ops: [], groups: [] };
 					}
 					const cw = msg.contextWindow;
@@ -450,6 +546,13 @@ async function main(): Promise<number> {
 					}
 					// The agent pulled blocks back — recompute so the next plan reflects it.
 					scheduleConduct();
+					// Tell an external conductor about the agent's self-unfold (host/event,
+					// mirrors RemoteRunner.notifyEvent — same wire event an in-process conductor's
+					// view.blocks would reflect automatically on the next context/update).
+					if (remoteConductor) {
+						const ids = (restored as Array<{ ids?: string[] }>).flatMap((r) => r.ids ?? []);
+						if (ids.length) remoteConductor.notifyEvent("agentUnfold", ids);
+					}
 					return;
 				}
 
@@ -515,6 +618,11 @@ async function main(): Promise<number> {
 			/* ignore */
 		}
 		try {
+			remoteConductor?.close();
+		} catch {
+			/* ignore */
+		}
+		try {
 			socket?.close();
 		} catch {
 			/* ignore */
@@ -543,6 +651,11 @@ async function main(): Promise<number> {
 	drainCompletions("shutdown");
 	try {
 		currentStore()?.dispose();
+	} catch {
+		/* ignore */
+	}
+	try {
+		remoteConductor?.close();
 	} catch {
 		/* ignore */
 	}

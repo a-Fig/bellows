@@ -81,6 +81,7 @@ function renderConductorTelemetry(t) {
     <div class="stat-block"><div class="label">conduct latency p50 / max</div><div class="value">${fmtNum(t.conductLatencyMs?.p50)}ms / ${fmtNum(t.conductLatencyMs?.max)}ms</div></div>
     <div class="stat-block"><div class="label">complete() spend</div><div class="value">${fmtUsd(t.completeCostUsd)}</div></div>
     ${t.errors?.length ? `<div class="stat-block"><div class="label">telemetry errors</div><div class="value">${t.errors.length}</div></div>` : ""}
+    ${t.infos?.length ? `<div class="stat-block"><div class="label">telemetry notes</div><div class="value">${t.infos.length}</div></div>` : ""}
   `;
 }
 

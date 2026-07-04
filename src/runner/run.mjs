@@ -4,9 +4,11 @@
  * Conforms to src/types.ts (RunRecord, RunStatus).
  */
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSafe } from "./proc.mjs";
+import { spawnSafe, killTree } from "./proc.mjs";
+import { parseConductorArm } from "./config.mjs";
 
 /** Bellows repo root — the host's vite-node config and bench.config.json live here. */
 const BELLOWS_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -19,6 +21,9 @@ import {
   enrichTurnsWithWire,
 } from "./collect.mjs";
 import { harvestLeaderboard, normalizeLabel } from "./platform.mjs";
+
+const CONDUCTOR_HEARTBEAT_TIMEOUT_MS = 20_000;
+const CONDUCTOR_HEARTBEAT_STALE_MS = 15_000; // mirrors Accordion's STALE_AFTER_MS
 
 const STALL_TIMEOUT_MS = 10 * 60 * 1000; // 10 min without any event
 const STATS_POLL_MIN_INTERVAL_MS = 5_000; // don't hammer get_session_stats
@@ -58,6 +63,11 @@ export async function executeRun(args) {
   fs.mkdirSync(runDir, { recursive: true });
   const hostTelemetryFile = arm === "none" ? null : path.join(runDir, "host.jsonl");
 
+  // Resolve up front so a bad "external:<id>" fails before anything is spawned.
+  // config.mjs's trial validation already calls parseConductorArm on load, but a
+  // caller may construct/execute a run without going through that path (e.g. tests).
+  const armDispatch = arm === "none" ? { type: "in-process", id: "none" } : parseConductorArm(arm);
+
   const fingerprint = { ...sharedFp, conductorId: arm };
   let workspaceDir = path.join(runDir, "workspace");
   let agentDir = path.join(runDir, "agent");
@@ -67,6 +77,10 @@ export async function executeRun(args) {
   let pi = null;
   /** @type {import("node:child_process").ChildProcess | null} */
   let host = null;
+  /** @type {import("node:child_process").ChildProcess | null} */
+  let externalConductor = null;
+  /** @type {import("node:fs").WriteStream | null} */
+  let externalConductorLog = null;
 
   try {
     const prov = provisionRun({
@@ -99,8 +113,32 @@ export async function executeRun(args) {
     pi.on("line", (o) => piLog.write("<< " + JSON.stringify(o) + "\n"));
 
     // Spawn the host child (unless raw baseline).
+    let conductorUrl = null;
+    if (armDispatch.type === "external") {
+      const spawned = await spawnExternalConductor({
+        config,
+        conductorId: armDispatch.id,
+        accordionHome,
+        runDir,
+        log,
+        label,
+      });
+      externalConductor = spawned.child;
+      externalConductorLog = spawned.conductorLog;
+      conductorUrl = spawned.url;
+    }
     if (arm !== "none") {
-      host = spawnHost({ config, arm, spec, accordionHome, hostTelemetryFile, runDir, log });
+      host = spawnHost({
+        config,
+        arm,
+        armDispatch,
+        conductorUrl,
+        spec,
+        accordionHome,
+        hostTelemetryFile,
+        runDir,
+        log,
+      });
     }
 
     // Kick off the agent.
@@ -131,6 +169,28 @@ export async function executeRun(args) {
       }
     } catch (e) {
       log(`[${label}] host teardown error: ${e.message}`);
+    }
+    // The external conductor is killed AFTER the host so the host's WS close is a
+    // clean session-end rather than racing a dropped conductor connection.
+    // m4: killTree so a conductor's own grandchildren (e.g. a Python probe) don't
+    // survive the run on win32, where a plain kill() only signals this one PID.
+    try {
+      if (externalConductor && externalConductor.exitCode === null && !externalConductor.killed) {
+        killTree(externalConductor, "SIGTERM");
+        await waitProc(externalConductor, 5_000);
+        if (externalConductor.exitCode === null) killTree(externalConductor, "SIGKILL");
+      }
+    } catch (e) {
+      log(`[${label}] external conductor teardown error: ${e.message}`);
+    }
+    // n9 (adversarial review): close the conductor's log write stream on every
+    // teardown path — it was left open for the run's duration on the success path.
+    if (externalConductorLog) {
+      try {
+        await new Promise((resolve) => externalConductorLog.end(resolve));
+      } catch (e) {
+        log(`[${label}] external conductor log close error: ${e.message}`);
+      }
     }
   }
 
@@ -247,6 +307,11 @@ export async function executeRun(args) {
 function driveUntilDone({ pi, spec, log, label }) {
   return new Promise((resolve) => {
     const deadline = Date.now() + spec.caps.minutes * 60 * 1000;
+    // Stall detection must never pre-empt the wall-clock cap. The run contract is
+    // "end only on agent-finish or the time cap", so the short stall safety is
+    // clamped to never fire before the time cap. (Every run is time-capped, so a
+    // genuinely hung run is still bounded — just by `minutes`, not by the stall.)
+    const stallMs = Math.max(STALL_TIMEOUT_MS, spec.caps.minutes * 60 * 1000 + 60_000);
     let assistantTurns = 0;
     let lastEventAt = Date.now();
     let lastStatsAt = 0;
@@ -345,7 +410,7 @@ function driveUntilDone({ pi, spec, log, label }) {
         finish("aborted-time", `wall-clock >= ${spec.caps.minutes} min`);
         return;
       }
-      if (now - lastEventAt >= STALL_TIMEOUT_MS) {
+      if (now - lastEventAt >= stallMs) {
         log(`[${label}] stall: no events for ${Math.round((now - lastEventAt) / 1000)}s`);
         finish("aborted-stall", `no events for ${Math.round((now - lastEventAt) / 1000)}s`);
         return;
@@ -358,8 +423,21 @@ function driveUntilDone({ pi, spec, log, label }) {
   });
 }
 
-/** Spawn the headless host child pointing at the shared accordion home. */
-export function spawnHost({ config, arm, spec, accordionHome, hostTelemetryFile, runDir, log }) {
+/**
+ * Spawn the headless host child pointing at the shared accordion home.
+ * @param {object} args
+ * @param {import("../types.ts").BenchConfig} args.config
+ * @param {string} args.arm                   raw arms[].conductor string (for "none"/telemetry)
+ * @param {{type:"in-process"|"external", id:string}} [args.armDispatch]  parsed dispatch (defaults to in-process(arm))
+ * @param {string|null} [args.conductorUrl]    ws:// URL of a spawned external conductor
+ * @param {import("../types.ts").TrialSpec} args.spec
+ * @param {string} args.accordionHome
+ * @param {string|null} args.hostTelemetryFile
+ * @param {string} args.runDir
+ * @param {(m:string)=>void} args.log
+ */
+export function spawnHost({ config, arm, armDispatch, conductorUrl, spec, accordionHome, hostTelemetryFile, runDir, log }) {
+  const dispatch = armDispatch || { type: "in-process", id: arm };
   // Invoke vite-node's entry directly with node.exe — no npx/.cmd shim, so
   // Windows paths with spaces never pass through cmd.exe quote handling.
   const hostArgs = [
@@ -370,15 +448,25 @@ export function spawnHost({ config, arm, spec, accordionHome, hostTelemetryFile,
     "--",
     "--accordion-home",
     accordionHome,
-    "--conductor",
-    arm,
+  ];
+  if (dispatch.type === "external") {
+    if (!conductorUrl) throw new Error(`spawnHost: external conductor "${dispatch.id}" has no conductorUrl`);
+    hostArgs.push("--conductor-url", conductorUrl, "--conductor-id", dispatch.id);
+  } else {
+    hostArgs.push("--conductor", dispatch.id);
+  }
+  hostArgs.push(
     "--budget",
     String(spec.budget),
     "--protect",
     String(spec.protectTokens),
     "--telemetry-out",
     hostTelemetryFile,
-  ];
+    // Keep the host available for reconnects across the WHOLE run, not the host's
+    // 30-min default — otherwise a long run loses its conductor after 30 min.
+    "--timeout-min",
+    String(spec.caps.minutes + 5),
+  );
   const hostLog = fs.createWriteStream(path.join(runDir, "host-stderr.log"), { flags: "a" });
   const child = spawnSafe(process.execPath, hostArgs, {
     cwd: BELLOWS_ROOT,
@@ -390,6 +478,182 @@ export function spawnHost({ config, arm, spec, accordionHome, hostTelemetryFile,
   child.stderr.on("data", (d) => hostLog.write(d));
   child.on("error", (e) => log(`[host] spawn error: ${e.message}`));
   return child;
+}
+
+/**
+ * Locate an external conductor's launch.json under `<accordionRepo>/conductors/<id>/`.
+ * @param {string} accordionRepo
+ * @param {string} conductorId
+ * @returns {{dir:string, launch: {id?:string, label?:string, command:string, args?:string[], portEnv?:string}}}
+ */
+export function loadConductorLaunchSpec(accordionRepo, conductorId) {
+  const dir = path.join(accordionRepo, "conductors", conductorId);
+  const launchPath = path.join(dir, "launch.json");
+  if (!fs.existsSync(launchPath)) {
+    throw new Error(
+      `external conductor "${conductorId}": no launch.json found at ${launchPath}. ` +
+        `External conductors are launched from <accordionRepo>/conductors/<id>/launch.json ` +
+        `(e.g. {"id":"thermocline","command":"node","args":["thermocline.mjs"]}).`,
+    );
+  }
+  let launch;
+  try {
+    launch = JSON.parse(fs.readFileSync(launchPath, "utf8"));
+  } catch (e) {
+    throw new Error(`external conductor "${conductorId}": failed to parse ${launchPath}: ${e.message}`);
+  }
+  if (!launch || typeof launch.command !== "string" || !launch.command.trim()) {
+    throw new Error(`external conductor "${conductorId}": ${launchPath} must have a "command" string`);
+  }
+  return { dir, launch };
+}
+
+/**
+ * Bind to port 0, read back the OS-assigned free port, then close.
+ *
+ * m5 (adversarial review): this has an inherent TOCTOU race — the port is free
+ * at the instant we close our probe socket, but nothing reserves it between
+ * that close and the conductor process's own bind a moment later. Another
+ * process (or a concurrent `parallel: N` run on this machine) can grab it
+ * first. We accept the race rather than engineering around it: a lost race
+ * surfaces cleanly as `waitForConductorHeartbeat`'s timeout (M2 now guarantees
+ * that failure kills the spawned process rather than leaking it), not a silent
+ * hang or a crash. See TUTORIAL.md's external-conductors section for the
+ * user-facing note.
+ */
+export function getFreePort() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.unref();
+    srv.on("error", reject);
+    srv.listen(0, "127.0.0.1", () => {
+      const { port } = srv.address();
+      srv.close((err) => (err ? reject(err) : resolve(port)));
+    });
+  });
+}
+
+/**
+ * Spawn an external conductor process (its own WS server) for this run and wait
+ * for its discovery heartbeat to appear under `<accordionHome>/.accordion/conductors/<id>.json`.
+ *
+ * @param {object} args
+ * @param {import("../types.ts").BenchConfig} args.config
+ * @param {string} args.conductorId
+ * @param {string} args.accordionHome     this run's ACCORDION_HOME (heartbeat + isolation)
+ * @param {string} args.runDir
+ * @param {(m:string)=>void} args.log
+ * @param {string} args.label
+ * @returns {Promise<{child: import("node:child_process").ChildProcess, url: string, conductorLog: import("node:fs").WriteStream}>}
+ */
+export async function spawnExternalConductor({ config, conductorId, accordionHome, runDir, log, label }) {
+  const { dir, launch } = loadConductorLaunchSpec(config.accordionRepo, conductorId);
+
+  const env = { ...process.env, ACCORDION_HOME: accordionHome };
+  if (launch.portEnv) {
+    const port = await getFreePort();
+    env[launch.portEnv] = String(port);
+  } else {
+    log(
+      `[${label}] WARN: conductor "${conductorId}" launch.json has no "portEnv" — it will bind its ` +
+        `default port, so this conductor CANNOT run in parallel arms/runs on this machine.`,
+    );
+  }
+
+  const args = Array.isArray(launch.args) ? launch.args : [];
+  const conductorLog = fs.createWriteStream(path.join(runDir, `conductor-${conductorId}.log`), { flags: "a" });
+  const child = spawnSafe(launch.command, args, {
+    cwd: dir,
+    env,
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  child.stdout?.on("data", (d) => conductorLog.write(d));
+  child.stderr?.on("data", (d) => conductorLog.write(d));
+  let spawnErr = null;
+  child.on("error", (e) => {
+    spawnErr = e;
+    log(`[${label}] conductor "${conductorId}" spawn error: ${e.message}`);
+  });
+
+  const heartbeatPath = path.join(accordionHome, ".accordion", "conductors", `${conductorId}.json`);
+  try {
+    const url = await waitForConductorHeartbeat({
+      heartbeatPath,
+      conductorId,
+      child,
+      getSpawnErr: () => spawnErr,
+    });
+    log(`[${label}] external conductor "${conductorId}" ready at ${url}`);
+    // Success: the conductor keeps running for the rest of the trial, so the log
+    // stream must stay open — hand it back so the caller can close it exactly
+    // once, alongside the process kill, when the run actually tears down (n9).
+    return { child, url, conductorLog };
+  } catch (e) {
+    // M2 (adversarial review): a heartbeat that never appears must not leave the
+    // spawned process orphaned — executeRun's finally block only tears down
+    // `externalConductor`, which is still null here because we haven't returned
+    // yet (the caller never got a handle to kill). Kill it ourselves before
+    // rethrowing so a conductor that hangs/crashes before advertising a heartbeat
+    // doesn't leak a process (and, on win32, its whole subtree — see killTree).
+    const pid = child.pid;
+    killTree(child, "SIGTERM");
+    await waitProc(child, 5_000);
+    if (child.exitCode === null) killTree(child, "SIGKILL");
+    // n9: this is the ONLY path where spawnExternalConductor itself owns
+    // teardown end to end, so close the log stream here before rethrowing.
+    await new Promise((resolve) => conductorLog.end(resolve));
+    // Expose the pid + exit state on the error so a caller/test can verify the
+    // process actually died rather than assuming it from a nonexistent handle.
+    e.killedPid = pid;
+    e.killedExitCode = child.exitCode;
+    throw e;
+  }
+}
+
+/** Poll a conductor's heartbeat JSON until it appears fresh, or throw on timeout/crash. */
+function waitForConductorHeartbeat({ heartbeatPath, conductorId, child, getSpawnErr }) {
+  const deadline = Date.now() + CONDUCTOR_HEARTBEAT_TIMEOUT_MS;
+  return new Promise((resolve, reject) => {
+    const tick = () => {
+      const spawnErr = getSpawnErr();
+      if (spawnErr) {
+        reject(new Error(`external conductor "${conductorId}" failed to spawn: ${spawnErr.message}`));
+        return;
+      }
+      if (child.exitCode !== null) {
+        reject(
+          new Error(
+            `external conductor "${conductorId}" exited (code=${child.exitCode}) before advertising a heartbeat`,
+          ),
+        );
+        return;
+      }
+      if (fs.existsSync(heartbeatPath)) {
+        try {
+          const entry = JSON.parse(fs.readFileSync(heartbeatPath, "utf8"));
+          const fresh = typeof entry.heartbeatAt === "number" && Date.now() - entry.heartbeatAt <= CONDUCTOR_HEARTBEAT_STALE_MS;
+          if (fresh && typeof entry.url === "string" && entry.url) {
+            resolve(entry.url);
+            return;
+          }
+        } catch {
+          /* half-written file — keep polling */
+        }
+      }
+      if (Date.now() >= deadline) {
+        reject(
+          new Error(
+            `external conductor "${conductorId}" did not advertise a fresh heartbeat at ${heartbeatPath} ` +
+              `within ${CONDUCTOR_HEARTBEAT_TIMEOUT_MS}ms`,
+          ),
+        );
+        return;
+      }
+      setTimeout(tick, 250);
+    };
+    tick();
+  });
 }
 
 // --- helpers -----------------------------------------------------------------

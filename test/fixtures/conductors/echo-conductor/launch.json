@@ -1,0 +1,7 @@
+{
+  "id": "echo-conductor",
+  "label": "Echo Conductor (fixture)",
+  "command": "node",
+  "args": ["echo-conductor.mjs"],
+  "portEnv": "ECHO_PORT"
+}

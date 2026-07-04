@@ -1,0 +1,6 @@
+{
+  "id": "hang-conductor",
+  "label": "Hang Conductor (fixture)",
+  "command": "node",
+  "args": ["hang-conductor.mjs"]
+}

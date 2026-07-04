@@ -123,6 +123,13 @@ export function validateTrialSpec(raw) {
     raw.arms.forEach((a, i) => {
       if (!a || typeof a !== "object" || typeof a.conductor !== "string" || !a.conductor.trim())
         errs.push(`arms[${i}].conductor: required non-empty string`);
+      else {
+        try {
+          parseConductorArm(a.conductor);
+        } catch (e) {
+          errs.push(`arms[${i}].conductor: ${e.message}`);
+        }
+      }
       if (a && a.name !== undefined && typeof a.name !== "string")
         errs.push(`arms[${i}].name: must be a string if present`);
     });
@@ -190,4 +197,33 @@ export function splitModel(model) {
   const idx = model.indexOf(":");
   if (idx === -1) throw new Error(`model must be "provider:modelId": ${model}`);
   return { provider: model.slice(0, idx), modelId: model.slice(idx + 1) };
+}
+
+/**
+ * Parse an `arms[].conductor` string into its dispatch shape.
+ *
+ *   "builtin"            -> { type: "in-process", id: "builtin" }
+ *   "none"               -> { type: "in-process", id: "none" }
+ *   "external:thermocline" -> { type: "external", id: "thermocline" }
+ *
+ * `external:<id>` names a conductor with a `launch.json` under
+ * `<accordionRepo>/conductors/<id>/` that the runner spawns as its own process
+ * (see src/runner/run.mjs spawnExternalConductor). Any other string is treated
+ * as an in-process conductor id resolved against Accordion's
+ * IN_PROCESS_CONDUCTORS registry at host-attach time.
+ * @param {string} conductor
+ * @returns {{type: "in-process" | "external", id: string}}
+ */
+export function parseConductorArm(conductor) {
+  if (typeof conductor !== "string" || !conductor.trim()) {
+    throw new Error("conductor must be a non-empty string");
+  }
+  if (conductor.startsWith("external:")) {
+    const id = conductor.slice("external:".length).trim();
+    if (!id) throw new Error('external conductor id missing after "external:"');
+    if (!/^[A-Za-z0-9._-]+$/.test(id))
+      throw new Error(`external conductor id "${id}" must match [A-Za-z0-9._-]+`);
+    return { type: "external", id };
+  }
+  return { type: "in-process", id: conductor };
 }

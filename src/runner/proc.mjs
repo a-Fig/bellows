@@ -13,6 +13,37 @@ import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
+/**
+ * Kill a child process AND its descendants (m4, adversarial review).
+ *
+ * `child.kill("SIGTERM"/"SIGKILL")` only signals the direct child PID. On
+ * win32 that's `TerminateProcess` on that one process — any grandchild the
+ * conductor itself spawned (e.g. thermocline's Python probe) is orphaned and
+ * keeps running. `taskkill /T` kills the whole process tree rooted at the PID.
+ * POSIX keeps the plain signal (a process-group kill would require the child
+ * to have been spawned detached/in its own group, which spawnSafe does not
+ * do here) as a portable fallback.
+ */
+export function killTree(child, signal = "SIGTERM") {
+  // NB: no `child.killed` in this guard — kill() sets it on the FIRST signal, which
+  // would make the SIGTERM→SIGKILL escalation a no-op on POSIX (a child trapping
+  // SIGTERM would survive). exitCode is the only reliable "actually exited" signal.
+  if (!child || child.pid == null || child.exitCode !== null) return;
+  if (process.platform === "win32") {
+    try {
+      execSync(`taskkill /PID ${child.pid} /T /F`, { stdio: ["ignore", "ignore", "ignore"] });
+      return;
+    } catch {
+      /* fall through to a plain kill as a last resort */
+    }
+  }
+  try {
+    child.kill(signal);
+  } catch {
+    /* already gone */
+  }
+}
+
 /** Resolve an executable/shim to an absolute path (Windows: prefer .cmd). */
 export function resolveCommand(cmd) {
   if (path.isAbsolute(cmd) && fs.existsSync(cmd)) return cmd;
