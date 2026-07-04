@@ -1,0 +1,20 @@
+# Second live smoke: exercises room.create (PR #98 endpoint) and the fixed
+# host spawn. Fresh trial name -> fresh label + unique agent name (the
+# leaderboard keeps one row per agent name).
+trial: smoke2-builtin
+problems: xjq
+model: token-router:deepseek/deepseek-v4-flash
+thinkingLevel: medium
+budget: 25000
+protectTokens: 10000
+arms:
+  - conductor: builtin
+seeds: 1
+caps:
+  costUsd: 1.5
+  turns: 60
+  minutes: 30
+  totalTokens: 1500000
+parallel: 1
+room:
+  create: true

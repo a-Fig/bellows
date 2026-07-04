@@ -80,7 +80,15 @@ export class RoomPool {
   async lease() {
     if (this.available.length) return this.available.shift();
     if (this.create) {
-      const id = await createRoom({ base: this.base, apiKey: this.apiKey, roomConfig: {} });
+      const id = await createRoom({
+        base: this.base,
+        apiKey: this.apiKey,
+        // Deployed shape (agent-trials PR #98): game_type required; name
+        // auto-generated when omitted. Default auto-reset stays on so created
+        // rooms recycle instead of accumulating against the per-account cap
+        // (scores are harvested from the leaderboard, never live room state).
+        roomConfig: { game_type: "slopcode" },
+      });
       this.log(`[rooms] created room ${id}`);
       return id;
     }
