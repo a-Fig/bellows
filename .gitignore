@@ -4,3 +4,4 @@ bench.config.json
 *.local.json
 secrets*
 .env
+report.html
