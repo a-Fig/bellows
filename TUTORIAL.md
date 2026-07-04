@@ -188,5 +188,152 @@ and agent dir for forensics.
 
 Nothing here is Windows-specific: clone bellows + Accordion on the homeserver, `npm install`
 both, copy `~/.pi/agent` credentials, set the key env var, and the same commands work.
-(A `bench worker --poll` daemon mode that picks up trials queued from the platform is the
-designed Phase 2 — not built yet.)
+
+## Worker mode (`bellows worker`)
+
+`bellows run` schedules a trial you already know the shape of. `bellows worker` is the other
+half: a long-running daemon that lets the **platform** dispatch work to this machine —
+useful for a homeserver (or any spare box) that should sit and grind through whatever runs
+get queued, without you hand-writing a trial YAML per machine.
+
+```bash
+node bin/bellows.mjs worker --poll     # long-running: claim, execute, repeat, forever
+node bin/bellows.mjs worker --once     # claim + execute at most one run, then exit (debugging)
+```
+
+### Config
+
+Add a `worker` section to `bench.config.json`:
+
+```json
+{
+  "worker": {
+    "platformUrl": "https://agent-trials-407493014719.us-west1.run.app",
+    "name": "homeserver-1",
+    "caps": ["in-process", "external-conductors"],
+    "pullBeforeClaim": false,
+    "parallel": 1
+  }
+}
+```
+
+- **`platformUrl`** — base URL of the agent-trials control plane (same host as `platformBase`
+  in the normal `run` path; kept as a separate field since a worker fleet may point workers at
+  a different base than ad hoc `bellows run` invocations).
+- **`name`** — this worker's identity. Sent on every claim/heartbeat/events/complete call; the
+  platform's scheduler and any per-worker dashboards key off it. Pick something stable and
+  identifying (`homeserver-1`, not `worker`).
+- **`caps`** — capability tags this worker advertises so the scheduler can route runs it can
+  actually satisfy:
+  - `in-process` — can run any conductor in Accordion's `IN_PROCESS_CONDUCTORS` registry.
+  - `external-conductors` — can spawn `external:<id>` conductor processes (needs the
+    conductor's own runtime deps — e.g. Python for a GPU probe — installed locally).
+  - `gpu-probe` — has a GPU available for conductors that need one (e.g. thermocline).
+  - `has-completions` — this worker's pi/model setup can service `host.complete()` calls for
+    LLM-backed conductors.
+  These are free-form strings the platform's scheduler interprets — `caps` doesn't gate
+  anything client-side beyond being included in the claim request.
+- **`pullBeforeClaim`** — `true` means `git pull --ff-only` the `accordionRepo` checkout before
+  each claim attempt (throttled to at most once/minute, so a 5s poll cadence doesn't hammer
+  git). A failed pull logs a warning and the worker keeps running against whatever's already
+  checked out — it never blocks or fails a claim. Off by default because most setups pin
+  `accordionRepo` to a specific branch/worktree on purpose (see the Gotchas section above);
+  turn it on for a homeserver that should always track the latest `devmain`.
+- **`parallel`** — reserved for running multiple claimed runs concurrently. Only `1` is
+  supported today; any other value is rejected at startup with a clear error.
+
+The API key **value** is never read from `bench.config.json` — only from the
+environment variable named by the top-level `platformApiKeyEnv` field
+(`AGENT_TRIALS_API_KEY` in the example config above), exactly like `bellows run`'s
+`platformApiKeyEnv`-driven lookup. (Fixed in an adversarial-review pass — the
+worker used to hardcode `AGENT_TRIALS_API_KEY` regardless of what
+`platformApiKeyEnv` said; harmless as long as you never repoint that field, but
+a footgun otherwise.)
+
+### What the worker advertises on every claim
+
+Alongside `caps`, each claim poll sends a `conductors` list: every id in Accordion's
+`IN_PROCESS_CONDUCTORS` registry, plus `external:<id>` for every
+`<accordionRepo>/conductors/<id>/launch.json` bellows finds. This tells the platform's
+scheduler exactly which conductor ids this worker's Accordion checkout can actually run,
+so it never dispatches a run for a conductor this machine doesn't have. The list is
+rebuilt via a short-lived vite-node subprocess (the same mechanism `spawnHost` uses)
+and cached for ~60s so the 5s poll cadence doesn't re-spawn it on every tick.
+
+### What happens per claimed run
+
+1. **Claim** — `POST /api/bench/workers/claim` with `{worker, caps, conductors}`. A `204`
+   means nothing is queued; the worker sleeps ~5s (± jitter) and polls again. A `200` returns
+   a fully-resolved run: trial config, the one arm for this run, and a seed.
+2. **Execute** — the claimed run is handed to `src/runner/run.mjs`'s `executeRun` (the exact
+   same function `bellows run` uses per run) under `runs/_worker/<trial>/<arm>-<seed>/`.
+3. **Heartbeat** — every ~30s while executing, `POST .../heartbeat`. A `{cancel: true}` reply
+   aborts the run (same teardown path as any other run ending: pi/host/conductor killed,
+   `killTree` on Windows) and it completes with `status: "failed"`, `error: "cancelled by
+   platform"`. A `409` means the platform already reaped this run server-side — the worker
+   stops driving it immediately and skips sending further events/complete (they'd just 409
+   again), logging locally and moving on to the next claim.
+4. **Events** — streamed throughout and batched (flushed every ~5s or every 20 events,
+   whichever comes first, capped at 100 per POST): `run-start` (arm, seed, accordion commit
+   sha), `sync` (one per pi sync — tailed straight from the host's own `host.jsonl`
+   telemetry: rev, live tokens, block/fold counts, budget), `warn` (host-reported errors),
+   `status-change` (done/failed/cancelling). Delivery is best-effort: a batch that fails
+   after 3 retries is dropped and counted, never retried indefinitely — events are supporting
+   telemetry, not the run's authoritative record.
+5. **Complete** — `POST .../complete` with the full `record.json` contents, `status`
+   (`"done"`/`"failed"`), the platform `room_id` if known, an `error` string on failure, and
+   (if the session is ≤ 25 MB decoded) the run's pi session JSONL, gzipped and base64'd.
+   Unlike events, `complete` retries hard — up to ~5 minutes of capped exponential
+   backoff — before giving up. If it still fails, `record.json` stays on disk under the run
+   directory and the worker logs loudly; nothing is lost, it just needs a manual resubmit
+   once the platform is reachable again.
+
+### Crash safety
+
+An `executeRun` throw (pi crashed, the host wedged, anything) is caught around each claimed
+run — it's folded into a `complete(failed, error: "executor threw: ...")` call and the worker
+loop moves on to the next claim rather than dying. A `SIGINT`/`SIGTERM` to the worker process
+(Ctrl-C, or a service manager stopping it) aborts whatever run is currently in flight and
+makes a best-effort `complete(failed, "worker shutdown")` call before the process exits —
+so a homeserver reboot or a deliberate restart doesn't leave an orphaned "running" row on the
+platform.
+
+### Running it as a background service (launchd sketch)
+
+A minimal launchd plist to keep `bellows worker` running on a Mac homeserver
+(`~/Library/LaunchAgents/dev.bellows.worker.plist`):
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>dev.bellows.worker</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/node</string>
+    <string>/path/to/bellows/bin/bellows.mjs</string>
+    <string>worker</string>
+    <string>--poll</string>
+  </array>
+  <key>WorkingDirectory</key><string>/path/to/bellows</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AGENT_TRIALS_API_KEY</key><string>at_...</string>
+  </dict>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/path/to/bellows/worker.log</string>
+  <key>StandardErrorPath</key><string>/path/to/bellows/worker.err.log</string>
+</dict>
+</plist>
+```
+
+`launchctl load ~/Library/LaunchAgents/dev.bellows.worker.plist` starts it; `KeepAlive`
+restarts it if it ever exits (a `SIGINT`/`SIGTERM` still exits cleanly per the crash-safety
+note above — this is just the belt-and-suspenders "come back up after a crash or reboot").
+
+### Debugging: `--once`
+
+`bellows worker --once` claims and executes at most one run, then exits — useful for
+verifying a worker's config/connectivity/conductor list end to end without leaving a
+long-running process around, or for a cron-style dispatch instead of a daemon.

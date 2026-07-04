@@ -232,4 +232,48 @@ export interface BenchConfig {
     string,
     { inputPerMtok?: number; outputPerMtok?: number; cacheReadPerMtok?: number; cacheWritePerMtok?: number }
   >;
+  /** `bellows worker` settings. Absent = worker mode unavailable (CLI errors clearly). */
+  worker?: WorkerConfig;
+}
+
+export interface WorkerConfig {
+  /** Base URL of the agent-trials control-plane API (claim/heartbeat/events/complete). */
+  platformUrl: string;
+  /** This machine's worker name, sent on every claim/heartbeat/events/complete call. */
+  name: string;
+  /**
+   * Capability tags advertised on claim, e.g. "in-process", "external-conductors",
+   * "gpu-probe", "has-completions". Purely informational to the scheduler.
+   */
+  caps: string[];
+  /** `git pull --ff-only` the accordionRepo before claiming (throttled to ~once/min). */
+  pullBeforeClaim: boolean;
+  /** Runs to execute concurrently. Only `1` is currently supported. */
+  parallel: number;
+}
+
+// ---------------------------------------------------------------------------
+// Worker <-> platform control-plane wire shapes (POST /api/bench/workers/claim,
+// /api/bench/runs/<id>/{heartbeat,events,complete}). See bin/bellows.mjs `worker`
+// command + src/worker/*.
+// ---------------------------------------------------------------------------
+
+/** A claimed unit of work — one arm × seed of a trial, already resolved server-side. */
+export interface ClaimedRun {
+  id: string;
+  trial: string;
+  name: string;
+  /** Full trial config (same shape as a parsed trial YAML), JSON. */
+  config: TrialSpec;
+  /** The single arm object for this run. */
+  arm: ArmSpec;
+  seed: number;
+}
+
+export type WorkerEventType = "run-start" | "sync" | "checkpoint" | "warn" | "status-change";
+
+export interface WorkerEvent {
+  ts: number;
+  type: WorkerEventType;
+  data: Record<string, unknown>;
 }

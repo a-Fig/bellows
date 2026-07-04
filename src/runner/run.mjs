@@ -42,10 +42,13 @@ const MAX_FAILED_STATS_POLLS = 6; // ~30s+ of cost blindness -> stop the run
  * @param {string} args.runDir
  * @param {Omit<import("../types.ts").Fingerprint,"conductorId">} args.sharedFp
  * @param {(m:string)=>void} args.log
+ * @param {AbortSignal} [args.abortSignal]  when aborted, tears the run down early
+ *   (status "error", statusDetail "cancelled"). Additive — omitted by `bellows run`;
+ *   used by `bellows worker` to honor a platform-issued cancel via heartbeat.
  * @returns {Promise<import("../types.ts").RunRecord>}
  */
 export async function executeRun(args) {
-  const { spec, config, arm, armName, seed, roomId, apiKey, runDir, sharedFp, log } = args;
+  const { spec, config, arm, armName, seed, roomId, apiKey, runDir, sharedFp, log, abortSignal } = args;
   // Label = "<trial>/<arm>/<seed>", trimmed + clamped to the platform's 64-char
   // limit. Used both as the run id and the leaderboard label (pull key).
   const label = normalizeLabel(`${spec.trial}/${armName}/${seed}`);
@@ -144,7 +147,7 @@ export async function executeRun(args) {
     // Kick off the agent.
     pi.send({ type: "prompt", message: KICKOFF_PROMPT });
 
-    const outcome = await driveUntilDone({ pi, spec, log, label });
+    const outcome = await driveUntilDone({ pi, spec, log, label, abortSignal });
     status = outcome.status;
     statusDetail = outcome.statusDetail;
   } catch (e) {
@@ -302,9 +305,10 @@ export async function executeRun(args) {
 
 /**
  * Watch pi's event stream and enforce caps. Resolves with a status.
+ * @param {AbortSignal} [abortSignal]  external cancellation (see executeRun's jsdoc)
  * @returns {Promise<{status:import("../types.ts").RunStatus, statusDetail?:string}>}
  */
-function driveUntilDone({ pi, spec, log, label }) {
+function driveUntilDone({ pi, spec, log, label, abortSignal }) {
   return new Promise((resolve) => {
     const deadline = Date.now() + spec.caps.minutes * 60 * 1000;
     // Stall detection must never pre-empt the wall-clock cap. The run contract is
@@ -324,8 +328,23 @@ function driveUntilDone({ pi, spec, log, label }) {
       clearInterval(ticker);
       pi.off("event", onEvent);
       pi.off("exit", onExit);
+      abortSignal?.removeEventListener("abort", onAbort);
       resolve({ status, statusDetail });
     };
+
+    const onAbort = () => {
+      log(`[${label}] cancelled externally`);
+      finish("error", "cancelled by platform");
+    };
+    if (abortSignal) {
+      if (abortSignal.aborted) {
+        // Already cancelled before we even started driving — finish on the next tick so
+        // the caller's listeners (attached right after this promise is constructed) run.
+        queueMicrotask(onAbort);
+      } else {
+        abortSignal.addEventListener("abort", onAbort, { once: true });
+      }
+    }
 
     let failedStatsPolls = 0;
     let warnedZeroCost = false;

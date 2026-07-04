@@ -3,11 +3,15 @@
  * bellows CLI.
  *   bellows run <trial.yaml> [--dry]
  *   bellows report [runsDir] [outFile]
+ *   bellows worker --poll [--once]
  */
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { loadBenchConfig, loadTrialSpec } from "../src/runner/config.mjs";
 import { runTrial, planDryRun, resolveRunsRoot } from "../src/runner/schedule.mjs";
+import { runWorkerLoop } from "../src/worker/loop.mjs";
+import { makeShutdownSignalHandler } from "../src/worker/shutdownSignal.mjs";
 
 function log(msg) {
   process.stderr.write(msg + "\n");
@@ -19,10 +23,12 @@ function usage() {
 Usage:
   bellows run <trial.yaml> [--dry]   Schedule and execute a trial (or plan it with --dry)
   bellows report [runsDir] [out]     Render RunRecords to an HTML report
+  bellows worker --poll [--once]     Claim + execute runs dispatched by the platform
 
 Options:
   --dry     Print the plan (runs, rooms, dirs, settings) without spawning pi/host
-            or touching the platform.`);
+            or touching the platform.
+  --once    (worker only) Claim and execute at most one run, then exit.`);
 }
 
 async function cmdRun(args) {
@@ -129,6 +135,46 @@ async function cmdReport(args) {
   }
 }
 
+async function cmdWorker(args) {
+  const once = args.includes("--once");
+  // --poll is the documented/expected flag for the long-running form; accepted but not
+  // required to distinguish from --once, since any invocation without --once polls anyway.
+  let config;
+  try {
+    ({ config } = loadBenchConfig(log));
+  } catch (e) {
+    log(`error: ${e.message}`);
+    process.exit(2);
+  }
+  if (!config.worker) {
+    log(`error: bench.config.json has no "worker" section. Add one (see bench.config.example.json):\n` +
+      `  "worker": { "platformUrl": "...", "name": "<worker-name>", "caps": ["in-process"] }`);
+    process.exit(2);
+  }
+  // m4 (adversarial review, PM decision): honor config.platformApiKeyEnv exactly
+  // like cmdRun does, rather than hardcoding AGENT_TRIALS_API_KEY. The intended
+  // deployment is the same key/account creating rooms and running the worker,
+  // so both paths must resolve the key the same way — a config pointing
+  // platformApiKeyEnv at a different env var previously had no effect on the
+  // worker, silently falling back to a var that may not even be set.
+  const apiKey = process.env[config.platformApiKeyEnv];
+  if (!apiKey) {
+    log(`error: platform api key env var ${config.platformApiKeyEnv} is not set. ` +
+      `Export it (never commit it) before running the worker.`);
+    process.exit(2);
+  }
+
+  const abortController = new AbortController();
+  const onSignal = makeShutdownSignalHandler({ abortController, log });
+  process.on("SIGINT", () => onSignal("SIGINT"));
+  process.on("SIGTERM", () => onSignal("SIGTERM"));
+
+  log(`[worker] ${config.worker.name} polling ${config.worker.platformUrl} (caps: ${config.worker.caps.join(", ") || "none"})`);
+  const summary = await runWorkerLoop({ config, apiKey, log, once, signal: abortController.signal });
+  log(`[worker] stopped. claimed=${summary.claimed} completed=${summary.completed} failed=${summary.failed}`);
+  process.exit(summary.failed > 0 && once ? 1 : 0);
+}
+
 async function main() {
   const [, , cmd, ...rest] = process.argv;
   switch (cmd) {
@@ -137,6 +183,9 @@ async function main() {
       break;
     case "report":
       await cmdReport(rest);
+      break;
+    case "worker":
+      await cmdWorker(rest);
       break;
     case "-h":
     case "--help":
@@ -150,7 +199,14 @@ async function main() {
   }
 }
 
-main().catch((e) => {
-  log(`fatal: ${e.stack || e.message}`);
-  process.exit(1);
-});
+// Only run the CLI when this file is the actual entrypoint, not when some
+// future test or tool imports it. Node-20-compatible equivalent of
+// `import.meta.main` (added in Node 24, after this package's engines >=20
+// floor) — compare the resolved module path against argv[1].
+const isEntrypoint = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+if (isEntrypoint) {
+  main().catch((e) => {
+    log(`fatal: ${e.stack || e.message}`);
+    process.exit(1);
+  });
+}
