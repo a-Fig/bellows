@@ -329,6 +329,39 @@ describe("RemoteConductorClient — protocol unit tests (fake conductor server)"
 		}
 	}, 30_000);
 
+	it("locks-bearing hello (thermocline shape) does not crash the host — LOCK_NAMES import regression", async () => {
+		// Found live: thermocline greets with locks: ["human-steering"]. LOCK_NAMES
+		// was imported from contract/protocol (which doesn't export it) instead of
+		// contract/conductor — undefined under vite-node, so the locks filter threw
+		// on the FIRST real hello and the unhandled exception killed the host.
+		// Every fixture here defaulted to locks: [] (filter callback never runs),
+		// which is exactly how 92 green tests missed it.
+		const home = mkdtempSync(path.join(tmpdir(), "bellows-remote-locks-"));
+		const telemetryOut = path.join(home, "telemetry.jsonl");
+		const mock = await new MockExtension({ accordionHome: home }).start();
+		const fake = await new FakeConductor({ locks: ["human-steering"] }).start();
+
+		const host = spawnHost({ accordionHome: home, conductorUrl: fake.url, conductorId: "fake-conductor", budget: 30_000, protect: 5_000, telemetryOut });
+
+		try {
+			await waitFor(() => mock.client !== null, 60_000, "host <-pi extension connect");
+			await waitFor(() => fake.hostHello !== null, 10_000, "host/hello at the fake conductor");
+			// The greet info only lands if handle() survived the locks-bearing hello.
+			await waitFor(
+				() => readTelemetry(telemetryOut).some((e) => e.t === "info" && String(e.message).includes("greeted")),
+				5000,
+				"greet info telemetry after locks-bearing hello",
+			);
+			expect(host.exitCode).toBeNull();
+			// No handler-threw error frame, and the host stayed attached.
+			const errs = readTelemetry(telemetryOut).filter((e) => e.t === "error");
+			expect(errs.map((e) => e.message).join("\n")).not.toMatch(/handler threw|never became ready/);
+		} finally {
+			await mock.close().catch(() => {});
+			fake.close();
+		}
+	}, 30_000);
+
 	it("rev is monotonic and a stale-rev conductor/commands reply is dropped", async () => {
 		const home = mkdtempSync(path.join(tmpdir(), "bellows-remote-rev-"));
 		const telemetryOut = path.join(home, "telemetry.jsonl");

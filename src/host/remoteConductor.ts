@@ -28,9 +28,13 @@ import type {
 	ClampReport,
 	LockName,
 } from "$conductors/contract/conductor";
+// LOCK_NAMES is a VALUE export of contract/conductor, not contract/protocol —
+// importing it from the wrong module is silently `undefined` under vite-node
+// (no typecheck), which crashed the host on thermocline's real locks-bearing
+// hello. Keep it in its own value import so the type-only block above stays.
+import { LOCK_NAMES } from "$conductors/contract/conductor";
 import {
 	CONDUCTOR_PROTOCOL_VERSION,
-	LOCK_NAMES,
 	isConductorMessage,
 	type ContentMode,
 	type ConductorMessage,
@@ -165,7 +169,21 @@ export class RemoteConductorClient implements Conductor {
 			} catch {
 				return;
 			}
-			this.handle(msg);
+			// A throw anywhere in handle() must NEVER escape to the process — an
+			// unhandled exception here kills the host and with it the pi run (the
+			// exact invariant B1 protects on the promise path; this is the
+			// synchronous twin, found live when thermocline's hello crashed v1).
+			try {
+				this.handle(msg);
+			} catch (e) {
+				const err = e instanceof Error ? e : new Error(String(e));
+				this.opts.telemetry.emit({
+					t: "error",
+					at: Date.now(),
+					message: `conductor message handler threw (frame dropped): ${err.message}`,
+				});
+				return;
+			}
 			if (this.greeted) {
 				clearTimeout(dialTimer);
 				this.connectedResolve?.();
