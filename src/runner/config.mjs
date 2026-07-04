@@ -83,8 +83,14 @@ function normalizeWorkerConfig(raw) {
   if (!platformUrl) errs.push("worker.platformUrl: required non-empty string");
   if (!name) errs.push("worker.name: required non-empty string");
   const caps = Array.isArray(raw?.caps) ? raw.caps.filter((c) => typeof c === "string") : [];
-  if (raw?.parallel !== undefined && (!Number.isInteger(raw.parallel) || raw.parallel < 1)) {
-    errs.push("worker.parallel: must be a positive integer if present");
+  // Nit (adversarial review): reject worker.parallel > 1 here, at config-load
+  // time, rather than letting it through and only failing at runWorkerLoop()
+  // startup (src/worker/loop.mjs throws "not yet supported" there). Validate
+  // what the loop actually rejects, so a bad config fails fast with a clear
+  // config-validation error instead of a runtime throw after the worker's
+  // already logged its "polling ..." banner.
+  if (raw?.parallel !== undefined && (!Number.isInteger(raw.parallel) || raw.parallel < 1 || raw.parallel > 1)) {
+    errs.push("worker.parallel: only 1 is supported today (see loop.mjs); must be the integer 1 if present");
   }
   if (errs.length) throw new Error(`Invalid bench config:\n  - ${errs.join("\n  - ")}`);
   return {

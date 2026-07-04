@@ -112,4 +112,34 @@ describe("PlatformClient", () => {
     expect(ok).toBe(false);
     expect(logs.join("\n")).not.toContain(SECRET);
   });
+
+  describe("M3: complete() respects a short deadlineMs on the shutdown path (adversarial review)", () => {
+    it("gives up around the short deadline instead of the default ~5 minute budget", async () => {
+      // Platform that never responds successfully (always 503) — without a
+      // short deadlineMs this would retry for ~5 minutes before giving up.
+      platform.onComplete = () => ({ status: 503, body: { error: "down" } });
+      const start = Date.now();
+      const ok = await client.complete("r1", { worker: "w1", status: "failed", record: {} }, { deadlineMs: 1_500 });
+      const elapsed = Date.now() - start;
+      expect(ok).toBe(false);
+      // Generous upper bound: proves it did NOT fall through to the ~5 minute
+      // default budget, while tolerating this platform's own backoff/timeout math.
+      expect(elapsed).toBeLessThan(10_000);
+      expect(logs.join("\n")).toMatch(/~2s/); // the final give-up log names the short budget, not "~5 minute"
+      expect(logs.join("\n")).not.toContain(SECRET);
+    }, 15_000);
+
+    it("a genuinely unreachable platform (connection refused) still respects a short deadlineMs", async () => {
+      // Point the client at a closed port (nothing listening) instead of the
+      // stub, so every attempt fails fast at the TCP level (not via
+      // httpJson's 60s AbortController timeout) — proving the deadline loop
+      // itself (not just a single attempt's timeout) is what's bounding this.
+      const deadClient = new (client.constructor)({ base: "http://127.0.0.1:1", apiKey: SECRET, log: (m) => logs.push(m) });
+      const start = Date.now();
+      const ok = await deadClient.complete("r1", { worker: "w1", status: "failed", record: {} }, { deadlineMs: 1_500 });
+      const elapsed = Date.now() - start;
+      expect(ok).toBe(false);
+      expect(elapsed).toBeLessThan(10_000);
+    }, 15_000);
+  });
 });

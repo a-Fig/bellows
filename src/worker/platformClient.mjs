@@ -88,7 +88,10 @@ export class PlatformClient {
   /**
    * @param {string} runId
    * @param {string} worker
-   * @returns {Promise<{cancel:boolean}>}
+   * @returns {Promise<{cancel:boolean, conflict:boolean}>} conflict:true means
+   *   HTTP 409 — the platform already considers this run reaped/cancelled
+   *   server-side; the caller should stop driving it without sending a
+   *   duplicate complete() (nit: JSDoc previously omitted `conflict`).
    */
   async heartbeat(runId, worker) {
     const url = `${this.base}/api/bench/runs/${encodeURIComponent(runId)}/heartbeat`;
@@ -138,23 +141,35 @@ export class PlatformClient {
   }
 
   /**
-   * Complete a run. Retries hard (~5 min budget) before giving up — the caller
-   * must keep record.json on disk regardless, and log loudly on final failure.
+   * Complete a run. Retries hard (~5 min budget by default) before giving up —
+   * the caller must keep record.json on disk regardless, and log loudly on
+   * final failure.
+   *
+   * M3 (adversarial review): the default 5-minute retry budget is right for a
+   * normal run completion, but wrong for the shutdown path — SIGINT should
+   * exit promptly, not block on a platform that may be unreachable for minutes.
+   * `deadlineMs` lets the shutdown caller pass a short budget (~10s) instead.
    * @param {string} runId
    * @param {object} body  {worker, status, record, room_id?, error?, session_gz_b64?}
+   * @param {object} [opts]
+   * @param {number} [opts.deadlineMs]  total retry budget in ms (default 5 minutes)
    * @returns {Promise<boolean>} true if the platform accepted it
    */
-  async complete(runId, body) {
+  async complete(runId, body, { deadlineMs = 5 * 60_000 } = {}) {
     const url = `${this.base}/api/bench/runs/${encodeURIComponent(runId)}/complete`;
-    const deadline = Date.now() + 5 * 60_000;
+    const deadline = Date.now() + deadlineMs;
     let attempt = 0;
     while (Date.now() < deadline) {
+      // Cap the per-attempt timeout by whatever's left of the deadline — with a
+      // short shutdown deadlineMs (~10s), a single hung request must not itself
+      // be allowed to run the default 60s and blow past the budget.
+      const attemptTimeoutMs = Math.max(1_000, Math.min(60_000, deadline - Date.now()));
       try {
         const { ok, status, json } = await httpJson(url, {
           method: "POST",
           headers: this._headers(),
           body,
-          timeoutMs: 60_000,
+          timeoutMs: attemptTimeoutMs,
         });
         if (ok) return true;
         if (status === 409) {
@@ -174,7 +189,8 @@ export class PlatformClient {
       if (remaining <= 0) break;
       await sleep(Math.min(backoffMs(attempt, { base: 2_000, cap: 30_000 }), Math.max(1_000, remaining)));
     }
-    this.log(`[platform] FAILED to deliver complete() for run ${runId} after retrying for ~5 minutes. ` +
+    const budgetLabel = deadlineMs >= 60_000 ? `~${Math.round(deadlineMs / 60_000)} minute(s)` : `~${Math.round(deadlineMs / 1000)}s`;
+    this.log(`[platform] FAILED to deliver complete() for run ${runId} after retrying for ${budgetLabel}. ` +
       `record.json is still on disk — resubmit manually once the platform is reachable.`);
     return false;
   }

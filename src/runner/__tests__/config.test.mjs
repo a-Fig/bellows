@@ -146,11 +146,11 @@ describe("normalizeBenchConfig", () => {
   it("keeps caps, pullBeforeClaim, parallel when given", () => {
     const cfg = normalizeBenchConfig({
       ...rawBenchConfigBase,
-      worker: { platformUrl: "https://p", name: "w1", caps: ["in-process", "gpu-probe"], pullBeforeClaim: true, parallel: 2 },
+      worker: { platformUrl: "https://p", name: "w1", caps: ["in-process", "gpu-probe"], pullBeforeClaim: true, parallel: 1 },
     });
     expect(cfg.worker.caps).toEqual(["in-process", "gpu-probe"]);
     expect(cfg.worker.pullBeforeClaim).toBe(true);
-    expect(cfg.worker.parallel).toBe(2);
+    expect(cfg.worker.parallel).toBe(1);
   });
 
   it("rejects a worker section missing platformUrl", () => {
@@ -164,6 +164,15 @@ describe("normalizeBenchConfig", () => {
   it("rejects a non-positive-integer parallel", () => {
     expect(() =>
       normalizeBenchConfig({ ...rawBenchConfigBase, worker: { platformUrl: "https://p", name: "w1", parallel: 0 } }),
+    ).toThrow(/worker.parallel/);
+  });
+
+  it("rejects worker.parallel > 1 at validation time (nit, adversarial review)", () => {
+    // Previously only src/worker/loop.mjs's runWorkerLoop() rejected this, at
+    // startup — after loadBenchConfig had already succeeded and the worker had
+    // logged its "polling ..." banner. Validate what the loop actually rejects.
+    expect(() =>
+      normalizeBenchConfig({ ...rawBenchConfigBase, worker: { platformUrl: "https://p", name: "w1", parallel: 2 } }),
     ).toThrow(/worker.parallel/);
   });
 });
