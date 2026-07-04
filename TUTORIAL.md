@@ -47,7 +47,66 @@ room:
 
 Conductor ids: `builtin`, `cold-score`, `cold-epoch`, `sliding-window`,
 `garbage-collector`, `compaction-naive`, `bear2-hybrid`, `code-skeleton`, `keel`,
-plus `none` for the raw baseline.
+plus `none` for the raw baseline. These are all **in-process** — the headless host
+loads them straight out of Accordion's `IN_PROCESS_CONDUCTORS` registry.
+
+### External conductors (`external:<id>`)
+
+A conductor that runs as its **own process** (the ADR 0007 escape hatch — e.g.
+`thermocline`, which needs its own GPU/Python probe) is addressed with an
+`external:` prefix instead of a bare id:
+
+```yaml
+arms:
+  - conductor: external:thermocline
+  - conductor: keel
+```
+
+What bellows does differently for an `external:<id>` arm:
+
+1. It looks for `<accordionRepo>/conductors/<id>/launch.json` — a small manifest:
+   ```json
+   { "id": "thermocline", "label": "Thermocline", "command": "node", "args": ["thermocline.mjs"], "portEnv": "THERMO_PORT" }
+   ```
+   Missing `launch.json` fails the run immediately with a clear error, before pi is
+   even spawned.
+2. It spawns that command (cwd = the conductor's own directory) with
+   `ACCORDION_HOME` set to the run's isolated accordion-home dir, so the conductor's
+   discovery heartbeat and any per-session persistence stay scoped to this run.
+3. **`portEnv`**: if `launch.json` declares one, bellows allocates a free TCP port
+   and sets that env var before spawning, so the conductor binds a run-private port.
+   **A conductor with no `portEnv` binds its hardcoded default port and therefore
+   cannot appear in more than one arm/run at a time on the same machine** — bellows
+   logs a warning and runs it anyway (useful for a quick single-arm check, unsafe for
+   `parallel > 1` trials or two trials sharing a conductor).
+4. It polls `<accordionHome>/.accordion/conductors/<id>.json` for a fresh heartbeat
+   (the `ConductorEntry` shape from Accordion's `registry.ts`: `id`, `url`, `pid`,
+   `heartbeatAt`, stale after 15s) for up to ~20s, then fails the run with a clear
+   timeout error if the conductor never advertises itself.
+5. The headless host is launched with `--conductor-url <ws url> --conductor-id <id>`
+   instead of `--conductor <id>` — it dials the conductor as a WebSocket **client**
+   (conductor wire protocol v3; the conductor process hosts the server, same topology
+   as Accordion's own remote-conductor support) rather than instantiating it in-process.
+6. The conductor process is killed alongside pi and the host when the run ends —
+   success, cap, crash, or teardown — so nothing is left running after a trial.
+
+`test/fixtures/conductors/echo-conductor/` is a minimal reference implementation of
+this contract (folds the largest non-protected `tool_result` block; no GPU/Python
+dependency) — read it as a template for wiring up a new external conductor, or run it
+directly for a protocol smoke test:
+
+```bash
+cd test/fixtures/conductors/echo-conductor
+node echo-conductor.mjs                 # binds ws://127.0.0.1:7799 by default
+ECHO_PORT=0 node echo-conductor.mjs     # OS-assigned ephemeral port (what bellows uses via portEnv)
+```
+
+It writes its heartbeat to `$ACCORDION_HOME/.accordion/conductors/echo-conductor.json`
+exactly like a real external conductor, so pointing a trial's `bench.config.json →
+accordionRepo` at a directory containing `test/fixtures/conductors/echo-conductor/`
+(or symlinking it under a real Accordion checkout's `conductors/`) is enough to
+exercise the whole spawn → discover → dial → fold pipeline end to end without any
+model/GPU dependency.
 
 ## Run it
 

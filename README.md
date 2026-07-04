@@ -12,11 +12,12 @@ couldn't see: cost, tokens, cache behavior, per-turn usage, and fold telemetry.
 | path | what |
 |---|---|
 | `src/types.ts` | Shared contracts: TrialSpec, RunRecord, Fingerprint, HostEvent. The seam between components. |
-| `src/host/` | Headless conductor host — dials the accordion extension's WS like the GUI does, runs a conductor, sends fold plans. Runs under vite-node (Svelte runes). |
-| `src/runner/` | Trial runner — spawns `pi --mode rpc` per run with isolated `PI_CODING_AGENT_DIR` + `ACCORDION_HOME`, enforces caps, drives the platform run, collects results. |
+| `src/host/` | Headless conductor host — dials the accordion extension's WS like the GUI does, runs a conductor, sends fold plans. Runs under vite-node (Svelte runes). `remoteConductor.ts` is the client for an **external** (out-of-process) conductor, arm syntax `external:<id>` — see [TUTORIAL.md](TUTORIAL.md#external-conductors-externalid). |
+| `src/runner/` | Trial runner — spawns `pi --mode rpc` per run with isolated `PI_CODING_AGENT_DIR` + `ACCORDION_HOME`, enforces caps, drives the platform run, collects results. Also spawns/discovers `external:<id>` conductor processes (`spawnExternalConductor` in `run.mjs`). |
 | `src/report/` | Static HTML report from RunRecords, cross-trial comparison by fingerprint. |
 | `templates/workspace/` | Per-run workspace template (slopcode client + agent briefing). |
 | `trials/` | Trial specs (YAML). |
+| `test/fixtures/` | `conductors/echo-conductor/` — a minimal external-conductor reference/test fixture (no GPU/model dependency). |
 | `runs/` | Output (gitignored): RunRecords + artifacts. |
 
 ## Setup
