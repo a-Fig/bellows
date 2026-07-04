@@ -3,11 +3,13 @@
  * bellows CLI.
  *   bellows run <trial.yaml> [--dry]
  *   bellows report [runsDir] [outFile]
+ *   bellows worker --poll [--once]
  */
 import fs from "node:fs";
 import path from "node:path";
 import { loadBenchConfig, loadTrialSpec } from "../src/runner/config.mjs";
 import { runTrial, planDryRun, resolveRunsRoot } from "../src/runner/schedule.mjs";
+import { runWorkerLoop } from "../src/worker/loop.mjs";
 
 function log(msg) {
   process.stderr.write(msg + "\n");
@@ -19,10 +21,12 @@ function usage() {
 Usage:
   bellows run <trial.yaml> [--dry]   Schedule and execute a trial (or plan it with --dry)
   bellows report [runsDir] [out]     Render RunRecords to an HTML report
+  bellows worker --poll [--once]     Claim + execute runs dispatched by the platform
 
 Options:
   --dry     Print the plan (runs, rooms, dirs, settings) without spawning pi/host
-            or touching the platform.`);
+            or touching the platform.
+  --once    (worker only) Claim and execute at most one run, then exit.`);
 }
 
 async function cmdRun(args) {
@@ -129,6 +133,42 @@ async function cmdReport(args) {
   }
 }
 
+async function cmdWorker(args) {
+  const once = args.includes("--once");
+  // --poll is the documented/expected flag for the long-running form; accepted but not
+  // required to distinguish from --once, since any invocation without --once polls anyway.
+  let config;
+  try {
+    ({ config } = loadBenchConfig(log));
+  } catch (e) {
+    log(`error: ${e.message}`);
+    process.exit(2);
+  }
+  if (!config.worker) {
+    log(`error: bench.config.json has no "worker" section. Add one (see bench.config.example.json):\n` +
+      `  "worker": { "platformUrl": "...", "name": "<worker-name>", "caps": ["in-process"] }`);
+    process.exit(2);
+  }
+  const apiKey = process.env.AGENT_TRIALS_API_KEY;
+  if (!apiKey) {
+    log(`error: AGENT_TRIALS_API_KEY is not set. Export it (never commit it) before running the worker.`);
+    process.exit(2);
+  }
+
+  const abortController = new AbortController();
+  const onSignal = (sig) => {
+    log(`[worker] received ${sig} — finishing the in-flight run (if any) then exiting`);
+    abortController.abort();
+  };
+  process.on("SIGINT", () => onSignal("SIGINT"));
+  process.on("SIGTERM", () => onSignal("SIGTERM"));
+
+  log(`[worker] ${config.worker.name} polling ${config.worker.platformUrl} (caps: ${config.worker.caps.join(", ") || "none"})`);
+  const summary = await runWorkerLoop({ config, apiKey, log, once, signal: abortController.signal });
+  log(`[worker] stopped. claimed=${summary.claimed} completed=${summary.completed} failed=${summary.failed}`);
+  process.exit(summary.failed > 0 && once ? 1 : 0);
+}
+
 async function main() {
   const [, , cmd, ...rest] = process.argv;
   switch (cmd) {
@@ -137,6 +177,9 @@ async function main() {
       break;
     case "report":
       await cmdReport(rest);
+      break;
+    case "worker":
+      await cmdWorker(rest);
       break;
     case "-h":
     case "--help":

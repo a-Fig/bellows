@@ -3,5 +3,12 @@
   "platformBase": "https://agent-trials-407493014719.us-west1.run.app",
   "platformApiKeyEnv": "AGENT_TRIALS_API_KEY",
   "piAgentDir": "C:/Users/smash/.pi/agent",
-  "runsDir": "./runs"
+  "runsDir": "./runs",
+  "worker": {
+    "platformUrl": "https://agent-trials-407493014719.us-west1.run.app",
+    "name": "homeserver-1",
+    "caps": ["in-process", "external-conductors"],
+    "pullBeforeClaim": false,
+    "parallel": 1
+  }
 }

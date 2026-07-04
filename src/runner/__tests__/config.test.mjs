@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { validateTrialSpec, normalizeProblems, splitModel, parseConductorArm } from "../config.mjs";
+import { validateTrialSpec, normalizeProblems, splitModel, parseConductorArm, normalizeBenchConfig } from "../config.mjs";
 
 const base = {
   trial: "t1",
@@ -106,5 +106,64 @@ describe("helpers", () => {
     });
     // provider ids never contain a colon, but modelIds might in theory — first-colon rule
     expect(splitModel("a:b:c")).toEqual({ provider: "a", modelId: "b:c" });
+  });
+});
+
+const rawBenchConfigBase = {
+  accordionRepo: "C:/accordion",
+  platformBase: "https://platform.example/",
+  platformApiKeyEnv: "AGENT_TRIALS_API_KEY",
+};
+
+describe("normalizeBenchConfig", () => {
+  it("omits worker and pricing when absent", () => {
+    const cfg = normalizeBenchConfig({ ...rawBenchConfigBase });
+    expect(cfg.worker).toBeUndefined();
+    expect(cfg.pricing).toBeUndefined();
+    expect(cfg.platformBase).toBe("https://platform.example"); // trailing slash trimmed
+  });
+
+  it("passes pricing through untouched when present", () => {
+    const pricing = { "deepseek/deepseek-v4-flash": { inputPerMtok: 1 } };
+    const cfg = normalizeBenchConfig({ ...rawBenchConfigBase, pricing });
+    expect(cfg.pricing).toEqual(pricing);
+  });
+
+  it("normalizes a well-formed worker section and applies defaults", () => {
+    const cfg = normalizeBenchConfig({
+      ...rawBenchConfigBase,
+      worker: { platformUrl: "https://platform.example/", name: "w1" },
+    });
+    expect(cfg.worker).toEqual({
+      platformUrl: "https://platform.example",
+      name: "w1",
+      caps: [],
+      pullBeforeClaim: false,
+      parallel: 1,
+    });
+  });
+
+  it("keeps caps, pullBeforeClaim, parallel when given", () => {
+    const cfg = normalizeBenchConfig({
+      ...rawBenchConfigBase,
+      worker: { platformUrl: "https://p", name: "w1", caps: ["in-process", "gpu-probe"], pullBeforeClaim: true, parallel: 2 },
+    });
+    expect(cfg.worker.caps).toEqual(["in-process", "gpu-probe"]);
+    expect(cfg.worker.pullBeforeClaim).toBe(true);
+    expect(cfg.worker.parallel).toBe(2);
+  });
+
+  it("rejects a worker section missing platformUrl", () => {
+    expect(() => normalizeBenchConfig({ ...rawBenchConfigBase, worker: { name: "w1" } })).toThrow(/worker.platformUrl/);
+  });
+
+  it("rejects a worker section missing name", () => {
+    expect(() => normalizeBenchConfig({ ...rawBenchConfigBase, worker: { platformUrl: "https://p" } })).toThrow(/worker.name/);
+  });
+
+  it("rejects a non-positive-integer parallel", () => {
+    expect(() =>
+      normalizeBenchConfig({ ...rawBenchConfigBase, worker: { platformUrl: "https://p", name: "w1", parallel: 0 } }),
+    ).toThrow(/worker.parallel/);
   });
 });

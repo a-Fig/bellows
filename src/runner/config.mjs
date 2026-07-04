@@ -47,7 +47,7 @@ export function loadBenchConfig(warn = console.warn) {
 }
 
 /** @returns {import("../types.ts").BenchConfig} */
-function normalizeBenchConfig(raw) {
+export function normalizeBenchConfig(raw) {
   const errs = [];
   if (!raw || typeof raw !== "object") errs.push("config is not an object");
   const s = (k) => (typeof raw[k] === "string" && raw[k].trim() ? raw[k] : null);
@@ -64,6 +64,35 @@ function normalizeBenchConfig(raw) {
     platformApiKeyEnv,
     piAgentDir: s("piAgentDir") || path.join(os.homedir(), ".pi", "agent"),
     runsDir: s("runsDir") || "./runs",
+    pricing: raw.pricing && typeof raw.pricing === "object" ? raw.pricing : undefined,
+    worker: normalizeWorkerConfig(raw.worker),
+  };
+}
+
+/**
+ * Normalize the optional `worker` section of bench.config.json.
+ * @param {any} raw
+ * @returns {import("../types.ts").WorkerConfig | undefined}
+ */
+function normalizeWorkerConfig(raw) {
+  if (raw === undefined) return undefined;
+  const errs = [];
+  if (!raw || typeof raw !== "object") errs.push("worker: must be an object");
+  const platformUrl = typeof raw?.platformUrl === "string" && raw.platformUrl.trim() ? raw.platformUrl : null;
+  const name = typeof raw?.name === "string" && raw.name.trim() ? raw.name : null;
+  if (!platformUrl) errs.push("worker.platformUrl: required non-empty string");
+  if (!name) errs.push("worker.name: required non-empty string");
+  const caps = Array.isArray(raw?.caps) ? raw.caps.filter((c) => typeof c === "string") : [];
+  if (raw?.parallel !== undefined && (!Number.isInteger(raw.parallel) || raw.parallel < 1)) {
+    errs.push("worker.parallel: must be a positive integer if present");
+  }
+  if (errs.length) throw new Error(`Invalid bench config:\n  - ${errs.join("\n  - ")}`);
+  return {
+    platformUrl: platformUrl.replace(/\/+$/, ""),
+    name,
+    caps,
+    pullBeforeClaim: raw?.pullBeforeClaim === true,
+    parallel: raw?.parallel || 1,
   };
 }
 
