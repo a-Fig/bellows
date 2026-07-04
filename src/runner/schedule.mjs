@@ -20,12 +20,15 @@ export function expandRuns(spec, runsRoot) {
   const trialDir = path.join(runsRoot, spec.trial);
   for (const arm of spec.arms) {
     const armName = arm.name || arm.conductor;
+    // The ":" in external:<id> arm names is illegal in Windows paths — sanitize
+    // for the directory only; armName/label keep the real id everywhere else.
+    const armDirName = armName.replace(/[<>:"/\\|?*]/g, "-");
     for (let seed = 1; seed <= (spec.seeds || 1); seed++) {
       runs.push({
         arm: arm.conductor,
         armName,
         seed,
-        runDir: path.join(trialDir, `${armName}-${seed}`),
+        runDir: path.join(trialDir, `${armDirName}-${seed}`),
         label: `${spec.trial}/${armName}/${seed}`,
       });
     }
