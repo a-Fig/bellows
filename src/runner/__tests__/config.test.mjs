@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { validateTrialSpec, normalizeProblems, splitModel } from "../config.mjs";
+import { validateTrialSpec, normalizeProblems, splitModel, parseConductorArm } from "../config.mjs";
 
 const base = {
   trial: "t1",
@@ -56,6 +56,40 @@ describe("validateTrialSpec", () => {
 
   it("validates caps fields", () => {
     expect(() => validateTrialSpec({ ...base, caps: { costUsd: 5, turns: 0, minutes: 90 } })).toThrow(/caps.turns/);
+  });
+
+  it("accepts an external:<id> arm", () => {
+    const spec = validateTrialSpec({ ...base, arms: [{ conductor: "external:thermocline" }] });
+    expect(spec.arms[0].conductor).toBe("external:thermocline");
+    expect(spec.arms[0].name).toBe("external:thermocline"); // defaults to the raw conductor string
+  });
+
+  it("rejects external: with no id", () => {
+    expect(() => validateTrialSpec({ ...base, arms: [{ conductor: "external:" }] })).toThrow(/external conductor id missing/);
+  });
+
+  it("rejects an external id with invalid characters", () => {
+    expect(() => validateTrialSpec({ ...base, arms: [{ conductor: "external:bad id!" }] })).toThrow(/must match/);
+  });
+});
+
+describe("parseConductorArm", () => {
+  it("parses a bare conductor id as in-process", () => {
+    expect(parseConductorArm("builtin")).toEqual({ type: "in-process", id: "builtin" });
+    expect(parseConductorArm("none")).toEqual({ type: "in-process", id: "none" });
+  });
+
+  it("parses external:<id> as external", () => {
+    expect(parseConductorArm("external:thermocline")).toEqual({ type: "external", id: "thermocline" });
+  });
+
+  it("rejects an empty string", () => {
+    expect(() => parseConductorArm("")).toThrow(/non-empty string/);
+  });
+
+  it("rejects external: with a malformed id", () => {
+    expect(() => parseConductorArm("external:has space")).toThrow(/must match/);
+    expect(() => parseConductorArm("external:")).toThrow(/missing/);
   });
 });
 
