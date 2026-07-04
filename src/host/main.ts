@@ -220,6 +220,13 @@ async function main(): Promise<number> {
 
 	/** Build a fresh conductor instance for a (re)attach — in-process id or external URL. */
 	function buildConductor(meta?: { title?: string; model?: string; cwd?: string }): Conductor {
+		// A rebuild (e.g. a `full` sync reset) must not leak the previous client's WS —
+		// a single-connection conductor would otherwise see two live host connections.
+		try {
+			remoteConductor?.close();
+		} catch {
+			/* ignore */
+		}
 		if (inProcEntry) {
 			remoteConductor = null;
 			return maybeSlowWrap(inProcEntry.create() as unknown as Conductor);

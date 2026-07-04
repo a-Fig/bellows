@@ -25,7 +25,10 @@ import path from "node:path";
  * do here) as a portable fallback.
  */
 export function killTree(child, signal = "SIGTERM") {
-  if (!child || child.pid == null || child.exitCode !== null || child.killed) return;
+  // NB: no `child.killed` in this guard — kill() sets it on the FIRST signal, which
+  // would make the SIGTERM→SIGKILL escalation a no-op on POSIX (a child trapping
+  // SIGTERM would survive). exitCode is the only reliable "actually exited" signal.
+  if (!child || child.pid == null || child.exitCode !== null) return;
   if (process.platform === "win32") {
     try {
       execSync(`taskkill /PID ${child.pid} /T /F`, { stdio: ["ignore", "ignore", "ignore"] });
