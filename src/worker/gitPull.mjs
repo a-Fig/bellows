@@ -14,11 +14,16 @@ let lastPullAt = 0;
  * @param {string} args.accordionRepo
  * @param {(m:string)=>void} [args.log]
  * @param {boolean} [args.force]  bypass the once/min throttle (tests)
+ * @returns {boolean} true if the pull ran AND actually moved HEAD (the caller
+ *   should invalidate anything cached off the old checkout — see
+ *   conductorAdvertise.mjs's clearConductorCache, m9 adversarial review). false
+ *   when throttled, a no-op ("Already up to date"), or the pull failed.
  */
 export function maybePullAccordion({ accordionRepo, log = () => {}, force = false }) {
   const now = Date.now();
-  if (!force && now - lastPullAt < PULL_THROTTLE_MS) return;
+  if (!force && now - lastPullAt < PULL_THROTTLE_MS) return false;
   lastPullAt = now;
+  const before = accordionSha(accordionRepo);
   try {
     const out = execFileSync("git", ["-C", accordionRepo, "pull", "--ff-only"], {
       encoding: "utf8",
@@ -29,7 +34,10 @@ export function maybePullAccordion({ accordionRepo, log = () => {}, force = fals
     log(`[worker] git pull --ff-only (${accordionRepo}): ${out.trim().split(/\r?\n/)[0] || "ok"}`);
   } catch (e) {
     log(`[worker] WARN: git pull --ff-only failed for ${accordionRepo}: ${e.message.split(/\r?\n/)[0]} — continuing with the current tree`);
+    return false;
   }
+  const after = accordionSha(accordionRepo);
+  return after !== before && !after.startsWith("unknown(") && !before.startsWith("unknown(");
 }
 
 /** git HEAD of the accordion checkout. Best-effort; "unknown" on failure. */

@@ -55,9 +55,32 @@ export class EventBatcher {
     }
   }
 
-  /** Stop the timer and flush whatever remains. Call once, at run end. */
+  /**
+   * Stop the timer and flush whatever remains. Call once, at run end.
+   *
+   * m6 (adversarial review): a single `flush()` call can miss events pushed
+   * while a *previous* flush was still in flight — `flush()` coalesces onto
+   * the existing `_flushing` promise instead of re-reading `this.queue`, so
+   * anything `push()`ed during that window sits in the queue after the await
+   * resolves. Loop until the queue is empty and no flush is in flight, so a
+   * push that raced the drain still gets sent. Capped at MAX_DRAIN_ITERATIONS
+   * so a platform that's down forever can't spin this forever — any leftover
+   * events at that point count into dropCount via the loop below.
+   */
   async drain() {
     clearInterval(this._timer);
-    await this.flush();
+    const MAX_DRAIN_ITERATIONS = 25; // generous: each iteration sends >=1 real batch
+    let iterations = 0;
+    while ((this.queue.length || this._flushing) && iterations < MAX_DRAIN_ITERATIONS) {
+      await this.flush();
+      iterations++;
+    }
+    if (this.queue.length) {
+      // Gave up after MAX_DRAIN_ITERATIONS with events still queued (platform
+      // unreachable for the whole drain) — count them as dropped rather than
+      // silently discarding them.
+      this.dropCount += this.queue.length;
+      this.queue.length = 0;
+    }
   }
 }

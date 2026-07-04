@@ -17,7 +17,7 @@ import path from "node:path";
 import { PlatformClient, sleep, backoffMs } from "./platformClient.mjs";
 import { EventBatcher } from "./eventBatcher.mjs";
 import { TelemetryTail } from "./telemetryTail.mjs";
-import { advertisedConductors } from "./conductorAdvertise.mjs";
+import { advertisedConductors, clearConductorCache } from "./conductorAdvertise.mjs";
 import { maybePullAccordion, accordionSha } from "./gitPull.mjs";
 import { packSessionForUpload } from "./sessionArchive.mjs";
 import { buildSharedContext, resolveRunsRoot } from "../runner/schedule.mjs";
@@ -26,17 +26,39 @@ import { executeRun as realExecuteRun } from "../runner/run.mjs";
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const IDLE_POLL_BASE_MS = 5_000;
 const IDLE_POLL_JITTER_MS = 2_000;
+// M3 (adversarial review): complete()'s default retry budget is ~5 minutes,
+// which is right for a normal run finishing but wrong on the shutdown path —
+// SIGINT should exit promptly rather than block on an unreachable platform.
+const SHUTDOWN_COMPLETE_DEADLINE_MS = 10_000;
+
+/**
+ * M2 (adversarial review): sanitize an arm name before it becomes a path segment.
+ * `external:<id>` arm names contain a literal colon, which is a reserved path
+ * character on Windows (`ENOENT`/`EINVAL` from fs.mkdirSync) — this worker's
+ * runDir previously built straight from the raw arm name and crashed on any
+ * external-conductor arm. The main bellows checkout fixed the equivalent bug in
+ * schedule.mjs's expandRuns (commit 827a914, not present in this worktree) with
+ * this exact regex; replicated verbatim here so the two fixes are byte-identical
+ * and the branches merge cleanly later.
+ * @param {string} name
+ * @returns {string}
+ */
+export function sanitizeForPath(name) {
+  return name.replace(/[<>:"/\\|?*]/g, "-");
+}
 
 /** Test seam: override the poll/heartbeat cadence so tests don't wait real-world seconds. */
 export const _timing = {
   heartbeatMs: HEARTBEAT_INTERVAL_MS,
   idleBaseMs: IDLE_POLL_BASE_MS,
   idleJitterMs: IDLE_POLL_JITTER_MS,
+  shutdownCompleteDeadlineMs: SHUTDOWN_COMPLETE_DEADLINE_MS,
 };
 export function _resetTiming() {
   _timing.heartbeatMs = HEARTBEAT_INTERVAL_MS;
   _timing.idleBaseMs = IDLE_POLL_BASE_MS;
   _timing.idleJitterMs = IDLE_POLL_JITTER_MS;
+  _timing.shutdownCompleteDeadlineMs = SHUTDOWN_COMPLETE_DEADLINE_MS;
 }
 
 /**
@@ -56,10 +78,14 @@ export function _resetTiming() {
 export async function defaultExecutor({ claimed, config, apiKey, runDir, abortSignal, log }) {
   const spec = claimed.config;
   const { sharedFp } = buildSharedContext(spec, config);
-  // The platform already picked a room for this claimed run when it's provided;
-  // otherwise fall back to the trial's own room supply (create=true trials mint
-  // one). Either way this mirrors RoomPool.lease()'s single-room-per-run contract.
-  const roomId = claimed.roomId || claimed.room_id || spec.room?.pool?.[0] || "";
+  // Nit (adversarial review): claimed.roomId/room_id were phantom reads —
+  // ClaimedRun (src/types.ts) has no such field and POST /workers/claim
+  // (platform/bench_routes.py claim_bench_run) only ever returns
+  // {id, trial, name, config, arm, seed}; the platform doesn't pick rooms for
+  // bench runs. The room always comes from the trial's own room supply
+  // (create=true trials mint one), mirroring RoomPool.lease()'s
+  // single-room-per-run contract.
+  const roomId = spec.room?.pool?.[0] || "";
   return realExecuteRun({
     spec,
     config,
@@ -125,7 +151,13 @@ export async function runWorkerLoop(opts) {
       iterations++;
 
       if (wc.pullBeforeClaim) {
-        maybePullAccordion({ accordionRepo: config.accordionRepo, log });
+        const headMoved = maybePullAccordion({ accordionRepo: config.accordionRepo, log });
+        // m9 (adversarial review): a pull that actually moved HEAD may have added/
+        // removed conductors (new IN_PROCESS_CONDUCTORS registrations, new/removed
+        // conductors/<id>/launch.json dirs) — the 60s conductor-list cache must not
+        // paper over that for up to a minute. clearConductorCache's own docstring
+        // already calls out this exact use.
+        if (headMoved) clearConductorCache();
       }
 
       let conductors = [];
@@ -191,7 +223,8 @@ function waitIdle(signal) {
  */
 async function executeClaimedRun({ claimed, config, apiKey, client, runsRoot, executeRunFn, log, shutdownSignal }) {
   const worker = config.worker.name;
-  const runDir = path.join(runsRoot, "_worker", claimed.trial, `${claimed.arm.name || claimed.arm.conductor}-${claimed.seed}`);
+  const armName = claimed.arm.name || claimed.arm.conductor;
+  const runDir = path.join(runsRoot, "_worker", claimed.trial, `${sanitizeForPath(armName)}-${claimed.seed}`);
   fs.mkdirSync(runDir, { recursive: true });
 
   const events = new EventBatcher({ client, runId: claimed.id, worker });
@@ -251,6 +284,18 @@ async function executeClaimedRun({ claimed, config, apiKey, client, runsRoot, ex
   }, _timing.heartbeatMs);
   heartbeatTimer.unref?.();
 
+  // m8 (adversarial review — documented, not changed, per PM decision): this maps
+  // the run's detailed RunStatus (src/types.ts) down to the platform's two-value
+  // {done, failed}. Only "error" (an infrastructure failure — pi crash, WS death,
+  // ...) becomes "failed". Every capped/aborted status — "aborted-cost",
+  // "aborted-turns", "aborted-time", "aborted-stall" — maps to "done", same as a
+  // clean "completed": a capped run still produced a gradeable result (whatever
+  // checkpoints it reached before the cap), and the platform grades independently
+  // of this status field. "failed" is reserved for "nothing gradeable came out of
+  // this at all" (executor crash, platform-side cancel/reap). The detailed
+  // RunStatus is not lost — it's carried in record.status (record.json) and now
+  // also in the final "status-change" event's data (see below) so a UI can show
+  // "done (aborted-turns)" rather than a bare "done".
   let record = null;
   let status = "done";
   let error = null;
@@ -280,39 +325,63 @@ async function executeClaimedRun({ claimed, config, apiKey, client, runsRoot, ex
     shutdownSignal?.removeEventListener("abort", onShutdown);
   }
 
-  if (reaped) {
-    // The platform already reaped this run server-side (409 on heartbeat) — it will
-    // 409 events/complete too, so don't bother. record.json is still written to disk
-    // by executeRun itself; nothing more to do here.
-    log(`[worker] run ${claimed.id}: platform reaped this run — skipping events/complete`);
-    return false;
+  // m5 (adversarial review): every exit past this point — including the early
+  // `reaped` return — must drain the EventBatcher so its setInterval timer is
+  // always cleared. It used to leak on the reaped path (an early `return`
+  // before `events.drain()`), which left the flush timer running (it's
+  // `.unref()`'d so it doesn't itself hang the process, but a leaked interval
+  // is still a bug — and any *pending* events on that path were silently
+  // dropped without even counting toward dropCount).
+  try {
+    if (reaped) {
+      // The platform already reaped this run server-side (409 on heartbeat) — it will
+      // 409 events/complete too, so don't bother sending them. record.json is still
+      // written to disk by executeRun itself; nothing more to do here.
+      log(`[worker] run ${claimed.id}: platform reaped this run — skipping events/complete`);
+      return false;
+    }
+
+    const { sessionGzB64, skippedReason } = record
+      ? packSessionForUpload(record.artifacts?.agentDir || path.join(runDir, "agent"), log)
+      : { sessionGzB64: null, skippedReason: "no record produced" };
+    if (skippedReason) events.push("warn", { message: `session upload skipped: ${skippedReason}` });
+
+    const completeBody = {
+      worker,
+      status,
+      record: record || syntheticRecord(claimed, error),
+    };
+    // Nit (adversarial review): room_id is deliberately omitted here, not a gap.
+    // claimed never carries a room id (see defaultExecutor's comment above) —
+    // POST .../complete's room_id field is optional and platform/bench_routes.py's
+    // complete_bench_run doesn't require or use it for bench runs, so there is
+    // nothing to echo back.
+    if (error) completeBody.error = error;
+    if (sessionGzB64) completeBody.session_gz_b64 = sessionGzB64;
+
+    // m8: carry the detailed RunStatus (record.status, e.g. "aborted-turns")
+    // alongside the platform's coarse done/failed status so a UI can distinguish
+    // a clean "completed" from a capped run without a second lookup.
+    const detailedStatus = record ? record.status : null;
+    events.push("status-change", { status, detailedStatus });
+
+    // On the shutdown path (SIGINT et al.) give complete() a short deadline
+    // instead of the default ~5 minute retry budget — the process is exiting
+    // and should not hang waiting on a possibly-unreachable platform. Any
+    // shutdown signal firing (not just one that cancelled *this* run) means
+    // we're on that path.
+    const completeOpts = shutdownSignal?.aborted ? { deadlineMs: _timing.shutdownCompleteDeadlineMs } : {};
+    const delivered = await client.complete(claimed.id, completeBody, completeOpts);
+    if (!delivered) {
+      log(`[worker] run ${claimed.id}: complete() was not delivered — record.json remains at ${runDir}`);
+    }
+    return status === "done";
+  } finally {
+    await events.drain();
+    if (events.dropCount > 0) {
+      log(`[worker] run ${claimed.id}: dropped ${events.dropCount} event(s) after retry`);
+    }
   }
-
-  const { sessionGzB64, skippedReason } = record
-    ? packSessionForUpload(record.artifacts?.agentDir || path.join(runDir, "agent"), log)
-    : { sessionGzB64: null, skippedReason: "no record produced" };
-  if (skippedReason) events.push("warn", { message: `session upload skipped: ${skippedReason}` });
-
-  const completeBody = {
-    worker,
-    status,
-    record: record || syntheticRecord(claimed, error),
-  };
-  if (claimed.room_id || claimed.roomId) completeBody.room_id = claimed.room_id || claimed.roomId;
-  if (error) completeBody.error = error;
-  if (sessionGzB64) completeBody.session_gz_b64 = sessionGzB64;
-
-  events.push("status-change", { status });
-  await events.drain();
-  if (events.dropCount > 0) {
-    log(`[worker] run ${claimed.id}: dropped ${events.dropCount} event(s) after retry`);
-  }
-
-  const delivered = await client.complete(claimed.id, completeBody);
-  if (!delivered) {
-    log(`[worker] run ${claimed.id}: complete() was not delivered — record.json remains at ${runDir}`);
-  }
-  return status === "done";
 }
 
 /** A minimal RunRecord-shaped stub for a run that never produced a real record (crash before executor returned). */
