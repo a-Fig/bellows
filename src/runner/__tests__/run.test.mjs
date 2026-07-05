@@ -9,6 +9,8 @@ import {
   getFreePort,
   spawnExternalConductor,
   spawnHost,
+  modelShortName,
+  buildJoinMeta,
 } from "../run.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -31,6 +33,56 @@ describe("platformAgentName", () => {
     const n = platformAgentName("has space/slash", "arm:x", 1);
     expect(n).toMatch(/^[A-Za-z0-9_.-]+$/);
     expect(n.length).toBeLessThanOrEqual(80);
+  });
+});
+
+describe("modelShortName", () => {
+  it("strips a leading token-router: prefix and takes the last path segment", () => {
+    expect(modelShortName("token-router:deepseek/deepseek-v4-flash")).toBe("deepseek-v4-flash");
+  });
+
+  it("takes the last path segment even without a token-router: prefix", () => {
+    expect(modelShortName("anthropic/claude-sonnet")).toBe("claude-sonnet");
+  });
+
+  it("returns the string unchanged when there is no provider prefix or path", () => {
+    expect(modelShortName("gpt-4")).toBe("gpt-4");
+  });
+
+  it("strips token-router: even when there is no further path segment", () => {
+    expect(modelShortName("token-router:solo-model")).toBe("solo-model");
+  });
+});
+
+describe("buildJoinMeta", () => {
+  it("builds display_name as '<armName> · <modelShort> · s<seed>'", () => {
+    const meta = buildJoinMeta({
+      armName: "keel",
+      model: "token-router:deepseek/deepseek-v4-flash",
+      conductor: "external:thermocline",
+      trial: "t1",
+      seed: 3,
+    });
+    expect(meta.display_name).toBe("keel · deepseek-v4-flash · s3");
+    expect(meta.model).toBe("token-router:deepseek/deepseek-v4-flash");
+    expect(meta.conductor).toBe("external:thermocline");
+    expect(meta.trial).toBe("t1");
+    expect(meta.seed).toBe(3);
+  });
+
+  it("seed is coerced to an integer", () => {
+    const meta = buildJoinMeta({ armName: "a", model: "m", conductor: "c", trial: "t", seed: 3.9 });
+    expect(Number.isInteger(meta.seed)).toBe(true);
+    expect(meta.seed).toBe(3);
+  });
+
+  it("caps every string field at 120 chars (truncates, does not throw)", () => {
+    const long = "x".repeat(500);
+    const meta = buildJoinMeta({ armName: long, model: long, conductor: long, trial: long, seed: 1 });
+    expect(meta.display_name.length).toBeLessThanOrEqual(120);
+    expect(meta.model.length).toBeLessThanOrEqual(120);
+    expect(meta.conductor.length).toBeLessThanOrEqual(120);
+    expect(meta.trial.length).toBeLessThanOrEqual(120);
   });
 });
 

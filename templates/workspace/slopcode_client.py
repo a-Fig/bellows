@@ -46,6 +46,17 @@ import urllib.request
 # --- injected by platform at download time ---
 BASE = "__PLATFORM_BASE__"
 KEY  = "__API_KEY__"
+# META_JSON is substituted as a base64-encoded JSON string (a JSON object, or
+# the bare word null) describing this run for the leaderboard's human-readable
+# display (display_name/model/conductor/trial/seed). Base64 keeps the
+# substitution a single opaque token -- safe to splice into a quoted Python
+# string literal regardless of what quote/backslash characters the JSON
+# itself contains. A hand-downloaded client (outside bellows provisioning)
+# keeps the literal token "__SLOPCODE_META_B64__" unsubstituted, which is not
+# valid base64/JSON -- _load_meta() below treats that the same as an explicit
+# null: no meta, join degrades to today's exact behavior ({"name": name} with
+# no "meta" key).
+META_JSON_B64 = "__SLOPCODE_META_B64__"
 # --------------------------------------------
 
 SESSION_FILE = ".slopcode_session.json"
@@ -485,8 +496,28 @@ def _print_grade_result(data: dict, problem: str = ""):
 # Commands
 # ---------------------------------------------------------------------------
 
+def _load_meta():
+    """Decode+parse META_JSON_B64 into a dict, or None if unavailable/invalid.
+
+    Degrades gracefully for a client that predates this feature or was
+    hand-downloaded outside bellows provisioning (unsubstituted placeholder --
+    not valid base64/JSON), and for the explicit "null" bellows writes when no
+    meta was built for this run.
+    """
+    try:
+        raw = base64.b64decode(META_JSON_B64).decode("utf-8")
+        parsed = json.loads(raw)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def cmd_join(room_id: str, name: str):
-    r = _post_no_aid("/rooms/%s/register" % room_id, {"name": name})
+    body = {"name": name}
+    meta = _load_meta()
+    if meta:
+        body["meta"] = meta
+    r = _post_no_aid("/rooms/%s/register" % room_id, body)
     if "agent_id" in r:
         _session["agent_id"] = r["agent_id"]
         _session["room_id"]  = room_id
