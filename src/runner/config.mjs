@@ -7,6 +7,7 @@ import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 import YAML from "yaml";
+import { validateAccordionRef } from "./accordionRef.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 /** Repo root = two levels up from src/runner/. */
@@ -147,6 +148,14 @@ export function validateTrialSpec(raw) {
   if (raw.thinkingLevel !== undefined && !VALID_THINKING.has(raw.thinkingLevel))
     errs.push(`thinkingLevel: "${raw.thinkingLevel}" not one of ${[...VALID_THINKING].join(", ")}`);
 
+  if (raw.accordionRef !== undefined) {
+    try {
+      validateAccordionRef(raw.accordionRef);
+    } catch (e) {
+      errs.push(e.message);
+    }
+  }
+
   if (!Number.isFinite(raw.budget) || raw.budget <= 0)
     errs.push("budget: required positive number");
   if (!Number.isFinite(raw.protectTokens) || raw.protectTokens < 0)
@@ -206,6 +215,7 @@ export function validateTrialSpec(raw) {
     problems: Array.isArray(problems) ? problems.slice() : problems,
     model: raw.model,
     thinkingLevel: raw.thinkingLevel || "medium",
+    ...(raw.accordionRef !== undefined ? { accordionRef: raw.accordionRef } : {}),
     budget: raw.budget,
     protectTokens: raw.protectTokens,
     arms: raw.arms.map((a) => ({ conductor: a.conductor, name: a.name || a.conductor })),

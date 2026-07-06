@@ -28,6 +28,16 @@ export interface TrialSpec {
   model: string;
   /** pi thinking level for all arms. Default "medium". */
   thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high";
+  /**
+   * Optional git rev (branch, tag, or SHA) of the accordion repo to bench. When
+   * set, the runner fetches it from the accordion repo's origin and checks it out
+   * into a pinned, detached worktree WITHOUT touching config.accordionRepo's
+   * working tree; that worktree becomes the effective accordion repo for the run.
+   * Absent => use config.accordionRepo as-is. Must match /^[A-Za-z0-9._\/-]{1,200}$/
+   * and not start with "-". Example: an unmerged conductor PR branch like
+   * "claude/happy-fermat-8b7485".
+   */
+  accordionRef?: string;
   /** Accordion token budget the conductor folds down to. */
   budget: number;
   /** Protected working-tail tokens (accordion protectTokens). */

@@ -8,7 +8,14 @@ import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSafe, killTree } from "./proc.mjs";
-import { parseConductorArm } from "./config.mjs";
+import { parseConductorArm, REPO_ROOT } from "./config.mjs";
+import { resolveEffectiveAccordionRepo } from "./accordionRef.mjs";
+
+/** Resolve runsDir relative to the repo root if not absolute (mirrors schedule.mjs). */
+function runsRootFrom(config) {
+  const rd = config.runsDir || "./runs";
+  return path.isAbsolute(rd) ? rd : path.resolve(REPO_ROOT, rd);
+}
 
 /** Bellows repo root — the host's vite-node config and bench.config.json live here. */
 const BELLOWS_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -76,6 +83,56 @@ export async function executeRun(args) {
   const armDispatch = arm === "none" ? { type: "in-process", id: "none" } : parseConductorArm(arm);
 
   const fingerprint = { ...sharedFp, conductorId: arm };
+  // Per-trial accordionRef: resolve to a pinned worktree (the effective accordion
+  // repo) WITHOUT touching config.accordionRepo's working tree. Absent => use
+  // config.accordionRepo as-is (today's behavior). The resolved SHA overrides the
+  // shared fingerprint's accordionCommit so two runs on different refs fingerprint
+  // differently (the comparison key). Resolution is idempotent + worktree-reused,
+  // so calling it per run (incl. from tests/worker) is cheap.
+  let accordionRepo = config.accordionRepo;
+  if (spec.accordionRef) {
+    try {
+      const eff = resolveEffectiveAccordionRepo({
+        accordionRepo: config.accordionRepo,
+        accordionRef: spec.accordionRef,
+        runsDir: runsRootFrom(config),
+        log: (m) => log(`[${label}] ${m}`),
+      });
+      accordionRepo = eff.repo;
+      if (eff.sha) fingerprint.accordionCommit = eff.sha;
+      log(`[${label}] accordionRef "${eff.ref}" resolved to ${eff.sha} at worktree ${eff.repo}`);
+    } catch (e) {
+      // A bad ref must fail the run cleanly (before spawning anything), not run
+      // silently against the wrong (base-checkout) tree.
+      status = "error";
+      statusDetail = `accordionRef "${spec.accordionRef}" resolution failed: ${e.message}`;
+      log(`[${label}] ERROR: ${statusDetail}`);
+      const endedAt = new Date();
+      const record = {
+        id: label,
+        label,
+        status,
+        statusDetail,
+        fingerprint,
+        timing: { startedAt: startedAt.toISOString(), endedAt: endedAt.toISOString(), wallClockS: 0 },
+        usage: emptyUsage(),
+        turns: [],
+        conductor: null,
+        platform: null,
+        artifacts: { piSessionFile: "", hostTelemetryFile, workspaceDir: runDir, agentDir: runDir },
+      };
+      try {
+        fs.writeFileSync(path.join(runDir, "record.json"), JSON.stringify(record, null, 2));
+      } catch {
+        /* best-effort */
+      }
+      logRunSummary(record, log);
+      return record;
+    }
+  }
+  // Effective-repo-bound config for downstream consumers (provision, host spawn,
+  // external-conductor launch). Only accordionRepo differs from `config`.
+  const effConfig = accordionRepo === config.accordionRepo ? config : { ...config, accordionRepo };
   let workspaceDir = path.join(runDir, "workspace");
   let agentDir = path.join(runDir, "agent");
   let accordionHome = path.join(runDir, "accordion-home");
@@ -93,7 +150,7 @@ export async function executeRun(args) {
     const prov = provisionRun({
       runDir,
       spec,
-      config,
+      config: effConfig,
       roomId,
       agentName,
       runLabel: label,
@@ -124,7 +181,7 @@ export async function executeRun(args) {
     let conductorUrl = null;
     if (armDispatch.type === "external") {
       const spawned = await spawnExternalConductor({
-        config,
+        config: effConfig,
         conductorId: armDispatch.id,
         accordionHome,
         runDir,
@@ -137,7 +194,7 @@ export async function executeRun(args) {
     }
     if (arm !== "none") {
       host = spawnHost({
-        config,
+        config: effConfig,
         arm,
         armDispatch,
         conductorUrl,
@@ -492,9 +549,15 @@ export function spawnHost({ config, arm, armDispatch, conductorUrl, spec, accord
     String(spec.caps.minutes + 5),
   );
   const hostLog = fs.createWriteStream(path.join(runDir, "host-stderr.log"), { flags: "a" });
+  // When a run pins an accordionRef, config.accordionRepo here is already the
+  // effective (pinned-worktree) path — hand it to the host via BELLOWS_ACCORDION_REPO
+  // so accordion.ts loads the engine/conductors from the pinned worktree, not the
+  // default bench.config.json checkout. Always set it (harmless when equal to the
+  // default) so the host never silently disagrees with the runner about which repo.
+  const hostEnv = { ...process.env, BELLOWS_ACCORDION_REPO: config.accordionRepo };
   const child = spawnSafe(process.execPath, hostArgs, {
     cwd: BELLOWS_ROOT,
-    env: { ...process.env },
+    env: hostEnv,
     windowsHide: true,
     stdio: ["ignore", "pipe", "pipe"],
   });

@@ -20,8 +20,19 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 
-/** Resolve the Accordion checkout root from bench.config.json (fallback: the example). */
+/**
+ * Resolve the Accordion checkout root.
+ *
+ * Order: BELLOWS_ACCORDION_REPO (set by the runner per run — the pinned-worktree
+ * path when the trial uses `accordionRef`) FIRST, then bench.config.json, then
+ * the example config. The env override lets a single run point the host at a
+ * specific ref's worktree without mutating any config on disk.
+ */
 export function accordionRepo(): string {
+	const envOverride = process.env.BELLOWS_ACCORDION_REPO;
+	if (envOverride && envOverride.trim()) {
+		return path.resolve(envOverride);
+	}
 	const candidates = [
 		path.resolve(__dirname, "../../bench.config.json"),
 		path.resolve(__dirname, "../../bench.config.example.json"),

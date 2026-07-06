@@ -24,8 +24,19 @@ import path from "node:path";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 
-/** Resolve the Accordion checkout from bench.config.json, else the example config. */
+/**
+ * Resolve the Accordion checkout. BELLOWS_ACCORDION_REPO (set by the runner per
+ * run — the pinned-worktree path for a trial's `accordionRef`) wins FIRST so the
+ * `$conductors` alias points at the SAME tree accordion.ts loads the engine from.
+ * If the two disagreed, the host would import store.svelte.ts from the worktree
+ * but resolve $conductors into the base checkout. Falls back to bench.config.json,
+ * then the example.
+ */
 function accordionRepo(): string {
+	const envOverride = process.env.BELLOWS_ACCORDION_REPO;
+	if (envOverride && envOverride.trim()) {
+		return path.resolve(envOverride);
+	}
 	const candidates = [
 		path.resolve(__dirname, "bench.config.json"),
 		path.resolve(__dirname, "bench.config.example.json"),
