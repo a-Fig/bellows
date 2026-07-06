@@ -56,6 +56,10 @@ export async function executeRun(args) {
   // agent_name (best run_score, case-insensitive) even inside a label filter, so
   // a shared name silently drops all but the best run.
   const agentName = platformAgentName(spec.trial, armName, seed);
+  // Human-readable join metadata — the leaderboard displays this instead of the
+  // raw (unique but gibberish) agent name. Purely additive: an old platform
+  // ignores the extra "meta" body field.
+  const joinMeta = buildJoinMeta({ armName, model: spec.model, conductor: arm, trial: spec.trial, seed });
   const problemsText = Array.isArray(spec.problems) ? spec.problems.join(", ") : String(spec.problems);
   const startedAt = new Date();
 
@@ -95,6 +99,7 @@ export async function executeRun(args) {
       runLabel: label,
       problemsText,
       apiKey,
+      meta: joinMeta,
     });
     workspaceDir = prov.workspaceDir;
     agentDir = prov.agentDir;
@@ -686,6 +691,48 @@ function waitForConductorHeartbeat({ heartbeatPath, conductorId, child, getSpawn
  */
 export function platformAgentName(trial, armName, seed) {
   return `${trial}-${armName}-s${seed}`.replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 80);
+}
+
+const META_FIELD_MAX = 120;
+
+/** Truncate a string to the platform's 120-char field cap (never throws). */
+function clampMetaField(s) {
+  return String(s).slice(0, META_FIELD_MAX);
+}
+
+/**
+ * Shorten a "provider:modelId" (or bare modelId) string for display: strips a
+ * leading "token-router:" provider prefix, then takes the last "/"-separated
+ * path segment. E.g. "token-router:deepseek/deepseek-v4-flash" -> "deepseek-v4-flash".
+ * @param {string} model
+ */
+export function modelShortName(model) {
+  const noProvider = model.startsWith("token-router:") ? model.slice("token-router:".length) : model;
+  const parts = noProvider.split("/");
+  return parts[parts.length - 1];
+}
+
+/**
+ * Build the optional join-meta object surfaced on the leaderboard (see the
+ * platform's POST /rooms/<id>/register `meta` field). Every string field is
+ * capped at 120 chars; this never throws.
+ * @param {object} args
+ * @param {string} args.armName
+ * @param {string} args.model     full "provider:modelId" string
+ * @param {string} args.conductor arm string as used elsewhere (e.g. "external:thermocline")
+ * @param {string} args.trial
+ * @param {number} args.seed
+ * @returns {{display_name:string, model:string, conductor:string, trial:string, seed:number}}
+ */
+export function buildJoinMeta({ armName, model, conductor, trial, seed }) {
+  const displayName = `${armName} · ${modelShortName(model)} · s${seed}`;
+  return {
+    display_name: clampMetaField(displayName),
+    model: clampMetaField(model),
+    conductor: clampMetaField(conductor),
+    trial: clampMetaField(trial),
+    seed: Math.trunc(seed),
+  };
 }
 
 function waitProc(child, ms) {

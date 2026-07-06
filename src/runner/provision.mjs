@@ -46,16 +46,22 @@ export function applyPlaceholders(text, map) {
 
 /**
  * Render the workspace client from the template, injecting the platform base +
- * api key placeholders. Returns the rendered client text (also written to disk
- * by provisionRun).
- * @param {string} clientTmpl  template contents with __PLATFORM_BASE__ / __API_KEY__
+ * api key placeholders (and, optionally, the join-meta object). Returns the
+ * rendered client text (also written to disk by provisionRun).
+ * @param {string} clientTmpl  template contents with __PLATFORM_BASE__ / __API_KEY__ / __SLOPCODE_META_B64__
  * @param {string} base
  * @param {string} apiKey
+ * @param {object} [meta]  optional join metadata (display_name/model/conductor/trial/seed) —
+ *   base64-JSON-encoded so the substitution is a single opaque token regardless of quote/
+ *   backslash characters in the JSON. Omitted/undefined encodes as the JSON literal `null`,
+ *   which the client's _load_meta() treats as "no meta" (degrades to today's join body exactly).
  */
-export function renderClient(clientTmpl, base, apiKey) {
+export function renderClient(clientTmpl, base, apiKey, meta) {
+  const metaJson = JSON.stringify(meta === undefined ? null : meta);
   return applyPlaceholders(clientTmpl, {
     __PLATFORM_BASE__: base,
     __API_KEY__: apiKey,
+    __SLOPCODE_META_B64__: Buffer.from(metaJson, "utf8").toString("base64"),
   });
 }
 
@@ -91,11 +97,13 @@ export function buildSettings({ model, thinkingLevel, accordionRepo }) {
  * @param {string} args.runLabel
  * @param {string} args.problemsText
  * @param {string} args.apiKey             real platform key (NOT logged)
+ * @param {object} [args.meta]              optional join metadata (display_name/model/conductor/
+ *   trial/seed) surfaced on the leaderboard in place of the raw agent name — see renderClient.
  * @returns {{ workspaceDir:string, agentDir:string, accordionHome:string,
  *             briefing:string, settings:object }}
  */
 export function provisionRun(args) {
-  const { runDir, spec, config, roomId, agentName, runLabel, problemsText, apiKey } = args;
+  const { runDir, spec, config, roomId, agentName, runLabel, problemsText, apiKey, meta } = args;
   const workspaceDir = path.join(runDir, "workspace");
   const agentDir = path.join(runDir, "agent");
   const accordionHome = path.join(runDir, "accordion-home");
@@ -105,9 +113,9 @@ export function provisionRun(args) {
 
   // 1. Copy the template into workspace, rendering placeholders. The briefing
   //    template (.tmpl) is rendered to AGENT_BRIEFING.md; the client gets its
-  //    BASE/KEY injected; everything else is copied verbatim.
+  //    BASE/KEY/META injected; everything else is copied verbatim.
   const briefing = renderBriefing({ roomId, agentName, runLabel, problemsText });
-  copyWorkspaceTemplate(workspaceDir, { base: config.platformBase, apiKey, briefing });
+  copyWorkspaceTemplate(workspaceDir, { base: config.platformBase, apiKey, briefing, meta });
 
   // 2. agent dir: settings + copied credentials.
   const settings = buildSettings({
@@ -123,7 +131,7 @@ export function provisionRun(args) {
 }
 
 /** Copy the committed workspace template into dest, rendering placeholders. */
-export function copyWorkspaceTemplate(dest, { base, apiKey, briefing }) {
+export function copyWorkspaceTemplate(dest, { base, apiKey, briefing, meta }) {
   for (const ent of fs.readdirSync(TEMPLATE_DIR, { withFileTypes: true })) {
     const src = path.join(TEMPLATE_DIR, ent.name);
     if (ent.name === "AGENT_BRIEFING.md.tmpl") {
@@ -131,7 +139,7 @@ export function copyWorkspaceTemplate(dest, { base, apiKey, briefing }) {
       continue;
     }
     if (ent.name === "slopcode_client.py") {
-      const rendered = renderClient(fs.readFileSync(src, "utf8"), base, apiKey);
+      const rendered = renderClient(fs.readFileSync(src, "utf8"), base, apiKey, meta);
       fs.writeFileSync(path.join(dest, ent.name), rendered);
       continue;
     }

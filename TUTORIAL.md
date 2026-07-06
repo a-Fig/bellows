@@ -45,6 +45,14 @@ room:
   create: true                  # mint a fresh room per run (PR #98 endpoint)
 ```
 
+When `room.create: true`, `problems` also decides which leaderboard bucket the
+created room lands on (`src/runner/roomConfig.mjs`): `all`/omitted → the full
+bench (no `problem_set`); one of the canonical preset keys (`easy`, `medium`,
+`hard`, `easy-1`, `easy-l1`..`easy-l4`, case-insensitive) → that `problem_set`;
+any other single string or a `problems: [a, b, ...]` list → an explicit
+`problems` array on the room. `room.pool` (pre-created rooms) is unaffected —
+their bucket was decided when they were created.
+
 Conductor ids: `builtin`, `cold-score`, `cold-epoch`, `sliding-window`,
 `garbage-collector`, `compaction-naive`, `bear2-hybrid`, `code-skeleton`, `keel`,
 plus `none` for the raw baseline. These are all **in-process** — the headless host

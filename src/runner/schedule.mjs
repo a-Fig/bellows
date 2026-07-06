@@ -9,6 +9,7 @@ import { sharedFingerprint } from "./fingerprint.mjs";
 import { TEMPLATE_DIR, KICKOFF_PROMPT, renderBriefing } from "./provision.mjs";
 import { executeRun, platformAgentName } from "./run.mjs";
 import { createRoom, probeRoomJoinable, sleep } from "./platform.mjs";
+import { slopcodeRoomConfig } from "./roomConfig.mjs";
 
 /**
  * Expand a spec into the flat list of runs (arm × seed).
@@ -68,13 +69,16 @@ export class RoomPool {
    * @param {boolean} args.create
    * @param {string} args.base
    * @param {string} args.apiKey
+   * @param {string | string[]} [args.problems]  spec.problems — derives the room's
+   *   problem_set/problems bucket (see roomConfig.mjs); omitted => full bench.
    * @param {(m:string)=>void} args.log
    */
-  constructor({ pool, create, base, apiKey, log }) {
+  constructor({ pool, create, base, apiKey, problems, log }) {
     this.available = [...pool];
     this.create = create;
     this.base = base;
     this.apiKey = apiKey;
+    this.problems = problems;
     this.log = log;
     this._waiters = [];
   }
@@ -83,14 +87,16 @@ export class RoomPool {
   async lease() {
     if (this.available.length) return this.available.shift();
     if (this.create) {
+      // Deployed shape (agent-trials PR #98): game_type required; name
+      // auto-generated when omitted. Default auto-reset stays on so created
+      // rooms recycle instead of accumulating against the per-account cap
+      // (scores are harvested from the leaderboard, never live room state).
+      const roomConfig = slopcodeRoomConfig(this.problems);
+      this.log(`[rooms] leaderboard bucket for this trial: ${describeRoomConfig(roomConfig)}`);
       const id = await createRoom({
         base: this.base,
         apiKey: this.apiKey,
-        // Deployed shape (agent-trials PR #98): game_type required; name
-        // auto-generated when omitted. Default auto-reset stays on so created
-        // rooms recycle instead of accumulating against the per-account cap
-        // (scores are harvested from the leaderboard, never live room state).
-        roomConfig: { game_type: "slopcode" },
+        roomConfig,
       });
       this.log(`[rooms] created room ${id}`);
       return id;
@@ -144,6 +150,7 @@ export async function runTrial({ spec, config, apiKey, log }) {
     create: spec.room.create === true,
     base,
     apiKey,
+    problems: spec.problems,
     log,
   });
 
@@ -319,6 +326,12 @@ export function planDryRun(spec, config) {
 
 function normalizeProblemsDisplay(p) {
   return Array.isArray(p) ? p.join(", ") : String(p);
+}
+/** Human-readable summary of a derived roomConfig, for log lines. */
+function describeRoomConfig(roomConfig) {
+  if (roomConfig.problem_set) return `problem_set=${roomConfig.problem_set}`;
+  if (roomConfig.problems) return `problems=[${roomConfig.problems.join(", ")}]`;
+  return "full bench (no problem_set)";
 }
 function splitModelSafe(model) {
   const idx = model.indexOf(":");

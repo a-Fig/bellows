@@ -38,6 +38,31 @@ describe("renderClient", () => {
     expect(tmpl).not.toMatch(/\bat_[A-Za-z0-9_-]{10,}/);
     expect(tmpl).not.toMatch(/\bsk-[A-Za-z0-9]{20,}/);
   });
+
+  it("with no meta arg, injects a base64 encoding of JSON null (client degrades to no-meta join)", () => {
+    const tmpl = fs.readFileSync(CLIENT_TMPL, "utf8");
+    const out = renderClient(tmpl, "https://example.test", "SECRETKEY");
+    expect(out).not.toContain("__SLOPCODE_META_B64__");
+    const b64Line = out.split("\n").find((l) => l.startsWith("META_JSON_B64"));
+    expect(b64Line).toBeTruthy();
+    const literal = b64Line.match(/"([^"]*)"/)[1];
+    expect(Buffer.from(literal, "base64").toString("utf8")).toBe("null");
+  });
+
+  it("with a meta object, injects a base64 encoding that round-trips to the same JSON", () => {
+    const tmpl = fs.readFileSync(CLIENT_TMPL, "utf8");
+    const meta = {
+      display_name: "keel · deepseek-v4-flash · s1",
+      model: "token-router:deepseek/deepseek-v4-flash",
+      conductor: "external:thermocline",
+      trial: "t1",
+      seed: 1,
+    };
+    const out = renderClient(tmpl, "https://example.test", "SECRETKEY", meta);
+    const b64Line = out.split("\n").find((l) => l.startsWith("META_JSON_B64"));
+    const literal = b64Line.match(/"([^"]*)"/)[1];
+    expect(JSON.parse(Buffer.from(literal, "base64").toString("utf8"))).toEqual(meta);
+  });
 });
 
 describe("renderBriefing", () => {
