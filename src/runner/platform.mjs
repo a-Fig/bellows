@@ -233,14 +233,35 @@ export function sleep(ms) {
  * finalizes on the agent's behalf after the run ends. Also makes the
  * leaderboard row `final`, which the harvest prefers.
  *
- * Returns "finalized" | "no-session" | "failed". Never throws.
+ * E_GRADE_PENDING handling: if the agent submitted a solution shortly before
+ * the run ended, the platform refuses finalize with HTTP 400
+ * `{code:"E_GRADE_PENDING"}` until async grading completes (observed up to a
+ * couple of minutes even when healthy). The run is already over at this
+ * point, so a bounded few-minute wait here is acceptable — it never blocks
+ * the runner's own model calls, only this post-run sweep. We poll-and-retry
+ * specifically for this code (other refusal codes are not transient and fail
+ * immediately, matching prior behavior).
+ *
+ * Returns "finalized" | "no-session" | "failed" | "grade-pending-gave-up".
+ * Never throws.
  * @param {object} args
  * @param {string} args.base
  * @param {string} args.apiKey
  * @param {string} args.workspaceDir
  * @param {(m:string)=>void} [args.log]
+ * @param {number} [args.gradePendingPollMs] wait between retries (default ~20s)
+ * @param {number} [args.gradePendingBudgetMs] total wait budget (default ~4 min)
+ * @param {(ms:number)=>Promise<void>} [args.sleepFn] injectable sleep for tests
  */
-export async function finalizeStaleAgent({ base, apiKey, workspaceDir, log = () => {} }) {
+export async function finalizeStaleAgent({
+  base,
+  apiKey,
+  workspaceDir,
+  log = () => {},
+  gradePendingPollMs = 20_000,
+  gradePendingBudgetMs = 240_000,
+  sleepFn = sleep,
+}) {
   let session;
   try {
     const raw = fs.readFileSync(path.join(workspaceDir, ".slopcode_session.json"), "utf8");
@@ -252,17 +273,51 @@ export async function finalizeStaleAgent({ base, apiKey, workspaceDir, log = () 
   const roomId = session.room_id;
   if (!agentId || !roomId) return "no-session";
   const url = `${base.replace(/\/+$/, "")}/rooms/${encodeURIComponent(roomId)}/action`;
-  try {
+
+  async function attemptFinalize() {
     const { ok, json } = await httpJson(url, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-API-Key": apiKey },
       body: { agent_id: agentId, command: "finalize" },
       timeoutMs: 20_000,
     });
+    return { ok, json };
+  }
+
+  try {
+    let { ok, json } = await attemptFinalize();
     if (ok && json && json.ok !== false) {
       log(`[finalize-sweep] finalized agent ${agentId} in room ${roomId}`);
       return "finalized";
     }
+
+    if (json && json.code === "E_GRADE_PENDING") {
+      // Attempt-count bound (budget / poll interval) rather than a wall-clock
+      // deadline — keeps this deterministic under an injected fake sleep in
+      // tests, and is equivalent in production since each iteration always
+      // waits exactly gradePendingPollMs.
+      const maxAttempts = Math.max(1, Math.floor(gradePendingBudgetMs / gradePendingPollMs));
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        log(`[finalize-sweep] grade pending, retry ${attempt}/${maxAttempts}`);
+        await sleepFn(gradePendingPollMs);
+        ({ ok, json } = await attemptFinalize());
+        if (ok && json && json.ok !== false) {
+          log(`[finalize-sweep] finalized agent ${agentId} in room ${roomId} (after grade-pending retry)`);
+          return "finalized";
+        }
+        if (!(json && json.code === "E_GRADE_PENDING")) {
+          // Turned into a different (non-transient) refusal — stop retrying.
+          log(`[finalize-sweep] finalize refused: ${JSON.stringify(json).slice(0, 160)}`);
+          return "failed";
+        }
+      }
+      log(
+        `[finalize-sweep] GIVING UP after ${gradePendingBudgetMs}ms of grade-pending retries — ` +
+          `room ${roomId} (agent ${agentId}) needs MANUAL finalize`,
+      );
+      return "grade-pending-gave-up";
+    }
+
     log(`[finalize-sweep] finalize refused: ${JSON.stringify(json).slice(0, 160)}`);
     return "failed";
   } catch (e) {
