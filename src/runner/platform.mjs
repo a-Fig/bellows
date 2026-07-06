@@ -5,8 +5,12 @@
  *  - room reachability check (join) for pool round-robin reuse
  *
  * The agent itself drives join/label/start/submit/finalize via slopcode_client.py
- * inside its workspace. The runner never mutates a live room's problem state.
+ * inside its workspace. The runner never mutates a live room's problem state —
+ * with ONE exception: the post-run finalize sweep (finalizeStaleAgent), which
+ * acts as the run's own agent to close a game the agent left open.
  */
+import fs from "node:fs";
+import path from "node:path";
 
 /** Small fetch wrapper with timeout. Node 20+ has global fetch. */
 async function httpJson(url, { method = "GET", headers = {}, body, timeoutMs = 30_000 } = {}) {
@@ -200,4 +204,54 @@ export async function probeRoomJoinable({ base, apiKey, roomId, probeName: _prob
 
 export function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Best-effort finalize of the run's agent using the session file the
+ * slopcode client saved in the workspace (`.slopcode_session.json`).
+ *
+ * A run that ends without `finalize` (turn/cost/time cap, crash, agent
+ * forgot) leaves its game open FOREVER — slopcode rooms only schedule their
+ * ~5 min auto-reset on finalize, so an un-finalized game wedges a pooled
+ * room until someone finalizes by hand (observed live three runs straight:
+ * smoke-03, then trials r2/r3). The runner holds the agent's identity, so it
+ * finalizes on the agent's behalf after the run ends. Also makes the
+ * leaderboard row `final`, which the harvest prefers.
+ *
+ * Returns "finalized" | "no-session" | "failed". Never throws.
+ * @param {object} args
+ * @param {string} args.base
+ * @param {string} args.apiKey
+ * @param {string} args.workspaceDir
+ * @param {(m:string)=>void} [args.log]
+ */
+export async function finalizeStaleAgent({ base, apiKey, workspaceDir, log = () => {} }) {
+  let session;
+  try {
+    const raw = fs.readFileSync(path.join(workspaceDir, ".slopcode_session.json"), "utf8");
+    session = JSON.parse(raw);
+  } catch {
+    return "no-session"; // agent never joined (or workspace gone) — nothing to release
+  }
+  const agentId = session.agent_id;
+  const roomId = session.room_id;
+  if (!agentId || !roomId) return "no-session";
+  const url = `${base.replace(/\/+$/, "")}/rooms/${encodeURIComponent(roomId)}/action`;
+  try {
+    const { ok, json } = await httpJson(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-API-Key": apiKey },
+      body: { agent_id: agentId, command: "finalize" },
+      timeoutMs: 20_000,
+    });
+    if (ok && json && json.ok !== false) {
+      log(`[finalize-sweep] finalized agent ${agentId} in room ${roomId}`);
+      return "finalized";
+    }
+    log(`[finalize-sweep] finalize refused: ${JSON.stringify(json).slice(0, 160)}`);
+    return "failed";
+  } catch (e) {
+    log(`[finalize-sweep] finalize error: ${e.message}`);
+    return "failed";
+  }
 }

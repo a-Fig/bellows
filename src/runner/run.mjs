@@ -27,7 +27,7 @@ import {
   collectHostTelemetry,
   enrichTurnsWithWire,
 } from "./collect.mjs";
-import { harvestLeaderboard, normalizeLabel } from "./platform.mjs";
+import { harvestLeaderboard, normalizeLabel, finalizeStaleAgent, sleep as platformSleep } from "./platform.mjs";
 
 const CONDUCTOR_HEARTBEAT_TIMEOUT_MS = 20_000;
 const CONDUCTOR_HEARTBEAT_STALE_MS = 15_000; // mirrors Accordion's STALE_AFTER_MS
@@ -303,6 +303,31 @@ export async function executeRun(args) {
     turns = enrichTurnsWithWire(turns, conductor);
   } catch (e) {
     log(`[${label}] host telemetry collect error: ${e.message}`);
+  }
+
+  // Post-run finalize sweep: if the agent joined but never finalized (caps,
+  // crash, forgot), close its game now — an open game wedges the pooled room
+  // forever (rooms only auto-reset ~5 min AFTER finalize) and leaves the
+  // leaderboard row non-final. Best-effort; retried once after a short wait
+  // in case grading is still pending (finalize is refused mid-grade).
+  try {
+    const swept = await finalizeStaleAgent({
+      base: spec.room.base || config.platformBase,
+      apiKey,
+      workspaceDir,
+      log: (m) => log(`[${label}] ${m}`),
+    });
+    if (swept === "failed") {
+      await platformSleep(30_000);
+      await finalizeStaleAgent({
+        base: spec.room.base || config.platformBase,
+        apiKey,
+        workspaceDir,
+        log: (m) => log(`[${label}] ${m}`),
+      });
+    }
+  } catch (e) {
+    log(`[${label}] finalize sweep error: ${e.message}`);
   }
 
   let platform = null;
