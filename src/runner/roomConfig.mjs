@@ -20,6 +20,10 @@ const PRESET_SET = new Set(PRESET_KEYS);
  */
 export function slopcodeRoomConfig(problems) {
   if (Array.isArray(problems)) {
+    // An ARRAY is always a list of problem NAMES, never presets: `problems:
+    // ["easy-1"]` asks the platform for a problem literally named "easy-1"
+    // (room create 400s on unknown names). To target a preset bucket, use the
+    // bare string form: `problems: easy-1`.
     return { game_type: "slopcode", problems: cleanProblemList(problems) };
   }
 
