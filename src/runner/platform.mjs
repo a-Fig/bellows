@@ -165,25 +165,34 @@ export async function createRoom({ base, apiKey, roomConfig = {} }) {
 }
 
 /**
- * Best-effort probe that a pooled room is reachable/joinable (i.e. it has reset
- * and is ready for a new run). Registers a throwaway agent name; a successful
- * register implies the room accepts new agents. Never throws — returns bool.
+ * Best-effort READ-ONLY probe that a pooled room is joinable (it has reset and
+ * accepts registrations). Checks the spectator view's game phase — the server
+ * only admits registrations while the room is in "waiting" (server.py
+ * register(): `room.state not in ("waiting",)` → 409).
+ *
+ * MUST NOT register: registering flips a slopcode room out of "waiting", so a
+ * register-based probe *consumes* the very reset it is checking for — the
+ * probe succeeds, the game starts with the throwaway agent, and the real
+ * agent's join then 409s (observed live: trial handoff-vs-builtin-easy1-r2,
+ * probe agent bellows_worker_probe_1783309267064_0 locked the room).
+ *
+ * `probeName` is accepted for call-site compatibility but unused.
+ * Never throws — returns bool.
  * @param {object} args
  * @param {string} args.base
  * @param {string} args.apiKey
  * @param {string} args.roomId
- * @param {string} args.probeName
+ * @param {string} [args.probeName]
  */
-export async function probeRoomJoinable({ base, apiKey, roomId, probeName }) {
-  const url = `${base.replace(/\/+$/, "")}/rooms/${encodeURIComponent(roomId)}/register`;
+export async function probeRoomJoinable({ base, apiKey, roomId, probeName: _probeName }) {
+  const url = `${base.replace(/\/+$/, "")}/rooms/${encodeURIComponent(roomId)}/spectate`;
   try {
-    const { ok } = await httpJson(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-API-Key": apiKey },
-      body: { name: probeName },
+    const { ok, json } = await httpJson(url, {
+      method: "GET",
+      headers: { "X-API-Key": apiKey },
       timeoutMs: 20_000,
     });
-    return ok;
+    return ok && json && json.phase === "waiting";
   } catch {
     return false;
   }
