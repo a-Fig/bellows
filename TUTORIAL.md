@@ -58,6 +58,46 @@ Conductor ids: `builtin`, `cold-score`, `cold-epoch`, `sliding-window`,
 plus `none` for the raw baseline. These are all **in-process** — the headless host
 loads them straight out of Accordion's `IN_PROCESS_CONDUCTORS` registry.
 
+### Bench a specific Accordion branch/PR (`accordionRef`)
+
+By default every run uses whatever `bench.config.json → accordionRepo` currently
+has checked out. To bench a **specific git rev** — typically an unmerged conductor
+PR branch — add an optional `accordionRef` to the trial, and bellows uses that ref
+**without touching the main checkout's working tree**:
+
+```yaml
+trial: handoff-vs-naive
+accordionRef: claude/happy-fermat-8b7485   # the Handoff conductor PR branch
+arms:
+  - conductor: handoff                     # a conductor only present on that branch
+  - conductor: compaction-naive
+```
+
+`accordionRef` is any git rev the accordion repo's origin knows — a branch, tag,
+or full SHA (`/^[A-Za-z0-9._\/-]{1,200}$/`, must not start with `-`). When set,
+the runner:
+
+1. fetches the ref onto a **private per-ref refspec**
+   (`git fetch origin +<ref>:refs/bellows-bench/<sha1-of-ref-string>`) and
+   rev-parses that ref to a full SHA — race-free under parallel runs (distinct
+   refs land on distinct files; `FETCH_HEAD` is never consulted). A bare-SHA ref
+   the server refuses to serve falls back to the local object store;
+2. checks that SHA out into a **pinned, detached worktree** under
+   `<runsDir>/_accordion/<sha12>` (reused across runs — a matching worktree is
+   left alone; a broken/mismatched one is recreated);
+3. uses that worktree as the effective accordion repo for the run: the pi
+   `extension/accordion.ts` path, the in-process/external conductors, and the
+   host all load from it, and the run's **fingerprint records the resolved SHA**
+   (so two runs on different refs never share a comparison key).
+
+Absent `accordionRef` ⇒ exactly today's behavior. The pinned worktree needs no
+`npm install`: the host imports only pure TS/rune modules whose `svelte` runtime
+comes from bellows' own `node_modules` and whose `$conductors` alias is supplied
+by `vite-node.config.ts`; the only artifact the fresh worktree lacks
+(`app/.svelte-kit/tsconfig.json`) is provisioned automatically at worktree
+creation. `worker.pullBeforeClaim` only ff-pulls the base checkout's current
+branch and can never disturb these detached pinned worktrees.
+
 ### External conductors (`external:<id>`)
 
 A conductor that runs as its **own process** (the ADR 0007 escape hatch — e.g.
@@ -187,8 +227,11 @@ and agent dir for forensics.
 - **Never delete platform rooms as cleanup** — deleting a room cascades and permanently
   erases that run's scores from the platform.
 - **Unmerged conductor branches**: bellows runs whatever is checked out at
-  `bench.config.json → accordionRepo`. To bench a conductor PR, check out that branch
-  in the Accordion repo (or point accordionRepo at a worktree of it).
+  `bench.config.json → accordionRepo`. To bench a conductor PR without disturbing
+  that checkout, set the trial's **`accordionRef`** field (see *Bench a specific
+  Accordion branch/PR* above) — it fetches the ref and pins a detached worktree.
+  Manually checking the branch out in the Accordion repo also works but mutates the
+  shared checkout.
 - The fingerprint records the Accordion commit, so mixed-checkout comparisons are
   caught by the report, not silently merged.
 

@@ -105,4 +105,16 @@ describe("buildSettings", () => {
     expect(s.compaction).toEqual({ enabled: false });
     expect(s.extensions[0]).toContain("extension/accordion.ts");
   });
+
+  it("points the accordion extension at the EFFECTIVE repo (a pinned accordionRef worktree)", () => {
+    // When a run pins an accordionRef, executeRun hands buildSettings the pinned
+    // worktree path as accordionRepo — the extension must resolve out of that tree.
+    const worktree = "C:/runs/_accordion/deadbeef1234";
+    const s = buildSettings({
+      model: "token-router:deepseek/deepseek-v4-flash",
+      thinkingLevel: "medium",
+      accordionRepo: worktree,
+    });
+    expect(s.extensions[0]).toBe("C:/runs/_accordion/deadbeef1234/extension/accordion.ts");
+  });
 });

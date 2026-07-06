@@ -28,6 +28,25 @@ describe("validateTrialSpec", () => {
     expect(() => validateTrialSpec({ ...base, model: "deepseek-v4-flash" })).toThrow(/provider:modelId/);
   });
 
+  it("accepts a well-formed accordionRef and carries it through", () => {
+    const spec = validateTrialSpec({ ...base, accordionRef: "claude/happy-fermat-8b7485" });
+    expect(spec.accordionRef).toBe("claude/happy-fermat-8b7485");
+  });
+
+  it("omits accordionRef entirely when absent (today's behavior)", () => {
+    const spec = validateTrialSpec({ ...base });
+    expect("accordionRef" in spec).toBe(false);
+  });
+
+  it("rejects an accordionRef that starts with '-' (git-flag injection)", () => {
+    expect(() => validateTrialSpec({ ...base, accordionRef: "--upload-pack=x" })).toThrow(/must not start with/);
+  });
+
+  it("rejects an accordionRef with disallowed characters", () => {
+    expect(() => validateTrialSpec({ ...base, accordionRef: "has space" })).toThrow(/must match/);
+    expect(() => validateTrialSpec({ ...base, accordionRef: "a;b" })).toThrow(/must match/);
+  });
+
   it("rejects a trial name with spaces (used in paths)", () => {
     expect(() => validateTrialSpec({ ...base, trial: "bad name" })).toThrow(/trial/);
   });

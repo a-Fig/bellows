@@ -42,3 +42,7 @@ node bin/bellows.mjs worker --poll               # claim + execute runs the plat
 Runs are the first-class record. Every run carries a condition fingerprint (model, budget,
 problems, template hash, pi version, accordion commit, conductor); the report compares any
 set of runs and warns loudly when fingerprints don't match.
+
+To bench an unmerged conductor PR, add `accordionRef: <branch|tag|sha>` to the trial spec —
+bellows fetches that ref and pins a detached Accordion worktree per run, without touching the
+main checkout (see TUTORIAL.md → *Bench a specific Accordion branch/PR*).

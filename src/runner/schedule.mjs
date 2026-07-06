@@ -164,7 +164,8 @@ export async function runTrial({ spec, config, apiKey, log }) {
   const parallel = Math.max(1, Math.min(spec.parallel || 1, runs.length));
   log(
     `[trial] ${spec.trial}: ${runs.length} runs (${spec.arms.length} arms × ${spec.seeds || 1} seeds), ` +
-      `parallel=${parallel}, rooms=${(spec.room.pool || []).length || (spec.room.create ? "create" : 0)}`,
+      `parallel=${parallel}, rooms=${(spec.room.pool || []).length || (spec.room.create ? "create" : 0)}` +
+      (spec.accordionRef ? `, accordionRef=${spec.accordionRef}` : ""),
   );
 
   const results = new Array(runs.length);
@@ -247,6 +248,8 @@ export function planDryRun(spec, config) {
   lines.push("=== bellows dry run ===");
   lines.push(`trial:      ${spec.trial}`);
   lines.push(`model:      ${spec.model}   thinking=${spec.thinkingLevel}`);
+  if (spec.accordionRef)
+    lines.push(`accordionRef: ${spec.accordionRef}  (fetched from origin + checked out into a pinned worktree under ${resolveRunsRoot(config)}/_accordion/<sha>)`);
   lines.push(`budget:     ${spec.budget}   protect=${spec.protectTokens}`);
   lines.push(`problems:   ${normalizeProblemsDisplay(spec.problems)}`);
   lines.push(`caps:       cost=$${spec.caps.costUsd}  turns=${spec.caps.turns}  minutes=${spec.caps.minutes}`);
