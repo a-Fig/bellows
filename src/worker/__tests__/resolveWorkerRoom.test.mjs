@@ -100,7 +100,7 @@ describe("resolveWorkerRoom", () => {
     expect(roomId).toBe("room-created");
     expect(stub.requests).toHaveLength(1);
     expect(stub.requests[0].url).toBe("/api/rooms");
-    expect(stub.requests[0].body).toEqual({ game_type: "slopcode", problem_set: "easy-1" });
+    expect(stub.requests[0].body).toEqual({ game_type: "slopcode", auto_archive: true, problem_set: "easy-1" });
     expect(logs.some((m) => m.includes("problem_set=easy-1"))).toBe(true);
   });
 
@@ -114,7 +114,7 @@ describe("resolveWorkerRoom", () => {
       log: () => {},
     });
     expect(roomId).toBe("room-created");
-    expect(stub.requests[0].body).toEqual({ game_type: "slopcode", problems: ["xjq"] });
+    expect(stub.requests[0].body).toEqual({ game_type: "slopcode", auto_archive: true, problems: ["xjq"] });
   });
 
   it("throws loudly when there is neither a pool nor room.create", async () => {
