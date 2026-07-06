@@ -77,8 +77,11 @@ arms:
 or full SHA (`/^[A-Za-z0-9._\/-]{1,200}$/`, must not start with `-`). When set,
 the runner:
 
-1. `git fetch origin <ref>` in `accordionRepo` (prefers `origin/<ref>`, then the
-   bare ref, then `FETCH_HEAD`), resolves it to a full SHA;
+1. fetches the ref onto a **private per-ref refspec**
+   (`git fetch origin +<ref>:refs/bellows-bench/<sha1-of-ref-string>`) and
+   rev-parses that ref to a full SHA — race-free under parallel runs (distinct
+   refs land on distinct files; `FETCH_HEAD` is never consulted). A bare-SHA ref
+   the server refuses to serve falls back to the local object store;
 2. checks that SHA out into a **pinned, detached worktree** under
    `<runsDir>/_accordion/<sha12>` (reused across runs — a matching worktree is
    left alone; a broken/mismatched one is recreated);

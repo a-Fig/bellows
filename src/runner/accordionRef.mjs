@@ -26,6 +26,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
 
 /** git rev must be a plausible branch/tag/SHA and must not look like a flag. */
@@ -55,18 +56,53 @@ function git(repo, args, timeoutMs = 120_000) {
   }).trim();
 }
 
-/** Run git without throwing; return {ok, out, err}. */
+/**
+ * Extract the ACTIONABLE git failure reason from an execFileSync error.
+ * e.message's first line is always the generic "Command failed: git ..." wrapper;
+ * the real reason (auth failure / ref not found / offline) is on stderr. Use the
+ * last non-empty stderr line, falling back to the last non-empty message line.
+ */
+function gitErrText(e) {
+  const stderr = typeof e?.stderr === "string" && e.stderr.trim() ? e.stderr : "";
+  const source = stderr || (e && e.message ? e.message : String(e));
+  const lines = source
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  return lines.length ? lines[lines.length - 1] : String(e);
+}
+
+/** Run git without throwing; return {ok, out, err} (err = actionable reason). */
 function gitTry(repo, args, timeoutMs = 120_000) {
   try {
     return { ok: true, out: git(repo, args, timeoutMs), err: "" };
   } catch (e) {
-    return { ok: false, out: "", err: e && e.message ? e.message : String(e) };
+    return { ok: false, out: "", err: gitErrText(e) };
   }
 }
 
 /**
- * Fetch `ref` from origin and resolve it to a full 40-char SHA.
- * Prefer origin's version: try `origin/<ref>`, then `<ref>`, then FETCH_HEAD.
+ * The private per-ref fetch destination: `refs/bellows-bench/<sha1-of-ref-string>`.
+ * Distinct ref STRINGS map to distinct ref files, so two concurrent runs fetching
+ * different refs can never clobber each other's resolution (unlike FETCH_HEAD,
+ * which is a single last-writer-wins file); the SAME ref string maps to the same
+ * file with the same content — a benign overwrite.
+ */
+export function benchRefName(ref) {
+  return `refs/bellows-bench/${crypto.createHash("sha1").update(ref, "utf8").digest("hex")}`;
+}
+
+/**
+ * Fetch `ref` from origin and resolve it to a full 40-char SHA — RACE-FREE.
+ *
+ * Strategy: fetch with an explicit private refspec (`+<ref>:refs/bellows-bench/<h>`)
+ * and rev-parse THAT ref. Resolution never reads FETCH_HEAD and never consults
+ * `origin/<ref>` (whose update by a concurrent fetch of a different ref is not our
+ * signal). For a bare-SHA ref the server may refuse a want-sha fetch
+ * (uploadpack.allowAnySHA1InWant is commonly off) — fall back to resolving the SHA
+ * directly against the local object store (the object is usually already present).
+ * A nonexistent ref fails both paths => clear error carrying git's actual reason.
+ *
  * @param {string} accordionRepo
  * @param {string} ref
  * @param {(m:string)=>void} [log]
@@ -74,20 +110,24 @@ function gitTry(repo, args, timeoutMs = 120_000) {
  */
 export function resolveRefToSha(accordionRepo, ref, log = () => {}) {
   validateAccordionRef(ref);
-  // Fetch the ref from origin. Tolerate failure (the ref may already resolve
-  // locally, or the network may be down) — we still try to resolve below.
-  const fetched = gitTry(accordionRepo, ["fetch", "origin", ref]);
-  if (!fetched.ok) {
-    log(`[accordionRef] WARN: git fetch origin ${ref} failed (${fetched.err.split(/\r?\n/)[0]}) — trying local resolution`);
-  }
-  // Prefer origin's version, then the bare ref, then FETCH_HEAD.
-  for (const candidate of [`origin/${ref}`, ref, "FETCH_HEAD"]) {
-    const r = gitTry(accordionRepo, ["rev-parse", "--verify", `${candidate}^{commit}`]);
+  const dst = benchRefName(ref);
+  const fetched = gitTry(accordionRepo, ["fetch", "origin", `+${ref}:${dst}`]);
+  if (fetched.ok) {
+    // `^{commit}` peels an annotated tag to its commit.
+    const r = gitTry(accordionRepo, ["rev-parse", "--verify", `${dst}^{commit}`]);
     if (r.ok && /^[0-9a-f]{40}$/.test(r.out)) return r.out;
+  } else {
+    log(`[accordionRef] WARN: git fetch origin +${ref}:${dst} failed (${fetched.err})`);
+    // Bare-SHA fallback: the fetch was refused/failed, but the object may already
+    // be in the local store (a prior fetch/clone brought it in).
+    if (/^[0-9a-f]{4,40}$/i.test(ref)) {
+      const r = gitTry(accordionRepo, ["rev-parse", "--verify", `${ref}^{commit}`]);
+      if (r.ok && /^[0-9a-f]{40}$/.test(r.out)) return r.out;
+    }
   }
   throw new Error(
-    `accordionRef: could not resolve "${ref}" to a commit in ${accordionRepo} ` +
-      `(tried origin/${ref}, ${ref}, FETCH_HEAD${fetched.ok ? "" : "; note: git fetch origin " + ref + " failed"})`,
+    `accordionRef: could not resolve "${ref}" from origin of ${accordionRepo}` +
+      (fetched.ok ? ` (fetched, but ${dst} did not resolve to a commit)` : ` (git fetch failed: ${fetched.err})`),
   );
 }
 
@@ -149,7 +189,7 @@ export function ensureWorktree({ accordionRepo, sha, runsDir, log = () => {} }) 
     if (!add.ok) {
       // A racing run may have created it between our check and our add (EEXIST-ish).
       if (worktreeMatches(wt, sha)) return wt;
-      throw new Error(`accordionRef: git worktree add --detach ${wt} ${shortSha(sha)} failed: ${add.err.split(/\r?\n/)[0]}`);
+      throw new Error(`accordionRef: git worktree add --detach ${wt} ${shortSha(sha)} failed: ${add.err}`);
     }
     log(`[accordionRef] created worktree ${wt} @ ${shortSha(sha)}`);
     if (!worktreeMatches(wt, sha)) {
@@ -239,7 +279,7 @@ function removeWorktree(accordionRepo, wt, log) {
   if (!rm.ok) {
     // remove can fail if the registration is already gone; fall back to a manual
     // rmdir + prune so recreation isn't blocked.
-    log(`[accordionRef] worktree remove --force ${wt} failed (${rm.err.split(/\r?\n/)[0]}) — rmdir + prune`);
+    log(`[accordionRef] worktree remove --force ${wt} failed (${rm.err}) — rmdir + prune`);
     try {
       fs.rmSync(wt, { recursive: true, force: true });
     } catch {

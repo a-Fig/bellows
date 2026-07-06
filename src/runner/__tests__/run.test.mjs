@@ -9,12 +9,28 @@ import {
   getFreePort,
   spawnExternalConductor,
   spawnHost,
+  hostEnv,
   modelShortName,
   buildJoinMeta,
 } from "../run.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE_DIR = path.resolve(HERE, "..", "..", "..", "test", "fixtures");
+
+describe("hostEnv — the effective-accordion-repo env seam", () => {
+  it("carries BELLOWS_ACCORDION_REPO = the effective repo (a pinned accordionRef worktree)", () => {
+    // executeRun hands spawnHost/spawnExternalConductor an effConfig whose
+    // accordionRepo is the pinned worktree when the trial sets accordionRef;
+    // both spawn sites spread hostEnv(effConfig) into the child env.
+    expect(hostEnv({ accordionRepo: "C:/runs/_accordion/deadbeef1234" })).toEqual({
+      BELLOWS_ACCORDION_REPO: "C:/runs/_accordion/deadbeef1234",
+    });
+  });
+
+  it("carries the default repo unchanged when no ref is pinned", () => {
+    expect(hostEnv({ accordionRepo: "C:/acc" })).toEqual({ BELLOWS_ACCORDION_REPO: "C:/acc" });
+  });
+});
 
 describe("platformAgentName", () => {
   it("is unique per (trial, arm, seed)", () => {

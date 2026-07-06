@@ -119,7 +119,10 @@ export async function executeRun(args) {
         turns: [],
         conductor: null,
         platform: null,
-        artifacts: { piSessionFile: "", hostTelemetryFile, workspaceDir: runDir, agentDir: runDir },
+        // hostTelemetryFile is null (not the would-be path): this run never spawned
+        // a host, so the file will never exist — matches schedule.mjs's errorRecord
+        // convention for never-started runs.
+        artifacts: { piSessionFile: "", hostTelemetryFile: null, workspaceDir: runDir, agentDir: runDir },
       };
       try {
         fs.writeFileSync(path.join(runDir, "record.json"), JSON.stringify(record, null, 2));
@@ -505,6 +508,23 @@ function driveUntilDone({ pi, spec, log, label, abortSignal }) {
 }
 
 /**
+ * Env overrides for every child process that must see the run's EFFECTIVE
+ * accordion repo — spread into `{ ...process.env, ...hostEnv(config) }` at both
+ * spawn sites (host, external conductor). When a run pins an accordionRef,
+ * config.accordionRepo here is already the pinned-worktree path, so the host's
+ * accordion.ts + vite-node.config.ts load the engine/$conductors from the SAME
+ * tree the runner provisioned. Always set (harmless when equal to the default)
+ * so a child never silently disagrees with the runner about which repo.
+ * Exported as the unit-testable seam for the executeRun -> effConfig ->
+ * BELLOWS_ACCORDION_REPO wiring.
+ * @param {import("../types.ts").BenchConfig} config  effective config for this run
+ * @returns {{BELLOWS_ACCORDION_REPO: string}}
+ */
+export function hostEnv(config) {
+  return { BELLOWS_ACCORDION_REPO: config.accordionRepo };
+}
+
+/**
  * Spawn the headless host child pointing at the shared accordion home.
  * @param {object} args
  * @param {import("../types.ts").BenchConfig} args.config
@@ -549,15 +569,9 @@ export function spawnHost({ config, arm, armDispatch, conductorUrl, spec, accord
     String(spec.caps.minutes + 5),
   );
   const hostLog = fs.createWriteStream(path.join(runDir, "host-stderr.log"), { flags: "a" });
-  // When a run pins an accordionRef, config.accordionRepo here is already the
-  // effective (pinned-worktree) path — hand it to the host via BELLOWS_ACCORDION_REPO
-  // so accordion.ts loads the engine/conductors from the pinned worktree, not the
-  // default bench.config.json checkout. Always set it (harmless when equal to the
-  // default) so the host never silently disagrees with the runner about which repo.
-  const hostEnv = { ...process.env, BELLOWS_ACCORDION_REPO: config.accordionRepo };
   const child = spawnSafe(process.execPath, hostArgs, {
     cwd: BELLOWS_ROOT,
-    env: hostEnv,
+    env: { ...process.env, ...hostEnv(config) },
     windowsHide: true,
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -636,7 +650,7 @@ export function getFreePort() {
 export async function spawnExternalConductor({ config, conductorId, accordionHome, runDir, log, label }) {
   const { dir, launch } = loadConductorLaunchSpec(config.accordionRepo, conductorId);
 
-  const env = { ...process.env, ACCORDION_HOME: accordionHome };
+  const env = { ...process.env, ...hostEnv(config), ACCORDION_HOME: accordionHome };
   if (launch.portEnv) {
     const port = await getFreePort();
     env[launch.portEnv] = String(port);

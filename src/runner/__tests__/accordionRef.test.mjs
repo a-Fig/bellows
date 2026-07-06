@@ -6,6 +6,7 @@ import { execFileSync } from "node:child_process";
 import {
   validateAccordionRef,
   ACCORDION_REF_RE,
+  benchRefName,
   resolveRefToSha,
   ensureWorktree,
   worktreePath,
@@ -122,6 +123,39 @@ describe.skipIf(!GIT_OK)("worktree create/reuse/mismatch (scratch git repo)", ()
 
   it("resolveRefToSha throws on an unknown ref", () => {
     expect(() => resolveRefToSha(srcRepo, "no-such-branch")).toThrow(/could not resolve/);
+  });
+
+  it("the unknown-ref error carries git's actual reason, not the 'Command failed' wrapper", () => {
+    let err = null;
+    try {
+      resolveRefToSha(srcRepo, "no-such-branch");
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeTruthy();
+    expect(err.message).toMatch(/could not resolve/);
+    // The actionable git reason (last non-empty stderr line, e.g. "fatal:
+    // couldn't find remote ref ..."), not execFileSync's generic wrapper line.
+    expect(err.message).toMatch(/couldn't find remote ref|no such ref|not our ref|fatal/i);
+    expect(err.message).not.toMatch(/Command failed: git/);
+  });
+
+  it("resolution pins a private per-ref refspec and never depends on FETCH_HEAD (race-free)", () => {
+    const sha = resolveRefToSha(srcRepo, "pr-branch");
+    expect(sha).toBe(shaB);
+    // The pin landed on the private ref named by the ref STRING's sha1...
+    expect(run(srcRepo, ["rev-parse", benchRefName("pr-branch")])).toBe(shaB);
+    // ...so a concurrent fetch of a DIFFERENT ref clobbering FETCH_HEAD (the old
+    // strategy's last-writer-wins hazard) cannot perturb re-resolution.
+    run(srcRepo, ["fetch", "origin", "main"]);
+    expect(run(srcRepo, ["rev-parse", "FETCH_HEAD"])).toBe(shaA); // FETCH_HEAD now points elsewhere
+    expect(resolveRefToSha(srcRepo, "pr-branch")).toBe(shaB); // still correct
+  });
+
+  it("benchRefName: distinct ref strings map to distinct private refs; same ref is stable", () => {
+    expect(benchRefName("pr-branch")).toBe(benchRefName("pr-branch"));
+    expect(benchRefName("pr-branch")).not.toBe(benchRefName("main"));
+    expect(benchRefName("a/b")).toMatch(/^refs\/bellows-bench\/[0-9a-f]{40}$/);
   });
 
   it("ensureWorktree CREATES a detached worktree checked out at the sha", () => {
