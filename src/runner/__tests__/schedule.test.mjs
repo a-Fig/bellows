@@ -59,7 +59,7 @@ describe("RoomPool.lease — createRoom receives the derived roomConfig", () => 
     expect(roomId).toBe("room-xyz");
     expect(stub.requests).toHaveLength(1);
     expect(stub.requests[0].url).toBe("/api/rooms");
-    expect(stub.requests[0].body).toEqual({ game_type: "slopcode", problem_set: "easy-1" });
+    expect(stub.requests[0].body).toEqual({ game_type: "slopcode", auto_archive: true, problem_set: "easy-1" });
   });
 
   it("an explicit problem-name array is passed through as { problems: [...] }", async () => {
@@ -76,7 +76,7 @@ describe("RoomPool.lease — createRoom receives the derived roomConfig", () => 
     });
 
     await pool.lease();
-    expect(stub.requests[0].body).toEqual({ game_type: "slopcode", problems: ["xjq", "abc"] });
+    expect(stub.requests[0].body).toEqual({ game_type: "slopcode", auto_archive: true, problems: ["xjq", "abc"] });
   });
 
   it("no problems (undefined) -> full-bench roomConfig, matching today's default", async () => {
@@ -85,7 +85,7 @@ describe("RoomPool.lease — createRoom receives the derived roomConfig", () => 
 
     const pool = new RoomPool({ pool: [], create: true, base, apiKey: "k", log: () => {} });
     await pool.lease();
-    expect(stub.requests[0].body).toEqual({ game_type: "slopcode" });
+    expect(stub.requests[0].body).toEqual({ game_type: "slopcode", auto_archive: true });
   });
 
   it("logs the derived leaderboard bucket before creating the room", async () => {
