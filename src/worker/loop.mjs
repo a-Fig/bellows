@@ -22,7 +22,7 @@ import { maybePullAccordion, accordionSha } from "./gitPull.mjs";
 import { packSessionForUpload } from "./sessionArchive.mjs";
 import { buildSharedContext, resolveRunsRoot, describeRoomConfig } from "../runner/schedule.mjs";
 import { executeRun as realExecuteRun } from "../runner/run.mjs";
-import { createRoom } from "../runner/platform.mjs";
+import { createRoom, probeRoomJoinable } from "../runner/platform.mjs";
 import { slopcodeRoomConfig } from "../runner/roomConfig.mjs";
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
@@ -74,16 +74,47 @@ export function _resetTiming() {
  * returns {id, trial, name, config, arm, seed}; the platform never picks
  * rooms for bench runs, so the trial's own room supply is the only source).
  *
+ * Pooled rooms are PROBED before the run launches: an aborted previous run
+ * leaves its game un-finalized and the room rejects registrations until it
+ * auto-resets, so joining cold sends the agent into "Room is not accepting
+ * registrations" and it burns its whole turn cap unscored (observed live:
+ * trial handoff-vs-builtin-easy1 run handoff/s0, 121 turns, no join). We wait
+ * out the reset window with backoff and fail the run loudly if the room never
+ * comes back — a failed run costs nothing; an unjoinable launched run costs
+ * the full cap.
+ *
  * @param {object} args
  * @param {import("../types.ts").TrialSpec} args.spec
  * @param {import("../types.ts").BenchConfig} args.config
  * @param {string} args.apiKey
  * @param {(m:string)=>void} args.log
+ * @param {typeof probeRoomJoinable} [args.probeFn]  test seam
+ * @param {(ms:number)=>Promise<void>} [args.sleepFn]  test seam
  * @returns {Promise<string>} the room id to join
  */
-export async function resolveWorkerRoom({ spec, config, apiKey, log }) {
+export async function resolveWorkerRoom({ spec, config, apiKey, log, probeFn = probeRoomJoinable, sleepFn = sleep }) {
   const pooled = spec.room?.pool?.[0];
-  if (pooled) return pooled;
+  if (pooled) {
+    const base = spec.room.base || config.platformBase;
+    // ~6.5 min of attempts: covers the slopcode room's ~5 min auto-reset after
+    // a finalized run plus scheduling slack.
+    const waitsMs = [0, 15_000, 30_000, 60_000, 90_000, 90_000, 105_000];
+    for (let i = 0; i < waitsMs.length; i++) {
+      if (waitsMs[i] > 0) await sleepFn(waitsMs[i]);
+      const ok = await probeFn({
+        base,
+        apiKey,
+        roomId: pooled,
+        probeName: `bellows_worker_probe_${Date.now()}_${i}`,
+      });
+      if (ok) return pooled;
+      log(`[worker] pooled room ${pooled} not joinable (probe ${i + 1}/${waitsMs.length})`);
+    }
+    throw new Error(
+      `pooled room ${pooled} never became joinable — it likely holds an un-finalized game from an aborted run. ` +
+        "Wait for its auto-reset or supply a different room.",
+    );
+  }
   if (spec.room?.create === true) {
     const base = spec.room.base || config.platformBase;
     const roomConfig = slopcodeRoomConfig(spec.problems);

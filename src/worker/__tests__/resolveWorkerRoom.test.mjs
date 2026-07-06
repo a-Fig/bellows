@@ -36,14 +36,55 @@ describe("resolveWorkerRoom", () => {
     stub = undefined;
   });
 
-  it("prefers a pooled room and makes no network call", async () => {
+  it("prefers a pooled room once it probes joinable", async () => {
+    const probed = [];
     const roomId = await resolveWorkerRoom({
       spec: { room: { pool: ["pooled-room"], create: true } },
       config: { platformBase: "http://127.0.0.1:1" },
       apiKey: "k",
       log: () => {},
+      probeFn: async ({ roomId }) => {
+        probed.push(roomId);
+        return true;
+      },
+      sleepFn: async () => {},
     });
     expect(roomId).toBe("pooled-room");
+    expect(probed).toEqual(["pooled-room"]);
+  });
+
+  it("waits out a not-yet-reset pooled room and succeeds when the probe recovers", async () => {
+    let calls = 0;
+    const sleeps = [];
+    const roomId = await resolveWorkerRoom({
+      spec: { room: { pool: ["pooled-room"] } },
+      config: { platformBase: "http://127.0.0.1:1" },
+      apiKey: "k",
+      log: () => {},
+      probeFn: async () => ++calls >= 3,
+      sleepFn: async (ms) => sleeps.push(ms),
+    });
+    expect(roomId).toBe("pooled-room");
+    expect(calls).toBe(3);
+    expect(sleeps).toEqual([15_000, 30_000]);
+  });
+
+  it("throws loudly when the pooled room never becomes joinable", async () => {
+    let calls = 0;
+    await expect(
+      resolveWorkerRoom({
+        spec: { room: { pool: ["dead-room"] } },
+        config: { platformBase: "http://127.0.0.1:1" },
+        apiKey: "k",
+        log: () => {},
+        probeFn: async () => {
+          calls++;
+          return false;
+        },
+        sleepFn: async () => {},
+      }),
+    ).rejects.toThrow(/never became joinable/);
+    expect(calls).toBe(7);
   });
 
   it("creates a room with the derived problem_set when room.create is set", async () => {

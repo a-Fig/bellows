@@ -14,7 +14,11 @@ python slopcode_client.py join __ROOM_ID__ "__AGENT_NAME__"
 python slopcode_client.py label "__RUN_LABEL__"
 ```
 
-If either command errors, retry it once, then continue — but the label MUST be set.
+If either command errors, wait 30 seconds and retry, up to 3 times. If `join`
+still fails after that (e.g. "Room is not accepting registrations"), STOP the
+run entirely: report the join error as your final message and do no other work.
+An unjoined run can never be scored — burning turns on the problems without a
+room is pure waste. Once joined, the label MUST be set.
 
 ## Room / run identity
 
