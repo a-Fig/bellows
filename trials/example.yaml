@@ -10,9 +10,9 @@ arms:
   - conductor: compaction-naive
 seeds: 3
 caps:
-  costUsd: 5
-  turns: 200
-  minutes: 90
+  costUsd: 20          # standard tier (smoke baseline x2); inert for token-router
+  turns: 10000         # effectively off — the owner's default; wall clock is the backstop
+  minutes: 180
 parallel: 3
 room:
   # until the agent-trials room-create endpoint is deployed, list room ids here.

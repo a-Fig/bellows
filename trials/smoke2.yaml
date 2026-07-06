@@ -1,20 +1,22 @@
-# Second live smoke: exercises room.create (PR #98 endpoint) and the fixed
-# host spawn. Fresh trial name -> fresh label + unique agent name (the
-# leaderboard keeps one row per agent name).
+# Second smoke: exercises room.create (PR #98 endpoint) and the fixed host
+# spawn. Fresh trial name -> fresh label + unique agent name (the leaderboard
+# keeps one row per agent name).
+#
+# Caps are the owner's smoke baseline: turn cap 10000 = effectively off,
+# 90 min wall clock is the real backstop, NO total-token cap.
 trial: smoke2-builtin
 problems: xjq
 model: token-router:deepseek/deepseek-v4-flash
 thinkingLevel: medium
-budget: 25000
-protectTokens: 10000
+budget: 100000
+protectTokens: 20000
 arms:
   - conductor: builtin
 seeds: 1
 caps:
-  costUsd: 1.5
-  turns: 60
-  minutes: 30
-  totalTokens: 1500000
+  costUsd: 10        # inert for token-router ($0 pricing) — validation requires it
+  turns: 10000       # effectively off
+  minutes: 90
 parallel: 1
 room:
   create: true

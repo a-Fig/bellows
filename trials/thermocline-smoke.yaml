@@ -13,10 +13,9 @@ arms:
   - conductor: external:thermocline
 seeds: 1
 caps:
-  costUsd: 2            # inert for token-router ($0 pricing) — validation requires it
-  turns: 40
-  minutes: 25
-  totalTokens: 2000000
+  costUsd: 10           # inert for token-router ($0 pricing) — validation requires it
+  turns: 10000          # owner smoke baseline: effectively off
+  minutes: 90           # wall clock is the real backstop; no total-token cap
 parallel: 1
 room:
   create: true

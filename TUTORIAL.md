@@ -28,18 +28,18 @@ trial: keel-vs-naive-xjq        # unique name; becomes the label prefix
 problems: xjq                   # problem name(s) the agent is told to solve
 model: token-router:deepseek/deepseek-v4-flash
 thinkingLevel: medium
-budget: 25000                   # accordion token budget the conductor folds to
-protectTokens: 10000            # protected working tail
+budget: 100000                  # accordion token budget the conductor folds to
+protectTokens: 20000            # protected working tail
 arms:
   - conductor: keel
   - conductor: compaction-naive
   - conductor: none             # raw baseline (no host attached)
 seeds: 2                        # repeats per arm
-caps:
-  costUsd: 2                    # per run
-  turns: 120                    # assistant messages per run
-  minutes: 60
-  totalTokens: 3000000          # IMPORTANT for token-router (see gotchas)
+caps:                           # smoke baseline: turn cap off, wall clock is the backstop
+  costUsd: 10                   # per run (inert for token-router — see gotchas)
+  turns: 10000                  # assistant messages per run; 10000 = effectively off
+  minutes: 90
+  # totalTokens: 3000000        # optional hard token backstop (see gotchas)
 parallel: 2                     # runs in flight at once
 room:
   create: true                  # mint a fresh room per run (PR #98 endpoint)
@@ -214,7 +214,9 @@ and agent dir for forensics.
 ## Gotchas
 
 - **token-router prices everything at $0** (its models.json entries carry no cost
-  rates), so the dollar cap is inert for those models — always set `caps.totalTokens`.
+  rates), so the dollar cap is inert for those models — `caps.minutes` (wall clock)
+  is the backstop that actually binds; set `caps.totalTokens` only if you want a
+  hard token ceiling on top of it.
   To get real dollar numbers in records, add rates to `bench.config.json`:
   ```json
   "pricing": { "deepseek/deepseek-v4-flash": { "inputPerMtok": 0.0, "outputPerMtok": 0.0, "cacheReadPerMtok": 0.0 } }
