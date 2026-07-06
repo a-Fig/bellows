@@ -7,6 +7,14 @@ import { RoomPool } from "../schedule.mjs";
  * src/worker/__tests__/stubPlatform.mjs (a scripted handler + a request log)
  * but scoped to just this one endpoint since RoomPool.lease() is the only
  * thing under test here.
+ *
+ * NOTE: these body assertions previously pinned the flattened (bug) shape —
+ * { game_type, auto_archive, problem_set/problems } sent verbatim as the
+ * whole POST body — which is how the createRoom envelope bug shipped
+ * unnoticed: the platform reads game_type from the top level but the room
+ * config from a nested `config` key, so every field except game_type was
+ * silently dropped server-side. Now asserts the corrected envelope
+ * { game_type, config: { ... } }.
  */
 class StubRoomsApi {
   constructor() {
@@ -59,7 +67,10 @@ describe("RoomPool.lease — createRoom receives the derived roomConfig", () => 
     expect(roomId).toBe("room-xyz");
     expect(stub.requests).toHaveLength(1);
     expect(stub.requests[0].url).toBe("/api/rooms");
-    expect(stub.requests[0].body).toEqual({ game_type: "slopcode", auto_archive: true, problem_set: "easy-1" });
+    expect(stub.requests[0].body).toEqual({
+      game_type: "slopcode",
+      config: { auto_archive: true, problem_set: "easy-1" },
+    });
   });
 
   it("an explicit problem-name array is passed through as { problems: [...] }", async () => {
@@ -76,7 +87,10 @@ describe("RoomPool.lease — createRoom receives the derived roomConfig", () => 
     });
 
     await pool.lease();
-    expect(stub.requests[0].body).toEqual({ game_type: "slopcode", auto_archive: true, problems: ["xjq", "abc"] });
+    expect(stub.requests[0].body).toEqual({
+      game_type: "slopcode",
+      config: { auto_archive: true, problems: ["xjq", "abc"] },
+    });
   });
 
   it("no problems (undefined) -> full-bench roomConfig, matching today's default", async () => {
@@ -85,7 +99,7 @@ describe("RoomPool.lease — createRoom receives the derived roomConfig", () => 
 
     const pool = new RoomPool({ pool: [], create: true, base, apiKey: "k", log: () => {} });
     await pool.lease();
-    expect(stub.requests[0].body).toEqual({ game_type: "slopcode", auto_archive: true });
+    expect(stub.requests[0].body).toEqual({ game_type: "slopcode", config: { auto_archive: true } });
   });
 
   it("logs the derived leaderboard bucket before creating the room", async () => {
