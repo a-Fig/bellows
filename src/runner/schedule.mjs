@@ -331,7 +331,7 @@ function normalizeProblemsDisplay(p) {
   return Array.isArray(p) ? p.join(", ") : String(p);
 }
 /** Human-readable summary of a derived roomConfig, for log lines. */
-function describeRoomConfig(roomConfig) {
+export function describeRoomConfig(roomConfig) {
   if (roomConfig.problem_set) return `problem_set=${roomConfig.problem_set}`;
   if (roomConfig.problems) return `problems=[${roomConfig.problems.join(", ")}]`;
   return "full bench (no problem_set)";

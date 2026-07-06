@@ -20,8 +20,10 @@ import { TelemetryTail } from "./telemetryTail.mjs";
 import { advertisedConductors, clearConductorCache } from "./conductorAdvertise.mjs";
 import { maybePullAccordion, accordionSha } from "./gitPull.mjs";
 import { packSessionForUpload } from "./sessionArchive.mjs";
-import { buildSharedContext, resolveRunsRoot } from "../runner/schedule.mjs";
+import { buildSharedContext, resolveRunsRoot, describeRoomConfig } from "../runner/schedule.mjs";
 import { executeRun as realExecuteRun } from "../runner/run.mjs";
+import { createRoom } from "../runner/platform.mjs";
+import { slopcodeRoomConfig } from "../runner/roomConfig.mjs";
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const IDLE_POLL_BASE_MS = 5_000;
@@ -62,6 +64,40 @@ export function _resetTiming() {
 }
 
 /**
+ * Resolve the room a platform-dispatched run should join, mirroring
+ * RoomPool.lease()'s single-room-per-run contract: prefer a pooled room,
+ * otherwise mint one when `room.create` is set. A run without either is
+ * refused loudly — silently passing an empty room id sends the agent into a
+ * workspace with a blank `__ROOM_ID__` and it burns its whole turn cap
+ * looking for a room (that exact failure shipped: claimed.roomId/room_id were
+ * phantom reads — ClaimedRun has no such field and POST /workers/claim only
+ * returns {id, trial, name, config, arm, seed}; the platform never picks
+ * rooms for bench runs, so the trial's own room supply is the only source).
+ *
+ * @param {object} args
+ * @param {import("../types.ts").TrialSpec} args.spec
+ * @param {import("../types.ts").BenchConfig} args.config
+ * @param {string} args.apiKey
+ * @param {(m:string)=>void} args.log
+ * @returns {Promise<string>} the room id to join
+ */
+export async function resolveWorkerRoom({ spec, config, apiKey, log }) {
+  const pooled = spec.room?.pool?.[0];
+  if (pooled) return pooled;
+  if (spec.room?.create === true) {
+    const base = spec.room.base || config.platformBase;
+    const roomConfig = slopcodeRoomConfig(spec.problems);
+    log(`[worker] room.create: leaderboard bucket ${describeRoomConfig(roomConfig)}`);
+    const id = await createRoom({ base, apiKey, roomConfig });
+    log(`[worker] created room ${id}`);
+    return id;
+  }
+  throw new Error(
+    "run has no room: spec.room.pool is empty and room.create is not true — refusing to launch an agent with a blank room id",
+  );
+}
+
+/**
  * Production executor: wraps src/runner/run.mjs's executeRun with the shared
  * fingerprint + a room id, matching what schedule.mjs's runTrial does per run —
  * reused as-is per the brief ("your job is a wrapper, not a rewrite").
@@ -78,14 +114,7 @@ export function _resetTiming() {
 export async function defaultExecutor({ claimed, config, apiKey, runDir, abortSignal, log }) {
   const spec = claimed.config;
   const { sharedFp } = buildSharedContext(spec, config);
-  // Nit (adversarial review): claimed.roomId/room_id were phantom reads —
-  // ClaimedRun (src/types.ts) has no such field and POST /workers/claim
-  // (platform/bench_routes.py claim_bench_run) only ever returns
-  // {id, trial, name, config, arm, seed}; the platform doesn't pick rooms for
-  // bench runs. The room always comes from the trial's own room supply
-  // (create=true trials mint one), mirroring RoomPool.lease()'s
-  // single-room-per-run contract.
-  const roomId = spec.room?.pool?.[0] || "";
+  const roomId = await resolveWorkerRoom({ spec, config, apiKey, log });
   return realExecuteRun({
     spec,
     config,
