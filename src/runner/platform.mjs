@@ -140,18 +140,33 @@ function num(v) {
 /**
  * Create a room via POST /api/rooms (API-key gated). Tolerates 404 with a
  * clear "endpoint not deployed" error so the flag can ship ahead of the server.
+ *
+ * The platform reads `game_type` (and optional `name`) from the TOP level of
+ * the POST body, but reads the room config (problem_set/problems/auto_archive/
+ * ...) from a nested `config` KEY — it does not merge top-level fields into
+ * the config. `roomConfig` here is the flattened shape produced by
+ * slopcodeRoomConfig() (`{ game_type, problem_set?/problems?, auto_archive }`),
+ * so this splits it into the envelope the server actually expects:
+ * `{ game_type, name?, config: { ...rest } }`. Sending roomConfig verbatim as
+ * the whole body silently drops every config field server-side (confirmed
+ * live: a worker-created room stored only `{ created_by }` — no problem_set,
+ * no problems, no auto_archive — while a `config`-wrapped curl POST stored
+ * both correctly).
  * @param {object} args
  * @param {string} args.base
  * @param {string} args.apiKey
- * @param {object} [args.roomConfig]  passed through as the request body
+ * @param {object} [args.roomConfig]  flattened shape from slopcodeRoomConfig();
+ *   split into { game_type, name?, config } before sending
  * @returns {Promise<string>} the new room id
  */
 export async function createRoom({ base, apiKey, roomConfig = {} }) {
   const url = `${base.replace(/\/+$/, "")}/api/rooms`;
+  const { game_type, name, ...config } = roomConfig;
+  const body = { game_type, ...(name !== undefined ? { name } : {}), config };
   const { status, ok, json } = await httpJson(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-API-Key": apiKey },
-    body: roomConfig,
+    body,
     timeoutMs: 30_000,
   });
   if (status === 404) {

@@ -2,7 +2,17 @@ import { describe, it, expect, afterEach } from "vitest";
 import http from "node:http";
 import { resolveWorkerRoom } from "../loop.mjs";
 
-/** Same tiny POST /api/rooms stub style as src/runner/__tests__/schedule.test.mjs. */
+/**
+ * Same tiny POST /api/rooms stub style as src/runner/__tests__/schedule.test.mjs.
+ *
+ * NOTE: these body assertions previously pinned the flattened (bug) shape —
+ * { game_type, auto_archive, problem_set/problems } sent verbatim as the
+ * whole POST body — which is how the createRoom envelope bug shipped
+ * unnoticed: the platform reads game_type from the top level but the room
+ * config from a nested `config` key, so every field except game_type was
+ * silently dropped server-side. Now asserts the corrected envelope
+ * { game_type, config: { ... } }.
+ */
 class StubRoomsApi {
   constructor() {
     this.requests = [];
@@ -100,7 +110,10 @@ describe("resolveWorkerRoom", () => {
     expect(roomId).toBe("room-created");
     expect(stub.requests).toHaveLength(1);
     expect(stub.requests[0].url).toBe("/api/rooms");
-    expect(stub.requests[0].body).toEqual({ game_type: "slopcode", auto_archive: true, problem_set: "easy-1" });
+    expect(stub.requests[0].body).toEqual({
+      game_type: "slopcode",
+      config: { auto_archive: true, problem_set: "easy-1" },
+    });
     expect(logs.some((m) => m.includes("problem_set=easy-1"))).toBe(true);
   });
 
@@ -114,7 +127,10 @@ describe("resolveWorkerRoom", () => {
       log: () => {},
     });
     expect(roomId).toBe("room-created");
-    expect(stub.requests[0].body).toEqual({ game_type: "slopcode", auto_archive: true, problems: ["xjq"] });
+    expect(stub.requests[0].body).toEqual({
+      game_type: "slopcode",
+      config: { auto_archive: true, problems: ["xjq"] },
+    });
   });
 
   it("throws loudly when there is neither a pool nor room.create", async () => {
