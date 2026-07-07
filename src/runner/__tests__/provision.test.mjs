@@ -1,5 +1,6 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -7,11 +8,14 @@ import {
   renderClient,
   renderBriefing,
   buildSettings,
+  writeJoinMeta,
+  copyWorkspaceTemplate,
+  META_FILE,
 } from "../provision.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(__dirname, "..", "..", "..");
-const CLIENT_TMPL = path.join(REPO, "templates", "workspace", "slopcode_client.py");
+const CLIENT_TMPL = path.join(REPO, "templates", "workspace", "platform_client.py");
 const BRIEFING_TMPL = path.join(REPO, "templates", "workspace", "AGENT_BRIEFING.md.tmpl");
 
 describe("applyPlaceholders", () => {
@@ -39,52 +43,107 @@ describe("renderClient", () => {
     expect(tmpl).not.toMatch(/\bsk-[A-Za-z0-9]{20,}/);
   });
 
-  it("with no meta arg, injects a base64 encoding of JSON null (client degrades to no-meta join)", () => {
+  it("the vanilla client carries NO meta placeholder (meta travels via .slopcode_meta.json)", () => {
     const tmpl = fs.readFileSync(CLIENT_TMPL, "utf8");
-    const out = renderClient(tmpl, "https://example.test", "SECRETKEY");
-    expect(out).not.toContain("__SLOPCODE_META_B64__");
-    const b64Line = out.split("\n").find((l) => l.startsWith("META_JSON_B64"));
-    expect(b64Line).toBeTruthy();
-    const literal = b64Line.match(/"([^"]*)"/)[1];
-    expect(Buffer.from(literal, "base64").toString("utf8")).toBe("null");
+    // The old bellows fork had __SLOPCODE_META_B64__; the vanilla client must not.
+    expect(tmpl).not.toContain("__SLOPCODE_META_B64__");
+  });
+});
+
+describe("writeJoinMeta / copyWorkspaceTemplate — join metadata as a file", () => {
+  const dirs = [];
+  const mkdir = () => {
+    const d = fs.mkdtempSync(path.join(os.tmpdir(), "bellows-prov-"));
+    dirs.push(d);
+    return d;
+  };
+  afterEach(() => {
+    for (const d of dirs.splice(0)) {
+      try {
+        fs.rmSync(d, { recursive: true, force: true });
+      } catch {
+        /* ignore */
+      }
+    }
   });
 
-  it("with a meta object, injects a base64 encoding that round-trips to the same JSON", () => {
-    const tmpl = fs.readFileSync(CLIENT_TMPL, "utf8");
-    const meta = {
-      display_name: "keel · deepseek-v4-flash · s1",
-      model: "token-router:deepseek/deepseek-v4-flash",
-      conductor: "external:thermocline",
-      trial: "t1",
-      seed: 1,
-    };
-    const out = renderClient(tmpl, "https://example.test", "SECRETKEY", meta);
-    const b64Line = out.split("\n").find((l) => l.startsWith("META_JSON_B64"));
-    const literal = b64Line.match(/"([^"]*)"/)[1];
-    expect(JSON.parse(Buffer.from(literal, "base64").toString("utf8"))).toEqual(meta);
+  const META = {
+    display_name: "keel · deepseek-v4-flash · s1",
+    model: "token-router:deepseek/deepseek-v4-flash",
+    conductor: "external:thermocline",
+    trial: "t1",
+    seed: 1,
+  };
+
+  it("writeJoinMeta writes exactly buildJoinMeta's whitelisted shape as JSON", () => {
+    const dir = mkdir();
+    writeJoinMeta(dir, META);
+    const written = JSON.parse(fs.readFileSync(path.join(dir, META_FILE), "utf8"));
+    expect(written).toEqual(META);
+    // The platform whitelist is display_name/model/conductor/trial (strings) + seed (int).
+    expect(Object.keys(written).sort()).toEqual(["conductor", "display_name", "model", "seed", "trial"]);
+    expect(Number.isInteger(written.seed)).toBe(true);
+  });
+
+  it("writeJoinMeta is a no-op when meta is undefined (client joins with today's body)", () => {
+    const dir = mkdir();
+    writeJoinMeta(dir, undefined);
+    expect(fs.existsSync(path.join(dir, META_FILE))).toBe(false);
+  });
+
+  it("copyWorkspaceTemplate writes the meta file alongside the rendered client", () => {
+    const dir = mkdir();
+    copyWorkspaceTemplate(dir, {
+      base: "https://example.test",
+      apiKey: "SECRETKEY",
+      briefing: "briefing body",
+      meta: META,
+    });
+    // client rendered with real base/key, no leftover placeholders
+    const client = fs.readFileSync(path.join(dir, "platform_client.py"), "utf8");
+    expect(client).toContain('BASE = "https://example.test"');
+    expect(client).not.toContain("__API_KEY__");
+    // briefing landed
+    expect(fs.readFileSync(path.join(dir, "AGENT_BRIEFING.md"), "utf8")).toBe("briefing body");
+    // meta file landed with the right content
+    const written = JSON.parse(fs.readFileSync(path.join(dir, META_FILE), "utf8"));
+    expect(written).toEqual(META);
+  });
+
+  it("copyWorkspaceTemplate writes no meta file when meta is omitted", () => {
+    const dir = mkdir();
+    copyWorkspaceTemplate(dir, {
+      base: "https://example.test",
+      apiKey: "SECRETKEY",
+      briefing: "briefing body",
+      meta: undefined,
+    });
+    expect(fs.existsSync(path.join(dir, META_FILE))).toBe(false);
   });
 });
 
 describe("renderBriefing", () => {
-  it("wires room/label/name/problems and puts the label step first", () => {
+  it("wires room/name/label/base and leaves no unrendered placeholders", () => {
     const tmpl = fs.readFileSync(BRIEFING_TMPL, "utf8");
     const out = renderBriefing({
       roomId: "ROOM123",
       agentName: "agent_x",
       runLabel: "t/keel/1",
-      problemsText: "easy-1, easy-2",
+      platformBase: "https://example.test",
       tmpl,
     });
     expect(out).toContain("ROOM123");
     expect(out).toContain("agent_x");
     expect(out).toContain('label "t/keel/1"');
-    expect(out).toContain("easy-1, easy-2");
+    expect(out).toContain("https://example.test");
+    // the agent self-serves the game client from the platform
+    expect(out).toContain("get-client slopcode");
+    // no placeholder should survive rendering — including the removed __PROBLEMS__
     expect(out).not.toContain("__ROOM_ID__");
-    // LABEL step must appear before the main loop
-    const labelIdx = out.indexOf("LABEL FIRST");
-    const loopIdx = out.indexOf("The loop");
-    expect(labelIdx).toBeGreaterThan(-1);
-    expect(labelIdx).toBeLessThan(loopIdx);
+    expect(out).not.toContain("__AGENT_NAME__");
+    expect(out).not.toContain("__RUN_LABEL__");
+    expect(out).not.toContain("__PLATFORM_BASE__");
+    expect(out).not.toContain("__PROBLEMS__");
   });
 });
 

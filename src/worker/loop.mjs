@@ -24,6 +24,7 @@ import { buildSharedContext, resolveRunsRoot, describeRoomConfig } from "../runn
 import { executeRun as realExecuteRun } from "../runner/run.mjs";
 import { createRoom, probeRoomJoinable } from "../runner/platform.mjs";
 import { slopcodeRoomConfig } from "../runner/roomConfig.mjs";
+import { isProblemScoped } from "../runner/config.mjs";
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const IDLE_POLL_BASE_MS = 5_000;
@@ -95,6 +96,23 @@ export function _resetTiming() {
 export async function resolveWorkerRoom({ spec, config, apiKey, log, probeFn = probeRoomJoinable, sleepFn = sleep }) {
   const pooled = spec.room?.pool?.[0];
   if (pooled) {
+    // Pooled + problem-scoped = silent mis-scoping (same hazard validateTrialSpec
+    // guards on the LOCAL run/--dry path): a pooled room's problem set is baked
+    // in at create time and spec.problems is only applied on the create branch
+    // below, so a claimed spec asking for a subset would silently run whatever
+    // the pooled room carries. Claimed (platform-dispatched) specs never pass
+    // through validateTrialSpec, so this is THE guard for the worker path.
+    // Throwing here is safe and loud: defaultExecutor calls this before
+    // executeRun, and executeClaimedRun's catch folds any executor throw into a
+    // failed complete() carrying this message — no room join is ever attempted.
+    if (isProblemScoped(spec.problems)) {
+      throw new Error(
+        "room.pool + a problem-scoped `problems` cannot be honored: pooled rooms carry the " +
+          "problem set they were created with, and bellows only applies `problems` when it " +
+          "creates a room. Use room.create for a problems subset, or drop `problems` (use " +
+          "`problems: all`) and pre-scope the pool room's problem_set at creation.",
+      );
+    }
     const base = spec.room.base || config.platformBase;
     // ~6.5 min of attempts: covers the slopcode room's ~5 min auto-reset after
     // a finalized run plus scheduling slack.

@@ -19,7 +19,7 @@ caps:
   minutes: 90
 parallel: 1
 room:
-  pool:
-    - 882d0ab6-772a-4ee1-9cd4-27cd35824491   # bellows-smoke-1
-    - 7c305b25-4c75-4ade-91d2-ed4f58f6ce35   # bellows-smoke-2
-  create: false
+  # Problem-SCOPED (`problems: xjq`), so create the room (bellows scopes a room's
+  # problem_set only at create time). A pooled + scoped spec is rejected at
+  # validation. Created rooms auto-archive at finalize.
+  create: true

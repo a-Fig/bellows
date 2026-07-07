@@ -16,7 +16,7 @@ couldn't see: cost, tokens, cache behavior, per-turn usage, and fold telemetry.
 | `src/runner/` | Trial runner — spawns `pi --mode rpc` per run with isolated `PI_CODING_AGENT_DIR` + `ACCORDION_HOME`, enforces caps, drives the platform run, collects results. Also spawns/discovers `external:<id>` conductor processes (`spawnExternalConductor` in `run.mjs`). |
 | `src/report/` | Static HTML report from RunRecords, cross-trial comparison by fingerprint. |
 | `src/worker/` | `bellows worker` daemon — the execution-plane half of the platform control loop: claims runs from `/api/bench/workers/claim`, drives them through `src/runner/run.mjs`'s `executeRun`, streams heartbeats/events, reports `complete`. See [TUTORIAL.md](TUTORIAL.md#worker-mode-bellows-worker). |
-| `templates/workspace/` | Per-run workspace template (slopcode client + agent briefing). |
+| `templates/workspace/` | Per-run workspace template (vanilla platform client + agent briefing). The agent self-serves the slopcode game client via `platform_client.py get-client slopcode`. |
 | `trials/` | Trial specs (YAML). |
 | `test/fixtures/` | `conductors/echo-conductor/` — a minimal external-conductor reference/test fixture (no GPU/model dependency). |
 | `runs/` | Output (gitignored): RunRecords + artifacts. |
