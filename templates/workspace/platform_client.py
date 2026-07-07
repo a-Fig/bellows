@@ -45,10 +45,24 @@ KEY  = "__API_KEY__"
 def _get(path: str) -> bytes:
     req = urllib.request.Request(f"{BASE}{path}", headers={"X-API-Key": KEY})
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             return resp.read()
     except urllib.error.HTTPError as e:
         return e.read()
+
+
+def _get_status(path: str) -> tuple[int, bytes]:
+    """Like _get but returns (http_status, body). status 0 signals a
+    network/URL error with no HTTP response. Callers that must not silently
+    save an error body (e.g. get-client) branch on the status."""
+    req = urllib.request.Request(f"{BASE}{path}", headers={"X-API-Key": KEY})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+    except (urllib.error.URLError, OSError, TimeoutError) as e:
+        return 0, f"Network error: {e}".encode("utf-8")
 
 
 def _post_json(path: str, body: dict) -> dict:
@@ -63,7 +77,7 @@ def _post_json(path: str, body: dict) -> dict:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         body = e.read()
@@ -104,7 +118,8 @@ def get_client(game_type: str, save_as: str | None = None) -> list[str]:
     saved = []
 
     save_as = save_as or f"{game_type}_client.py"
-    raw = _get(f"/games/{game_type}/client.py")
+    status, raw = _get_status(f"/games/{game_type}/client.py")
+
     # The server returns a JSON {"error": ...} body (not Python) for an unknown
     # game type. Detect that before writing, so a typo doesn't leave a corrupt
     # .py file on disk that fails with a confusing syntax error when run.
@@ -117,6 +132,28 @@ def get_client(game_type: str, save_as: str | None = None) -> list[str]:
             print(f"Could not download client: {err}")
             print("Check the game type. Run 'python platform_client.py lobby' to see available games.")
             sys.exit(1)
+
+    # Guard against saving a non-client error body verbatim. A 5xx/HTML proxy
+    # page or an empty body must NOT be written as `<game>_client.py` and then
+    # run as garbage. The served client is a Python file that starts with the
+    # `#!/usr/bin/env python3` shebang; require HTTP 200 and that positive
+    # marker. Anything else is an error we surface loudly on stderr.
+    stripped = raw.lstrip()
+    if status != 200 or not stripped or not stripped.startswith(b"#!/"):
+        detail = raw.decode("utf-8", errors="replace").strip()
+        if len(detail) > 200:
+            detail = detail[:200] + "..."
+        print(
+            f"Could not download client for {game_type!r}: "
+            f"unexpected server response (HTTP {status}).",
+            file=sys.stderr,
+        )
+        if detail:
+            print(f"Response body: {detail}", file=sys.stderr)
+        else:
+            print("Response body was empty.", file=sys.stderr)
+        sys.exit(1)
+
     content = raw.decode()
     with open(save_as, "w", encoding="utf-8") as f:
         f.write(content)
