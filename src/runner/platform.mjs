@@ -4,8 +4,10 @@
  *  - optional room creation (behind room.create flag)
  *  - room reachability check (join) for pool round-robin reuse
  *
- * The agent itself drives join/label/start/submit/finalize via slopcode_client.py
- * inside its workspace. The runner never mutates a live room's problem state —
+ * The agent itself self-serves the game client from the platform
+ * (`platform_client.py get-client slopcode`) and then drives
+ * join/label/start/submit/finalize via the downloaded slopcode_client.py inside
+ * its workspace. The runner never mutates a live room's problem state —
  * with ONE exception: the post-run finalize sweep (finalizeStaleAgent), which
  * acts as the run's own agent to close a game the agent left open.
  */
