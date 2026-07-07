@@ -424,12 +424,14 @@ async function executeClaimedRun({ claimed, config, apiKey, client, runsRoot, ex
       status,
       record: record || syntheticRecord(claimed, error),
     };
-    // Nit (adversarial review): room_id is deliberately omitted here, not a gap.
-    // `roomId` (captured via onRoomResolved, see above) is now reported on every
-    // heartbeat as soon as it's known, and the platform persists it there — so
-    // there is nothing left to echo back on complete(). POST .../complete's
-    // room_id field is optional and platform/bench_routes.py's complete_bench_run
-    // doesn't require or use it for bench runs either.
+    // room_id: complete() is the AUTHORITATIVE report; the heartbeat's room_id
+    // is only the early report enabling live grading detail mid-run. The
+    // platform's db.complete_bench_run persists room_id UNCONDITIONALLY from
+    // this body (`SET room_id = %s`), so omitting it here left completed worker
+    // runs with room_id = NULL — and would even wipe a room_id the heartbeat
+    // had already persisted mid-run. Include it whenever the room resolved;
+    // omit only when it never did (executor failed before resolveWorkerRoom).
+    if (roomId) completeBody.room_id = roomId;
     if (error) completeBody.error = error;
     if (sessionGzB64) completeBody.session_gz_b64 = sessionGzB64;
 

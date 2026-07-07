@@ -190,6 +190,13 @@ describe("runWorkerLoop", { timeout: 20_000 }, () => {
     expect(heartbeatReqs.length).toBeGreaterThanOrEqual(2);
     expect(heartbeatReqs[0].body).not.toHaveProperty("room_id");
     expect(heartbeatReqs[heartbeatReqs.length - 1].body.room_id).toBe("room-live-42");
+
+    // complete() is the AUTHORITATIVE room_id report — the platform's
+    // db.complete_bench_run persists room_id unconditionally from this body,
+    // so once the room is known it must be carried here too (omitting it would
+    // wipe the value the heartbeat already persisted mid-run).
+    const completeReq = platform.requests.find((r) => r.url === "/api/bench/runs/run-1/complete");
+    expect(completeReq.body.room_id).toBe("room-live-42");
   });
 
   it("M2: an external:<id> arm name (literal colon) does not crash runDir provisioning", async () => {
@@ -382,6 +389,9 @@ describe("runWorkerLoop", { timeout: 20_000 }, () => {
     const completeReq = platform.requests.find((r) => r.url === "/api/bench/runs/run-throw/complete");
     expect(completeReq.body.status).toBe("failed");
     expect(completeReq.body.error).toMatch(/boom: pi crashed/);
+    // The executor threw before onRoomResolved ever fired — the room was never
+    // known, so complete() must omit room_id entirely (not send null).
+    expect(completeReq.body).not.toHaveProperty("room_id");
   });
 
   it("never logs the API key across the whole claim/execute/complete lifecycle", async () => {
