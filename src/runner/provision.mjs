@@ -1,7 +1,9 @@
 /**
  * Per-run directory provisioning: workspace/, agent/, accordion-home/.
  *
- * - workspace/  = rendered template (client with BASE+KEY injected, briefing).
+ * - workspace/  = rendered template (client with BASE+KEY injected, briefing,
+ *   and — when meta is supplied — a `.slopcode_meta.json` the slopcode client
+ *   reads at join time to label the leaderboard row).
  * - agent/      = PI_CODING_AGENT_DIR (settings.json + copied auth.json/models.json).
  * - accordion-home/ = empty dir shared by pi (ACCORDION_HOME) and the host.
  */
@@ -18,22 +20,26 @@ export const KICKOFF_PROMPT =
 
 /**
  * Render the briefing text for a run. Pure — safe to hash for the fingerprint.
+ *
+ * The briefing is game+room+label only: the agent self-serves the game client
+ * (`get-client slopcode`), joins the room, sets its label, and follows the
+ * SlopCode guide. It deliberately does NOT enumerate problems — the room's own
+ * problem set is authoritative (see roomConfig.mjs / the pooled-vs-scoped guard
+ * in config.mjs). So there is no `__PROBLEMS__` token to substitute.
  * @param {object} args
  * @param {string} args.roomId
  * @param {string} args.agentName
  * @param {string} args.runLabel
- * @param {string} args.problemsText
  * @param {string} [args.platformBase]  platform URL, rendered into the briefing for reference
  * @param {string} [args.tmpl]  raw briefing template (defaults to file on disk)
  */
-export function renderBriefing({ roomId, agentName, runLabel, problemsText, platformBase, tmpl }) {
+export function renderBriefing({ roomId, agentName, runLabel, platformBase, tmpl }) {
   const raw = tmpl ?? fs.readFileSync(BRIEFING_TMPL, "utf8");
   return applyPlaceholders(raw, {
     __PLATFORM_BASE__: platformBase ?? "",
     __ROOM_ID__: roomId,
     __AGENT_NAME__: agentName,
     __RUN_LABEL__: runLabel,
-    __PROBLEMS__: problemsText,
   });
 }
 
@@ -46,25 +52,42 @@ export function applyPlaceholders(text, map) {
   return out;
 }
 
+/** Filename the slopcode client reads at join time for leaderboard labels. */
+export const META_FILE = ".slopcode_meta.json";
+
 /**
- * Render the workspace client from the template, injecting the platform base +
- * api key placeholders (and, optionally, the join-meta object). Returns the
- * rendered client text (also written to disk by provisionRun).
- * @param {string} clientTmpl  template contents with __PLATFORM_BASE__ / __API_KEY__ / __SLOPCODE_META_B64__
+ * Render the vanilla platform client from the template, injecting only the
+ * platform base + api key placeholders. Returns the rendered client text (also
+ * written to disk by provisionRun).
+ *
+ * Join metadata is NOT injected into the client any more. The old bellows-only
+ * slopcode fork carried a `__SLOPCODE_META_B64__` placeholder + `_load_meta()`;
+ * the platform's vanilla client has neither. Leaderboard labels now travel via a
+ * `.slopcode_meta.json` file written next to the client (see writeJoinMeta),
+ * which the slopcode client's cmd_join reads from its CWD.
+ * @param {string} clientTmpl  template contents with __PLATFORM_BASE__ / __API_KEY__
  * @param {string} base
  * @param {string} apiKey
- * @param {object} [meta]  optional join metadata (display_name/model/conductor/trial/seed) —
- *   base64-JSON-encoded so the substitution is a single opaque token regardless of quote/
- *   backslash characters in the JSON. Omitted/undefined encodes as the JSON literal `null`,
- *   which the client's _load_meta() treats as "no meta" (degrades to today's join body exactly).
  */
-export function renderClient(clientTmpl, base, apiKey, meta) {
-  const metaJson = JSON.stringify(meta === undefined ? null : meta);
+export function renderClient(clientTmpl, base, apiKey) {
   return applyPlaceholders(clientTmpl, {
     __PLATFORM_BASE__: base,
     __API_KEY__: apiKey,
-    __SLOPCODE_META_B64__: Buffer.from(metaJson, "utf8").toString("base64"),
   });
+}
+
+/**
+ * Write the optional `.slopcode_meta.json` the slopcode client reads at join
+ * time. `meta` is buildJoinMeta's output — the platform whitelists exactly
+ * {display_name, model, conductor, trial} (strings) + {seed} (int), so this is
+ * already the right shape. A no-op when meta is undefined (the client treats an
+ * absent file as "no meta" and joins with today's body exactly).
+ * @param {string} dir   workspace directory (the client's CWD at join time)
+ * @param {object} [meta]
+ */
+export function writeJoinMeta(dir, meta) {
+  if (meta === undefined) return;
+  fs.writeFileSync(path.join(dir, META_FILE), JSON.stringify(meta, null, 2));
 }
 
 /**
@@ -97,15 +120,15 @@ export function buildSettings({ model, thinkingLevel, accordionRepo }) {
  * @param {string} args.roomId
  * @param {string} args.agentName
  * @param {string} args.runLabel
- * @param {string} args.problemsText
  * @param {string} args.apiKey             real platform key (NOT logged)
  * @param {object} [args.meta]              optional join metadata (display_name/model/conductor/
- *   trial/seed) surfaced on the leaderboard in place of the raw agent name — see renderClient.
+ *   trial/seed) written to workspace/.slopcode_meta.json and surfaced on the leaderboard in
+ *   place of the raw agent name — see writeJoinMeta.
  * @returns {{ workspaceDir:string, agentDir:string, accordionHome:string,
  *             briefing:string, settings:object }}
  */
 export function provisionRun(args) {
-  const { runDir, spec, config, roomId, agentName, runLabel, problemsText, apiKey, meta } = args;
+  const { runDir, spec, config, roomId, agentName, runLabel, apiKey, meta } = args;
   const workspaceDir = path.join(runDir, "workspace");
   const agentDir = path.join(runDir, "agent");
   const accordionHome = path.join(runDir, "accordion-home");
@@ -115,8 +138,9 @@ export function provisionRun(args) {
 
   // 1. Copy the template into workspace, rendering placeholders. The briefing
   //    template (.tmpl) is rendered to AGENT_BRIEFING.md; the client gets its
-  //    BASE/KEY/META injected; everything else is copied verbatim.
-  const briefing = renderBriefing({ roomId, agentName, runLabel, problemsText, platformBase: config.platformBase });
+  //    BASE/KEY injected; join metadata is written as .slopcode_meta.json;
+  //    everything else is copied verbatim.
+  const briefing = renderBriefing({ roomId, agentName, runLabel, platformBase: config.platformBase });
   copyWorkspaceTemplate(workspaceDir, { base: config.platformBase, apiKey, briefing, meta });
 
   // 2. agent dir: settings + copied credentials.
@@ -141,7 +165,7 @@ export function copyWorkspaceTemplate(dest, { base, apiKey, briefing, meta }) {
       continue;
     }
     if (ent.name === "platform_client.py") {
-      const rendered = renderClient(fs.readFileSync(src, "utf8"), base, apiKey, meta);
+      const rendered = renderClient(fs.readFileSync(src, "utf8"), base, apiKey);
       fs.writeFileSync(path.join(dest, ent.name), rendered);
       continue;
     }
@@ -149,6 +173,10 @@ export function copyWorkspaceTemplate(dest, { base, apiKey, briefing, meta }) {
     if (ent.isDirectory()) fs.cpSync(src, path.join(dest, ent.name), { recursive: true });
     else fs.copyFileSync(src, path.join(dest, ent.name));
   }
+  // The join-meta file lives alongside the client so the slopcode client's
+  // cmd_join finds it in its CWD. Written last, after the verbatim pass, so a
+  // stray committed .slopcode_meta.json could never shadow the real one.
+  writeJoinMeta(dest, meta);
 }
 
 /** Copy a credential file programmatically (never read/log its contents). */

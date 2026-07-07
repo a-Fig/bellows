@@ -311,7 +311,6 @@ export function planDryRun(spec, config) {
       roomId: pool.length ? pool[0] : "<ROOM_ID>",
       agentName: platformAgentName(spec.trial, r0.armName, r0.seed),
       runLabel: r0.label,
-      problemsText: Array.isArray(spec.problems) ? spec.problems.join(", ") : String(spec.problems),
       platformBase: base,
     });
     lines.push("--- example rendered AGENT_BRIEFING.md (run 1, first ~24 lines) ---");

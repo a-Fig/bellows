@@ -67,7 +67,6 @@ export async function executeRun(args) {
   // raw (unique but gibberish) agent name. Purely additive: an old platform
   // ignores the extra "meta" body field.
   const joinMeta = buildJoinMeta({ armName, model: spec.model, conductor: arm, trial: spec.trial, seed });
-  const problemsText = Array.isArray(spec.problems) ? spec.problems.join(", ") : String(spec.problems);
   const startedAt = new Date();
 
   /** @type {import("../types.ts").RunStatus} */
@@ -157,7 +156,6 @@ export async function executeRun(args) {
       roomId,
       agentName,
       runLabel: label,
-      problemsText,
       apiKey,
       meta: joinMeta,
     });
