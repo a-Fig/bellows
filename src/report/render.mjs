@@ -86,13 +86,16 @@ function renderConductorTelemetry(t) {
 }
 
 function renderRunDetail(run) {
-  const aborted = isAborted(run);
   const statusClass = `status-${run.status}`;
-  const scoreText = aborted
-    ? scorelessKind(run) === "harvest-failed"
-      ? `<span class="badge badge-aborted">completed but score harvest failed — harness telemetry only</span>`
-      : `<span class="badge badge-aborted">harness telemetry only — no platform score</span>`
-    : `checkpoints ${fmtNum(run.platform.checkpointsSolved)}/${fmtNum(run.platform.checkpointsAttempted)}`;
+  const kind = scorelessKind(run);
+  const scoreText =
+    kind === null
+      ? `checkpoints ${fmtNum(run.platform.checkpointsSolved)}/${fmtNum(run.platform.checkpointsAttempted)}`
+      : kind === "harvest-failed"
+        ? `<span class="badge badge-aborted">completed but score harvest failed — harness telemetry only</span>`
+        : kind === "errored"
+          ? `<span class="badge badge-aborted">errored — excluded from score aggregates${run.platform ? ` (withheld platform row: ${fmtNum(run.platform.checkpointsSolved)}/${fmtNum(run.platform.checkpointsAttempted)})` : ""}</span>`
+          : `<span class="badge badge-aborted">harness telemetry only — no platform score</span>`;
 
   return `<details class="run-detail">
     <summary>
