@@ -11,8 +11,12 @@ import {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(__dirname, "..", "..", "..");
-const CLIENT_TMPL = path.join(REPO, "templates", "workspace", "slopcode_client.py");
+const CLIENT_TMPL = path.join(REPO, "templates", "workspace", "platform_client.py");
 const BRIEFING_TMPL = path.join(REPO, "templates", "workspace", "AGENT_BRIEFING.md.tmpl");
+
+// Synthetic client template exercising renderClient's meta injection independent
+// of any committed client (the vanilla platform_client.py has no meta placeholder).
+const META_TMPL = 'BASE = "__PLATFORM_BASE__"\nKEY  = "__API_KEY__"\nMETA_JSON_B64 = "__SLOPCODE_META_B64__"\n';
 
 describe("applyPlaceholders", () => {
   it("substitutes every occurrence", () => {
@@ -40,8 +44,7 @@ describe("renderClient", () => {
   });
 
   it("with no meta arg, injects a base64 encoding of JSON null (client degrades to no-meta join)", () => {
-    const tmpl = fs.readFileSync(CLIENT_TMPL, "utf8");
-    const out = renderClient(tmpl, "https://example.test", "SECRETKEY");
+    const out = renderClient(META_TMPL, "https://example.test", "SECRETKEY");
     expect(out).not.toContain("__SLOPCODE_META_B64__");
     const b64Line = out.split("\n").find((l) => l.startsWith("META_JSON_B64"));
     expect(b64Line).toBeTruthy();
@@ -50,7 +53,6 @@ describe("renderClient", () => {
   });
 
   it("with a meta object, injects a base64 encoding that round-trips to the same JSON", () => {
-    const tmpl = fs.readFileSync(CLIENT_TMPL, "utf8");
     const meta = {
       display_name: "keel · deepseek-v4-flash · s1",
       model: "token-router:deepseek/deepseek-v4-flash",
@@ -58,7 +60,7 @@ describe("renderClient", () => {
       trial: "t1",
       seed: 1,
     };
-    const out = renderClient(tmpl, "https://example.test", "SECRETKEY", meta);
+    const out = renderClient(META_TMPL, "https://example.test", "SECRETKEY", meta);
     const b64Line = out.split("\n").find((l) => l.startsWith("META_JSON_B64"));
     const literal = b64Line.match(/"([^"]*)"/)[1];
     expect(JSON.parse(Buffer.from(literal, "base64").toString("utf8"))).toEqual(meta);
@@ -66,25 +68,27 @@ describe("renderClient", () => {
 });
 
 describe("renderBriefing", () => {
-  it("wires room/label/name/problems and puts the label step first", () => {
+  it("wires room/name/label/base and leaves no unrendered placeholders", () => {
     const tmpl = fs.readFileSync(BRIEFING_TMPL, "utf8");
     const out = renderBriefing({
       roomId: "ROOM123",
       agentName: "agent_x",
       runLabel: "t/keel/1",
       problemsText: "easy-1, easy-2",
+      platformBase: "https://example.test",
       tmpl,
     });
     expect(out).toContain("ROOM123");
     expect(out).toContain("agent_x");
     expect(out).toContain('label "t/keel/1"');
-    expect(out).toContain("easy-1, easy-2");
+    expect(out).toContain("https://example.test");
+    // the agent self-serves the game client from the platform
+    expect(out).toContain("get-client slopcode");
+    // no placeholder should survive rendering
     expect(out).not.toContain("__ROOM_ID__");
-    // LABEL step must appear before the main loop
-    const labelIdx = out.indexOf("LABEL FIRST");
-    const loopIdx = out.indexOf("The loop");
-    expect(labelIdx).toBeGreaterThan(-1);
-    expect(labelIdx).toBeLessThan(loopIdx);
+    expect(out).not.toContain("__AGENT_NAME__");
+    expect(out).not.toContain("__RUN_LABEL__");
+    expect(out).not.toContain("__PLATFORM_BASE__");
   });
 });
 

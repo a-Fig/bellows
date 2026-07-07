@@ -1,66 +1,17 @@
-# Benchmark run briefing
+# Agent Trials — SlopCode benchmark run
 
-You are an autonomous coding agent competing on the **SlopCode** benchmark. Your
-entire job is to solve the problem(s) below and submit your solutions through the
-provided client. Work only inside this workspace directory.
+- Platform URL: __PLATFORM_BASE__   (pre-injected into `platform_client.py`)
+- API Key:      (pre-injected into `platform_client.py` — you never pass it manually)
+- Game:         slopcode
+- Room:         __ROOM_ID__      ← join THIS room; do not pick one from the lobby
+- Run label:    __RUN_LABEL__    ← set once, right after joining
 
-## STEP 0 — LABEL FIRST (do this immediately, before anything else)
+Onboarding (read the guide if you need it):
 
-The run is only scored if it is labelled. Right after you join the room, set the
-label. Do it once, exactly, and do not change it:
+    python platform_client.py get-client slopcode
+    python slopcode_client.py join __ROOM_ID__ "__AGENT_NAME__"
+    python slopcode_client.py label "__RUN_LABEL__"
 
-```
-python slopcode_client.py join __ROOM_ID__ "__AGENT_NAME__"
-python slopcode_client.py label "__RUN_LABEL__"
-```
-
-If either command errors, wait 30 seconds and retry, up to 3 times. If `join`
-still fails after that (e.g. "Room is not accepting registrations"), STOP the
-run entirely: report the join error as your final message and do no other work.
-An unjoined run can never be scored — burning turns on the problems without a
-room is pure waste. Once joined, the label MUST be set.
-
-## Room / run identity
-
-- Room id:   `__ROOM_ID__`
-- Agent name: `__AGENT_NAME__`   (join with EXACTLY this name — do not change it)
-- Run label:  `__RUN_LABEL__`   (exact string — used to pull your score later)
-- Problems:   __PROBLEMS__
-
-**Attempt exactly the problems listed above**, in order, by name — call
-`start <problem>` for each. Do not assume the room has a preset problem set; a
-prompt-scoped subset is expected and scored normally (it shows as attempted=N).
-
-## The loop (repeat per problem)
-
-The client `slopcode_client.py` is already in this directory and configured. Its
-documented loop is:
-
-1. `python slopcode_client.py join __ROOM_ID__ "__AGENT_NAME__"`  — join the room.
-2. `python slopcode_client.py label "__RUN_LABEL__"`  — **label the run (STEP 0 above).**
-3. `python slopcode_client.py list`  — see available problems.
-4. `python slopcode_client.py start <problem>`  — start a problem. WARNING: starting commits it to your score. This writes `spec_checkpoint_1.md`.
-5. `python slopcode_client.py files <problem>`  — if the problem has static assets, download them.
-6. Read the spec file, then **implement the solution** in this workspace. The entry file must exist at the workspace root (usually `<problem>.py`). Add a `requirements.txt` if you need third-party packages (see the client's policy — no URLs, no local paths).
-7. `python slopcode_client.py submit <problem>`  — pack + submit the workspace snapshot.
-8. `python slopcode_client.py wait`  — block until graded; prints the result.
-9. `python slopcode_client.py advance <problem>`  — commit the grade and reveal the next checkpoint spec (writes `spec_checkpoint_N.md`), or mark the problem complete.
-10. Repeat steps 6–9 for each checkpoint of the problem, then move to the next problem.
-
-## Finish
-
-When you have attempted all the problems you can (or run out of useful work):
-
-```
-python slopcode_client.py finalize confirm
-```
-
-Finalizing locks in your run score. **You must finalize** for the run to count.
-
-## Rules
-
-- Use `python` to run the client (Python 3 is available).
-- Do not edit `slopcode_client.py`.
-- Keep the workspace small; snapshots are size-capped.
-- If a command fails, read its error output and adapt — do not silently give up.
-- Prefer the standard library; only add `requirements.txt` entries you actually need.
+Then follow the SlopCode guide: list → start → implement → submit → wait →
+advance through each checkpoint, and `finalize confirm` when done. Good luck and
+do the best you can.

@@ -23,11 +23,13 @@ export const KICKOFF_PROMPT =
  * @param {string} args.agentName
  * @param {string} args.runLabel
  * @param {string} args.problemsText
+ * @param {string} [args.platformBase]  platform URL, rendered into the briefing for reference
  * @param {string} [args.tmpl]  raw briefing template (defaults to file on disk)
  */
-export function renderBriefing({ roomId, agentName, runLabel, problemsText, tmpl }) {
+export function renderBriefing({ roomId, agentName, runLabel, problemsText, platformBase, tmpl }) {
   const raw = tmpl ?? fs.readFileSync(BRIEFING_TMPL, "utf8");
   return applyPlaceholders(raw, {
+    __PLATFORM_BASE__: platformBase ?? "",
     __ROOM_ID__: roomId,
     __AGENT_NAME__: agentName,
     __RUN_LABEL__: runLabel,
@@ -114,7 +116,7 @@ export function provisionRun(args) {
   // 1. Copy the template into workspace, rendering placeholders. The briefing
   //    template (.tmpl) is rendered to AGENT_BRIEFING.md; the client gets its
   //    BASE/KEY/META injected; everything else is copied verbatim.
-  const briefing = renderBriefing({ roomId, agentName, runLabel, problemsText });
+  const briefing = renderBriefing({ roomId, agentName, runLabel, problemsText, platformBase: config.platformBase });
   copyWorkspaceTemplate(workspaceDir, { base: config.platformBase, apiKey, briefing, meta });
 
   // 2. agent dir: settings + copied credentials.
@@ -138,7 +140,7 @@ export function copyWorkspaceTemplate(dest, { base, apiKey, briefing, meta }) {
       fs.writeFileSync(path.join(dest, "AGENT_BRIEFING.md"), briefing);
       continue;
     }
-    if (ent.name === "slopcode_client.py") {
+    if (ent.name === "platform_client.py") {
       const rendered = renderClient(fs.readFileSync(src, "utf8"), base, apiKey, meta);
       fs.writeFileSync(path.join(dest, ent.name), rendered);
       continue;
