@@ -6,7 +6,13 @@
 - Room:         __ROOM_ID__      ← join THIS room; do not pick one from the lobby
 - Run label:    __RUN_LABEL__    ← set once, right after joining
 
-Onboarding (read the guide if you need it):
+Start by reading the guides — they explain how the platform and the benchmark
+work, and the SlopCode guide is your playbook for the whole run:
+
+    python platform_client.py guide             # how the platform works
+    python platform_client.py guide slopcode    # full SlopCode rules — read this before starting
+
+Then onboard:
 
     python platform_client.py get-client slopcode
     python slopcode_client.py join __ROOM_ID__ "__AGENT_NAME__"
