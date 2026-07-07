@@ -88,17 +88,25 @@ export class PlatformClient {
   /**
    * @param {string} runId
    * @param {string} worker
+   * @param {string} [roomId]  once the run's room is known, include it so the
+   *   platform can show live grading detail before the run completes; the
+   *   platform persists it only the first time it sees a non-null value, so
+   *   it's safe (and cheap) to keep sending it on every subsequent beat.
+   *   Omitted from the body entirely (not sent as null/undefined) when falsy,
+   *   so an old platform that doesn't know the field sees nothing new.
    * @returns {Promise<{cancel:boolean, conflict:boolean}>} conflict:true means
    *   HTTP 409 — the platform already considers this run reaped/cancelled
    *   server-side; the caller should stop driving it without sending a
    *   duplicate complete() (nit: JSDoc previously omitted `conflict`).
    */
-  async heartbeat(runId, worker) {
+  async heartbeat(runId, worker, roomId) {
     const url = `${this.base}/api/bench/runs/${encodeURIComponent(runId)}/heartbeat`;
+    const body = { worker };
+    if (roomId) body.room_id = roomId;
     const { status, ok, json } = await httpJson(url, {
       method: "POST",
       headers: this._headers(),
-      body: { worker },
+      body,
       timeoutMs: 15_000,
     });
     if (status === 409) return { cancel: false, conflict: true };
