@@ -139,6 +139,9 @@ describe("foldHostTelemetry", () => {
     expect(tel.plansSent).toBe(2);
     expect(tel.totalFoldOps).toBe(6);
   });
+  it("counts attach events", () => {
+    expect(tel.attachCount).toBe(1);
+  });
   it("builds a budget series from sync events", () => {
     expect(tel.budgetSeries).toEqual([
       [200, 50000, 70000],
@@ -157,6 +160,29 @@ describe("foldHostTelemetry", () => {
   it("falls back to the supplied conductor id when no attach event", () => {
     const t2 = foldHostTelemetry(JSON.stringify({ t: "sync", at: 1, liveTokens: 1, budget: 2 }), "cold-score");
     expect(t2.conductorId).toBe("cold-score");
+  });
+});
+
+// Issue #14: a host that dies during attach (e.g. "unknown conductor") writes only an
+// error event — never attach/sync. foldHostTelemetry must surface that as attachCount:0,
+// syncs:0, with the error preserved, so the runner's integrity guard can detect it.
+const UNKNOWN_CONDUCTOR_FIXTURE = [{ t: "error", at: 50, message: 'unknown conductor "zzz" (available: builtin, keel)' }]
+  .map((e) => JSON.stringify(e))
+  .join("\n");
+
+describe("foldHostTelemetry — conductor never attached (issue #14)", () => {
+  const tel = foldHostTelemetry(UNKNOWN_CONDUCTOR_FIXTURE, "zzz");
+
+  it("reports zero attach and zero sync events", () => {
+    expect(tel.attachCount).toBe(0);
+    expect(tel.syncs).toBe(0);
+  });
+  it("preserves the single error", () => {
+    expect(tel.errors.length).toBe(1);
+    expect(tel.errors[0]).toMatch(/unknown conductor/);
+  });
+  it("falls back to the supplied conductor id since no attach event set it", () => {
+    expect(tel.conductorId).toBe("zzz");
   });
 });
 

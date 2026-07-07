@@ -12,6 +12,7 @@ import {
   hostEnv,
   modelShortName,
   buildJoinMeta,
+  conductorNeverAttached,
 } from "../run.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -29,6 +30,36 @@ describe("hostEnv — the effective-accordion-repo env seam", () => {
 
   it("carries the default repo unchanged when no ref is pinned", () => {
     expect(hostEnv({ accordionRepo: "C:/acc" })).toEqual({ BELLOWS_ACCORDION_REPO: "C:/acc" });
+  });
+});
+
+describe("conductorNeverAttached — issue #14 finalization guard", () => {
+  const errored = { attachCount: 0, syncs: 0, errors: ["unknown conductor \"zzz\""] };
+  const healthy = { attachCount: 1, syncs: 12, errors: [] };
+
+  it("flags a completed run whose conductor never attached", () => {
+    expect(conductorNeverAttached("keel", errored, "completed")).toBe(true);
+  });
+
+  it("does not flag arm 'none' (no conductor was ever requested)", () => {
+    expect(conductorNeverAttached("none", errored, "completed")).toBe(false);
+  });
+
+  it("does not flag a healthy conductor (attached + synced)", () => {
+    expect(conductorNeverAttached("keel", healthy, "completed")).toBe(false);
+  });
+
+  it("does not flag a null conductor (e.g. telemetry file missing)", () => {
+    expect(conductorNeverAttached("keel", null, "completed")).toBe(false);
+  });
+
+  it("does not override a non-completed status (e.g. an existing error or abort)", () => {
+    expect(conductorNeverAttached("keel", errored, "error")).toBe(false);
+    expect(conductorNeverAttached("keel", errored, "aborted-cost")).toBe(false);
+  });
+
+  it("does not flag zero attach/sync without a surfaced error (edge case, no error signal)", () => {
+    expect(conductorNeverAttached("keel", { attachCount: 0, syncs: 0, errors: [] }, "completed")).toBe(false);
   });
 });
 

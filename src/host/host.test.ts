@@ -220,4 +220,30 @@ describe("headless conductor host", () => {
 			await mock.close().catch(() => {});
 		}
 	}, 90_000);
+
+	it("issue #14: exits 1 with a single error telemetry line and zero attach/sync when the conductor id is unknown", async () => {
+		const home = mkdtempSync(path.join(tmpdir(), "bellows-host-badconductor-"));
+		const telemetryOut = path.join(home, "telemetry.jsonl");
+
+		// The unknown-conductor check runs before the host even looks for a pi session
+		// descriptor, so no MockExtension/WS server is needed here — the host should fail
+		// fast on its own.
+		const spawned = spawnHost({
+			accordionHome: home,
+			conductor: "does-not-exist-zzz",
+			budget: 30_000,
+			protect: 5_000,
+			telemetryOut,
+		});
+
+		const code = await spawned.exit;
+		expect(code).toBe(1);
+
+		const tel = readTelemetry(telemetryOut);
+		const errorLines = tel.filter((e) => e.t === "error");
+		expect(errorLines.length).toBe(1);
+		expect(String(errorLines[0].message)).toMatch(/unknown conductor/);
+		expect(tel.some((e) => e.t === "attach")).toBe(false);
+		expect(tel.some((e) => e.t === "sync")).toBe(false);
+	}, 30_000);
 });

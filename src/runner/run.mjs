@@ -210,7 +210,7 @@ export async function executeRun(args) {
     // Kick off the agent.
     pi.send({ type: "prompt", message: KICKOFF_PROMPT });
 
-    const outcome = await driveUntilDone({ pi, spec, log, label, abortSignal });
+    const outcome = await driveUntilDone({ pi, host, spec, log, label, abortSignal });
     status = outcome.status;
     statusDetail = outcome.statusDetail;
   } catch (e) {
@@ -303,6 +303,20 @@ export async function executeRun(args) {
     log(`[${label}] host telemetry collect error: ${e.message}`);
   }
 
+  // Integrity guard: a run whose conductor never attached must not be scored as that conductor.
+  // If a real conductor was requested (arm !== "none") but the host produced zero attach and
+  // zero sync events while surfacing at least one error, the conductor under test never ran —
+  // force the run to error so it is not gradeable as that conductor. (Issue #14.)
+  // The errors>0 clause is what distinguishes a real non-attach failure from a trivially short
+  // run: every genuine non-attach path emits >=1 error event (dial refused, "no session
+  // descriptor", "unknown conductor", protocol mismatch), so its absence means "no failure seen".
+  if (conductorNeverAttached(arm, conductor, status)) {
+    const detail = `conductor "${arm}" never attached (0 attach / 0 sync; ${conductor.errors[0]})`;
+    log(`[${label}] integrity guard: ${detail} — forcing status=error`);
+    status = "error";
+    statusDetail = statusDetail ? `${statusDetail}; ${detail}` : detail;
+  }
+
   // Post-run finalize sweep: if the agent joined but never finalized (caps,
   // crash, forgot), close its game now — an open game wedges the pooled room
   // forever (rooms only auto-reset ~5 min AFTER finalize) and leaves the
@@ -387,10 +401,11 @@ export async function executeRun(args) {
 
 /**
  * Watch pi's event stream and enforce caps. Resolves with a status.
+ * @param {import("node:child_process").ChildProcess | null} [host]  conductor host process, if spawned (see Layer 1, issue #14)
  * @param {AbortSignal} [abortSignal]  external cancellation (see executeRun's jsdoc)
  * @returns {Promise<{status:import("../types.ts").RunStatus, statusDetail?:string}>}
  */
-function driveUntilDone({ pi, spec, log, label, abortSignal }) {
+function driveUntilDone({ pi, host, spec, log, label, abortSignal }) {
   return new Promise((resolve) => {
     const deadline = Date.now() + spec.caps.minutes * 60 * 1000;
     // Stall detection must never pre-empt the wall-clock cap. The run contract is
@@ -411,8 +426,25 @@ function driveUntilDone({ pi, spec, log, label, abortSignal }) {
       pi.off("event", onEvent);
       pi.off("exit", onExit);
       abortSignal?.removeEventListener("abort", onAbort);
+      if (host) host.off("exit", onHostExit);
       resolve({ status, statusDetail });
     };
+
+    // Layer 1 (issue #14): the conductor host is a separate process from pi. If it
+    // dies before the run finishes — e.g. it threw "unknown conductor" during
+    // attach and called process.exit(1) — pi's event stream never learns about it
+    // and would otherwise sail on to "completed". A nonzero host exit is always
+    // fatal to the conductor under test, so fail the run fast. A clean exit(0) is
+    // the host's normal end-of-run shutdown and is left to the pi-driven paths
+    // above; our own teardown SIGTERM/SIGKILL yields code===null and must not be
+    // misread as a failure (finish's settled guard also makes any post-settle
+    // call here a no-op).
+    const onHostExit = (code, signal) => {
+      if (code && code !== 0) {
+        finish("error", `conductor host exited (code ${code}) before the run finished — conductor likely failed to attach`);
+      }
+    };
+    host?.on("exit", onHostExit);
 
     const onAbort = () => {
       log(`[${label}] cancelled externally`);
@@ -539,6 +571,28 @@ function driveUntilDone({ pi, spec, log, label, abortSignal }) {
  */
 export function hostEnv(config) {
   return { BELLOWS_ACCORDION_REPO: config.accordionRepo };
+}
+
+/**
+ * Issue #14 integrity guard: true when a real conductor was requested (arm !== "none")
+ * but its telemetry shows it never attached (0 attach / 0 sync) while surfacing at least
+ * one error — i.e. the conductor under test never ran, so a "completed" status would
+ * misrepresent the run. Exported as the unit-testable seam for executeRun's finalization
+ * guard.
+ * @param {string} arm  raw arms[].conductor string (for "none"/telemetry)
+ * @param {import("../types.ts").ConductorTelemetry | null} conductor
+ * @param {import("../types.ts").RunStatus} status
+ * @returns {boolean}
+ */
+export function conductorNeverAttached(arm, conductor, status) {
+  return (
+    arm !== "none" &&
+    !!conductor &&
+    conductor.attachCount === 0 &&
+    conductor.syncs === 0 &&
+    conductor.errors.length > 0 &&
+    status === "completed"
+  );
 }
 
 /**
