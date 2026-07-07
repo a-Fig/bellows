@@ -188,6 +188,8 @@ export type HostEvent =
 export interface ConductorTelemetry {
   conductorId: string;
   syncs: number;
+  /** Number of attach events seen; 0 means the conductor never attached. */
+  attachCount: number;
   plansSent: number;
   totalFoldOps: number;
   /** liveTokens samples over time: [atMs, liveTokens, budget]. */

@@ -3,6 +3,7 @@ import { mkdir, writeFile, rm, readFile, mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import generateReport from "./index.mjs";
+import { aggregateGroup, isAborted, scorelessKind } from "./aggregate.mjs";
 
 const SHARED_FP = {
   model: "token-router:deepseek/deepseek-v4-flash",
@@ -122,7 +123,20 @@ describe("generateReport", () => {
       costUsd: 2.0,
     });
 
-    for (const run of [...groupRuns, mismatchedRun, abortedRun]) {
+    // Errored run WITH a platform row (issue #14): the conductor never
+    // attached but the agent still played unmanaged and finalized, so a
+    // harvested leaderboard row exists. It must be excluded from score
+    // aggregates and labeled, not silently counted under "keel".
+    const erroredRun = makeRun({
+      id: "example/keel/3",
+      conductorId: "keel",
+      seed: 3,
+      status: "error",
+      statusDetail: 'conductor "keel" never attached (0 attach / 0 sync; unknown conductor "keel")',
+      platform: { gameId: "slopcode", roomId: "r6", agentName: "a", runScore: 20, checkpointsSolved: 5, checkpointsAttempted: 5, raw: {} },
+    });
+
+    for (const run of [...groupRuns, mismatchedRun, abortedRun, erroredRun]) {
       const safeName = run.id.replace(/\//g, "_");
       await writeFile(path.join(runsDir, "example", `${safeName}.json`), JSON.stringify(run, null, 2), "utf8");
     }
@@ -178,6 +192,12 @@ describe("generateReport", () => {
     expect(html).toContain("aborted-cost");
   });
 
+  it("labels the errored run's withheld platform row instead of scoring it (issue #14)", () => {
+    expect(html).toContain("example/keel/3");
+    expect(html).toContain("errored — excluded from score aggregates");
+    expect(html).toContain("withheld platform row");
+  });
+
   it("reports skipped junk files without throwing", () => {
     expect(html).toContain("skipped while loading runs");
   });
@@ -230,5 +250,40 @@ describe("generateReport", () => {
     await expect(generateReport(goneDir, outFile2)).resolves.toBeUndefined();
     const html2 = await readFile(outFile2, "utf8");
     expect(html2).toContain("No comparable runs found");
+  });
+});
+
+// Issue #14 follow-through: forcing status="error" in the runner is only half
+// the fix — the aggregator must actually treat errored runs as scoreless, even
+// when they carry a harvested platform row (agent played unmanaged and
+// finalized before the integrity guard fired).
+describe("score exclusion of errored runs (issue #14)", () => {
+  const platformRow = { gameId: "slopcode", roomId: "r9", agentName: "a", runScore: 20, checkpointsSolved: 5, checkpointsAttempted: 5, raw: {} };
+
+  it("isAborted treats an errored run as scoreless even with a platform row", () => {
+    expect(isAborted({ platform: platformRow, status: "error" })).toBe(true);
+    expect(isAborted({ platform: platformRow, status: "completed" })).toBe(false);
+    expect(isAborted({ platform: null, status: "aborted-cost" })).toBe(true);
+  });
+
+  it("scorelessKind distinguishes errored / harvest-failed / aborted / scored", () => {
+    expect(scorelessKind({ platform: platformRow, status: "error" })).toBe("errored");
+    expect(scorelessKind({ platform: null, status: "error" })).toBe("errored");
+    expect(scorelessKind({ platform: null, status: "completed" })).toBe("harvest-failed");
+    expect(scorelessKind({ platform: null, status: "aborted-cost" })).toBe("aborted");
+    expect(scorelessKind({ platform: platformRow, status: "completed" })).toBe(null);
+  });
+
+  it("aggregateGroup keeps an errored run's platform row out of checkpoint medians", () => {
+    const runs = [
+      makeRun({ id: "x/keel/1", conductorId: "keel", seed: 1, platform: { ...platformRow, checkpointsSolved: 3 } }),
+      makeRun({ id: "x/keel/2", conductorId: "keel", seed: 2, platform: { ...platformRow, checkpointsSolved: 4 } }),
+      makeRun({ id: "x/keel/3", conductorId: "keel", seed: 3, status: "error", platform: { ...platformRow, checkpointsSolved: 5 } }),
+    ];
+    const [row] = aggregateGroup({ runs });
+    expect(row.scoredCount).toBe(2);
+    expect(row.abortedCount).toBe(1);
+    // Median of [3, 4] — 3.5. Were the errored run's row counted, this would be 4.
+    expect(row.checkpointsSolved).toBe(3.5);
   });
 });

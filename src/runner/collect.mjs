@@ -163,6 +163,7 @@ export function foldHostTelemetry(text, fallbackConductorId = "") {
   let conductorId = fallbackConductorId;
   let budget = 0; // established by the attach event; sync events don't carry it
   let syncs = 0;
+  let attachCount = 0;
   let plansSent = 0;
   let totalFoldOps = 0;
   let heldPlanReplies = 0;
@@ -176,6 +177,7 @@ export function foldHostTelemetry(text, fallbackConductorId = "") {
   for (const e of events) {
     switch (e.t) {
       case "attach":
+        attachCount++;
         if (e.conductor) conductorId = e.conductor;
         if (Number.isFinite(e.budget)) budget = e.budget;
         break;
@@ -211,6 +213,7 @@ export function foldHostTelemetry(text, fallbackConductorId = "") {
   return {
     conductorId,
     syncs,
+    attachCount,
     plansSent,
     totalFoldOps,
     budgetSeries,

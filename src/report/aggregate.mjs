@@ -15,15 +15,21 @@ export function conductorOf(run) {
 }
 
 /**
- * A run without a platform row can't contribute score data. Note the distinct
- * cases: cap-aborted runs (status aborted-*) AND completed runs whose
- * leaderboard harvest failed (platform outage). Render labels them differently
- * via `scorelessKind`, but both are excluded from checkpoint aggregates.
+ * A run that can't contribute score data. Two ways in: no platform row at all
+ * (cap-aborted runs, or completed runs whose leaderboard harvest failed —
+ * platform outage), or status "error" — per RunStatus semantics an errored run
+ * produced nothing gradeable, so any platform row it carries must not be
+ * attributed to the conductor. The latter matters for issue #14: a run whose
+ * conductor never attached can still hold a finalized platform row (the agent
+ * played unmanaged), and that row must not enter this conductor's aggregates.
+ * Render labels the cases via `scorelessKind`; all are excluded from
+ * checkpoint aggregates.
  */
-export const isAborted = (run) => run.platform === null;
+export const isAborted = (run) => run.platform === null || run.status === "error";
 
-/** Why a run has no score: "aborted" | "harvest-failed" | null (has a score). */
+/** Why a run has no score: "errored" | "aborted" | "harvest-failed" | null (has a score). */
 export const scorelessKind = (run) => {
+  if (run.status === "error") return "errored";
   if (run.platform !== null) return null;
   return run.status === "completed" ? "harvest-failed" : "aborted";
 };
