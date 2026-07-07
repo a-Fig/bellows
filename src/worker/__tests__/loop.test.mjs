@@ -156,6 +156,49 @@ describe("runWorkerLoop", { timeout: 20_000 }, () => {
     expect(logs.join("\n")).not.toContain(SECRET);
   });
 
+  it("heartbeats omit room_id before it's resolved, then include it on every beat after", async () => {
+    platform.onClaim = () => ({ status: 200, body: { run: claimedRunFixture() } });
+    platform.onComplete = () => ({ status: 200, body: { ok: true } });
+    platform.onHeartbeat = () => ({ status: 200, body: { cancel: false } });
+
+    const fakeExecutor = vi.fn(async ({ runDir, onRoomResolved }) => {
+      fs.mkdirSync(runDir, { recursive: true });
+      // Simulate resolveWorkerRoom: room isn't known immediately — give the
+      // heartbeat timer (30ms in this suite) a chance to fire at least once
+      // before the room resolves, then fire a couple more times after.
+      await new Promise((r) => setTimeout(r, 80));
+      onRoomResolved("room-live-42");
+      await new Promise((r) => setTimeout(r, 80));
+      return {
+        id: "run-1",
+        label: "t1/keel/1",
+        status: "completed",
+        fingerprint: { conductorId: "keel" },
+        timing: { startedAt: "2026-01-01T00:00:00.000Z", endedAt: "2026-01-01T00:01:00.000Z", wallClockS: 60 },
+        usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, costUsd: 0, assistantTurns: 1, toolCalls: 0 },
+        turns: [],
+        conductor: null,
+        platform: null,
+        artifacts: { piSessionFile: "", hostTelemetryFile: null, workspaceDir: runDir, agentDir: runDir },
+      };
+    });
+
+    const summary = await runWorkerLoop({ config: baseConfig(runsDir, platform.url), apiKey: SECRET, log, once: true, executeRunFn: fakeExecutor });
+    expect(summary).toEqual({ claimed: 1, completed: 1, failed: 0 });
+
+    const heartbeatReqs = platform.requests.filter((r) => r.url === "/api/bench/runs/run-1/heartbeat");
+    expect(heartbeatReqs.length).toBeGreaterThanOrEqual(2);
+    expect(heartbeatReqs[0].body).not.toHaveProperty("room_id");
+    expect(heartbeatReqs[heartbeatReqs.length - 1].body.room_id).toBe("room-live-42");
+
+    // complete() is the AUTHORITATIVE room_id report — the platform's
+    // db.complete_bench_run persists room_id unconditionally from this body,
+    // so once the room is known it must be carried here too (omitting it would
+    // wipe the value the heartbeat already persisted mid-run).
+    const completeReq = platform.requests.find((r) => r.url === "/api/bench/runs/run-1/complete");
+    expect(completeReq.body.room_id).toBe("room-live-42");
+  });
+
   it("M2: an external:<id> arm name (literal colon) does not crash runDir provisioning", async () => {
     // Before the fix, runDir was built straight from claimed.arm.name ("external:thermocline"),
     // and fs.mkdirSync on win32 throws (colon is a reserved path character) — the run would
@@ -346,6 +389,9 @@ describe("runWorkerLoop", { timeout: 20_000 }, () => {
     const completeReq = platform.requests.find((r) => r.url === "/api/bench/runs/run-throw/complete");
     expect(completeReq.body.status).toBe("failed");
     expect(completeReq.body.error).toMatch(/boom: pi crashed/);
+    // The executor threw before onRoomResolved ever fired — the room was never
+    // known, so complete() must omit room_id entirely (not send null).
+    expect(completeReq.body).not.toHaveProperty("room_id");
   });
 
   it("never logs the API key across the whole claim/execute/complete lifecycle", async () => {

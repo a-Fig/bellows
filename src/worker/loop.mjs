@@ -140,12 +140,18 @@ export async function resolveWorkerRoom({ spec, config, apiKey, log, probeFn = p
  * @param {string} args.runDir
  * @param {AbortSignal} args.abortSignal
  * @param {(m:string)=>void} args.log
+ * @param {(roomId:string)=>void} [args.onRoomResolved]  test/wiring seam: the
+ *   room is only known once resolveWorkerRoom returns (after claim, before the
+ *   agent launches) — the heartbeat loop in executeClaimedRun starts earlier
+ *   and has no other way to learn it, so it passes this in to capture the id
+ *   as soon as it exists and include it on every subsequent heartbeat.
  * @returns {Promise<import("../types.ts").RunRecord>}
  */
-export async function defaultExecutor({ claimed, config, apiKey, runDir, abortSignal, log }) {
+export async function defaultExecutor({ claimed, config, apiKey, runDir, abortSignal, log, onRoomResolved }) {
   const spec = claimed.config;
   const { sharedFp } = buildSharedContext(spec, config);
   const roomId = await resolveWorkerRoom({ spec, config, apiKey, log });
+  onRoomResolved?.(roomId);
   return realExecuteRun({
     spec,
     config,
@@ -294,6 +300,10 @@ async function executeClaimedRun({ claimed, config, apiKey, client, runsRoot, ex
   const abortController = new AbortController();
   let cancelled = false;
   let cancelError = null;
+  // Known only once resolveWorkerRoom returns inside the executor (see
+  // defaultExecutor's onRoomResolved) — heartbeats sent before then simply
+  // omit room_id (platformClient.heartbeat treats a falsy roomId as "omit").
+  let roomId = null;
   // Distinct from a plain cancel: the platform already considers this run gone
   // (409 on heartbeat), so events/complete would just 409 again — skip them.
   let reaped = false;
@@ -322,7 +332,7 @@ async function executeClaimedRun({ claimed, config, apiKey, client, runsRoot, ex
 
   const heartbeatTimer = setInterval(async () => {
     try {
-      const { cancel, conflict } = await client.heartbeat(claimed.id, worker);
+      const { cancel, conflict } = await client.heartbeat(claimed.id, worker, roomId);
       if (conflict) {
         // 409: reaped/cancelled server-side — stop driving, but don't try to send a
         // duplicate complete() the server would just reject again.
@@ -367,6 +377,9 @@ async function executeClaimedRun({ claimed, config, apiKey, client, runsRoot, ex
       runDir,
       abortSignal: abortController.signal,
       log,
+      onRoomResolved: (id) => {
+        roomId = id;
+      },
     });
     if (cancelled) {
       status = "failed";
@@ -411,11 +424,14 @@ async function executeClaimedRun({ claimed, config, apiKey, client, runsRoot, ex
       status,
       record: record || syntheticRecord(claimed, error),
     };
-    // Nit (adversarial review): room_id is deliberately omitted here, not a gap.
-    // claimed never carries a room id (see defaultExecutor's comment above) —
-    // POST .../complete's room_id field is optional and platform/bench_routes.py's
-    // complete_bench_run doesn't require or use it for bench runs, so there is
-    // nothing to echo back.
+    // room_id: complete() is the AUTHORITATIVE report; the heartbeat's room_id
+    // is only the early report enabling live grading detail mid-run. The
+    // platform's db.complete_bench_run persists room_id UNCONDITIONALLY from
+    // this body (`SET room_id = %s`), so omitting it here left completed worker
+    // runs with room_id = NULL — and would even wipe a room_id the heartbeat
+    // had already persisted mid-run. Include it whenever the room resolved;
+    // omit only when it never did (executor failed before resolveWorkerRoom).
+    if (roomId) completeBody.room_id = roomId;
     if (error) completeBody.error = error;
     if (sessionGzB64) completeBody.session_gz_b64 = sessionGzB64;
 

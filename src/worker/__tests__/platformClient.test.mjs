@@ -54,6 +54,23 @@ describe("PlatformClient", () => {
     expect(r.cancel).toBe(false);
   });
 
+  it("heartbeat includes room_id once known", async () => {
+    platform.onHeartbeat = () => ({ status: 200, body: { cancel: false } });
+    await client.heartbeat("r1", "w1", "room-42");
+    expect(platform.requests[0].body).toEqual({ worker: "w1", room_id: "room-42" });
+  });
+
+  it("heartbeat omits room_id before it's known (undefined or falsy)", async () => {
+    platform.onHeartbeat = () => ({ status: 200, body: { cancel: false } });
+    await client.heartbeat("r1", "w1");
+    expect(platform.requests[0].body).toEqual({ worker: "w1" });
+    expect(platform.requests[0].body).not.toHaveProperty("room_id");
+
+    await client.heartbeat("r1", "w1", null);
+    expect(platform.requests[1].body).toEqual({ worker: "w1" });
+    expect(platform.requests[1].body).not.toHaveProperty("room_id");
+  });
+
   it("sendEvents delivers a batch and caps it at 100 per call", async () => {
     const events = Array.from({ length: 150 }, (_, i) => ({ ts: i, type: "sync", data: {} }));
     const ok = await client.sendEvents("r1", "w1", events);
