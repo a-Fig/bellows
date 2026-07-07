@@ -24,8 +24,9 @@ export const KICKOFF_PROMPT =
  * The briefing is game+room+label only: the agent self-serves the game client
  * (`get-client slopcode`), joins the room, sets its label, and follows the
  * SlopCode guide. It deliberately does NOT enumerate problems — the room's own
- * problem set is authoritative (see roomConfig.mjs / the pooled-vs-scoped guard
- * in config.mjs). So there is no `__PROBLEMS__` token to substitute.
+ * problem set is authoritative (see roomConfig.mjs / the pooled-vs-scoped guards
+ * in config.mjs for local specs and worker loop.mjs's resolveWorkerRoom for
+ * claimed specs). So there is no `__PROBLEMS__` token to substitute.
  * @param {object} args
  * @param {string} args.roomId
  * @param {string} args.agentName

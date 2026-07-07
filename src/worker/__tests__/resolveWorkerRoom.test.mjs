@@ -63,6 +63,60 @@ describe("resolveWorkerRoom", () => {
     expect(probed).toEqual(["pooled-room"]);
   });
 
+  it("rejects a pooled room + problem-scoped spec BEFORE any join/probe (worker-path mis-scoping guard)", async () => {
+    // Claimed (platform-dispatched) specs never pass through validateTrialSpec —
+    // this is the worker-path twin of that guard. The throw happens inside
+    // defaultExecutor before executeRun, and executeClaimedRun folds any executor
+    // throw into a failed complete() carrying the message (covered by
+    // loop.test.mjs "an executor throw is caught, folded into a failed
+    // complete(), and the loop keeps going").
+    const probed = [];
+    await expect(
+      resolveWorkerRoom({
+        spec: { problems: "easy-1", room: { pool: ["pooled-room"] } },
+        config: { platformBase: "http://127.0.0.1:1" },
+        apiKey: "k",
+        log: () => {},
+        probeFn: async ({ roomId }) => {
+          probed.push(roomId);
+          return true;
+        },
+        sleepFn: async () => {},
+      }),
+    ).rejects.toThrow(/pooled rooms carry the problem set/);
+    expect(probed).toEqual([]); // guard fires before any room join/probe is attempted
+  });
+
+  it("rejects a pooled room + explicit problem-name list likewise", async () => {
+    await expect(
+      resolveWorkerRoom({
+        spec: { problems: ["xjq"], room: { pool: ["pooled-room"] } },
+        config: { platformBase: "http://127.0.0.1:1" },
+        apiKey: "k",
+        log: () => {},
+        probeFn: async () => true,
+        sleepFn: async () => {},
+      }),
+    ).rejects.toThrow(/room\.pool \+ a problem-scoped/);
+  });
+
+  it("a pooled room + full-bench problems (`all`) still proceeds", async () => {
+    const probed = [];
+    const roomId = await resolveWorkerRoom({
+      spec: { problems: "all", room: { pool: ["pooled-room"] } },
+      config: { platformBase: "http://127.0.0.1:1" },
+      apiKey: "k",
+      log: () => {},
+      probeFn: async ({ roomId }) => {
+        probed.push(roomId);
+        return true;
+      },
+      sleepFn: async () => {},
+    });
+    expect(roomId).toBe("pooled-room");
+    expect(probed).toEqual(["pooled-room"]);
+  });
+
   it("waits out a not-yet-reset pooled room and succeeds when the probe recovers", async () => {
     let calls = 0;
     const sleeps = [];

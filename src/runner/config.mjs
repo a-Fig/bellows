@@ -214,6 +214,10 @@ export function validateTrialSpec(raw) {
     // whatever problem set the pooled room already carries — NOT what `problems`
     // asks for. Fail fast rather than mis-report. A full-bench selector
     // (`problems: all`) does not scope, so pooled full-bench trials are fine.
+    // COVERAGE: this guard only sees LOCAL specs (loadTrialSpec — `bellows run`
+    // / --dry). Platform-CLAIMED specs never pass through validateTrialSpec;
+    // the worker path enforces the same rule in resolveWorkerRoom's pool branch
+    // (src/worker/loop.mjs). Keep the two in sync.
     if (hasPool && problemsOk && isProblemScoped(problems)) {
       errs.push(
         "room.pool + a problem-scoped `problems` cannot be honored: pooled rooms carry the " +
