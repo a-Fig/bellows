@@ -8,6 +8,7 @@ import os from "node:os";
 import { fileURLToPath } from "node:url";
 import YAML from "yaml";
 import { validateAccordionRef } from "./accordionRef.mjs";
+import { slopcodeRoomConfig } from "./roomConfig.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 /** Repo root = two levels up from src/runner/. */
@@ -205,6 +206,22 @@ export function validateTrialSpec(raw) {
     if (room.base !== undefined && typeof room.base !== "string") errs.push("room.base: must be a string");
     if (!hasPool && room.create !== true)
       errs.push("room: need either a non-empty pool or create:true (no rooms available otherwise)");
+
+    // Pooled rooms + a problem-scoping `problems:` selector = silent mis-scoping.
+    // A pooled room's problem set is baked in at CREATE time; bellows only applies
+    // spec.problems on the create branch (slopcodeRoomConfig). The briefing no
+    // longer enumerates problems, so a pooled + scoped spec would silently run
+    // whatever problem set the pooled room already carries — NOT what `problems`
+    // asks for. Fail fast rather than mis-report. A full-bench selector
+    // (`problems: all`) does not scope, so pooled full-bench trials are fine.
+    if (hasPool && problemsOk && isProblemScoped(problems)) {
+      errs.push(
+        "room.pool + a problem-scoped `problems` cannot be honored: pooled rooms carry the " +
+          "problem set they were created with, and bellows only applies `problems` when it " +
+          "creates a room. Use room.create for a problems subset, or drop `problems` (use " +
+          "`problems: all`) and pre-scope the pool room's problem_set at creation.",
+      );
+    }
   }
 
   if (errs.length) throw new Error(`Invalid trial spec:\n  - ${errs.join("\n  - ")}`);
@@ -229,6 +246,29 @@ export function validateTrialSpec(raw) {
     },
   };
   return spec;
+}
+
+/**
+ * True when `problems` selects a SUBSET of the bench (a preset bucket or an
+ * explicit name list) rather than the whole bench. Mirrors roomConfig.mjs:
+ * `slopcodeRoomConfig` yields a `problem_set`/`problems` key for a scoped
+ * selector and a bare `{ game_type }` (no such key) for full bench
+ * (empty / "all"). Used to reject pooled + scoped trials (see validateTrialSpec).
+ * Defensive against roomConfig throwing on a degenerate array (it never should
+ * here — arrays are validated non-empty first).
+ * @param {string | string[]} problems
+ * @returns {boolean}
+ */
+export function isProblemScoped(problems) {
+  let cfg;
+  try {
+    cfg = slopcodeRoomConfig(problems);
+  } catch {
+    // A throw means a non-empty-but-all-blank array — treat as scoped (it named
+    // something), so the guard errs on the side of failing loudly.
+    return true;
+  }
+  return cfg.problem_set !== undefined || cfg.problems !== undefined;
 }
 
 /** Normalized problems string for the fingerprint (sorted + comma-joined). */

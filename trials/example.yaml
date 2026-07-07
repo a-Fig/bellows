@@ -15,10 +15,8 @@ caps:
   minutes: 180
 parallel: 3
 room:
-  # until the agent-trials room-create endpoint is deployed, list room ids here.
-  # Replace these with real pre-created SlopCode room ids before a live run.
-  pool:
-    - 00000000-room-aaaa-0000-000000000001
-    - 00000000-room-bbbb-0000-000000000002
-    - 00000000-room-cccc-0000-000000000003
-  create: false
+  # This trial is problem-SCOPED (`problems: easy-1`), so it must create its own
+  # rooms: bellows scopes a room's problem_set only at create time. A pooled +
+  # scoped spec is rejected at validation (the pool room's baked-in problem set
+  # would silently override `problems`). Created rooms auto-archive at finalize.
+  create: true

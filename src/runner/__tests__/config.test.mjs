@@ -1,9 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { validateTrialSpec, normalizeProblems, splitModel, parseConductorArm, normalizeBenchConfig } from "../config.mjs";
+import { validateTrialSpec, normalizeProblems, isProblemScoped, splitModel, parseConductorArm, normalizeBenchConfig } from "../config.mjs";
 
+// Base spec is pooled + FULL BENCH (`problems: all`) so it stays valid under the
+// pooled-vs-scoped guard: a pooled room may run the full bench, but not a scoped
+// subset. Scoped-pool rejection is covered by its own tests below.
 const base = {
   trial: "t1",
-  problems: "easy-1",
+  problems: "all",
   model: "token-router:deepseek/deepseek-v4-flash",
   budget: 70000,
   protectTokens: 20000,
@@ -65,6 +68,29 @@ describe("validateTrialSpec", () => {
     expect(spec.room.pool).toEqual([]);
   });
 
+  it("rejects a pooled room with a problem-scoped preset (silent mis-scoping guard)", () => {
+    expect(() => validateTrialSpec({ ...base, problems: "easy-1", room: { pool: ["r1", "r2"] } })).toThrow(
+      /pooled rooms carry the problem set/,
+    );
+  });
+
+  it("rejects a pooled room with a problem-scoped name list", () => {
+    expect(() => validateTrialSpec({ ...base, problems: ["xjq"], room: { pool: ["r1"] } })).toThrow(
+      /room\.pool \+ a problem-scoped/,
+    );
+  });
+
+  it("accepts a pooled room with full-bench problems (`all`) — pooled rooms may run the full bench", () => {
+    const spec = validateTrialSpec({ ...base, problems: "all", room: { pool: ["r1", "r2"] } });
+    expect(spec.room.pool).toEqual(["r1", "r2"]);
+  });
+
+  it("accepts a problem-scoped spec when it creates its own room", () => {
+    const spec = validateTrialSpec({ ...base, problems: "easy-1", room: { create: true } });
+    expect(spec.room.create).toBe(true);
+    expect(spec.problems).toBe("easy-1");
+  });
+
   it("rejects a non-positive budget", () => {
     expect(() => validateTrialSpec({ ...base, budget: 0 })).toThrow(/budget/);
   });
@@ -116,6 +142,15 @@ describe("helpers", () => {
   it("normalizeProblems sorts + joins a list", () => {
     expect(normalizeProblems(["b", "a", "c"])).toBe("a,b,c");
     expect(normalizeProblems("easy-1")).toBe("easy-1");
+  });
+
+  it("isProblemScoped: presets and name lists are scoped; full bench is not", () => {
+    expect(isProblemScoped("easy-1")).toBe(true); // preset bucket
+    expect(isProblemScoped("easy")).toBe(true); // preset bucket
+    expect(isProblemScoped("xjq")).toBe(true); // single problem name
+    expect(isProblemScoped(["xjq", "abc"])).toBe(true); // name list
+    expect(isProblemScoped("all")).toBe(false); // full bench
+    expect(isProblemScoped("")).toBe(false); // empty -> full bench
   });
 
   it("splitModel splits on the first colon only", () => {
