@@ -122,6 +122,33 @@ describe("agentSpawnEnv", () => {
     expect(fs.existsSync(path.join(binDir, "python"))).toBe(true);
   });
 
+  it("merges SSL vars on macOS when the resolver returns them", () => {
+    const add = agentSpawnEnv({
+      baseEnv: { PATH: "/usr/bin" },
+      binDir: path.join(mkTmp(), "bin"),
+      platform: "darwin",
+      // python present -> no shim; isolate the SSL branch.
+      resolveSsl: () => ({ SSL_CERT_FILE: "/ca/cacert.pem", REQUESTS_CA_BUNDLE: "/ca/cacert.pem" }),
+    });
+    expect(add.SSL_CERT_FILE).toBe("/ca/cacert.pem");
+    expect(add.REQUESTS_CA_BUNDLE).toBe("/ca/cacert.pem");
+  });
+
+  it("never touches SSL off macOS — resolver is not even called", () => {
+    let called = false;
+    const add = agentSpawnEnv({
+      baseEnv: { PATH: "/usr/bin" },
+      binDir: path.join(mkTmp(), "bin"),
+      platform: "win32",
+      resolveSsl: () => {
+        called = true;
+        return { SSL_CERT_FILE: "/ca/cacert.pem" };
+      },
+    });
+    expect(called).toBe(false);
+    expect(add.SSL_CERT_FILE).toBeUndefined();
+  });
+
   it("returns no additions on a fully healthy env", () => {
     // python present on PATH, SSL already configured -> nothing to do.
     const pathDir = mkTmp();

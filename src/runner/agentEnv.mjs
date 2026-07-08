@@ -118,16 +118,30 @@ export function ensurePythonShim({
  * @param {string} args.binDir               per-run dir to hold the python shim
  * @param {NodeJS.Platform} [args.platform]
  * @param {(m:string)=>void} [args.log]
+ * @param {(deps:{env:NodeJS.ProcessEnv})=>Record<string,string>} [args.resolveSsl]
+ *   certifi SSL resolver (injectable seam for tests)
  * @returns {Record<string,string>}          additions to spread over baseEnv
  */
-export function agentSpawnEnv({ baseEnv, binDir, platform = process.platform, log = () => {} }) {
+export function agentSpawnEnv({
+  baseEnv,
+  binDir,
+  platform = process.platform,
+  log = () => {},
+  resolveSsl = resolveSslCertEnv,
+}) {
   /** @type {Record<string,string>} */
   const add = {};
 
-  const ssl = resolveSslCertEnv({ env: baseEnv });
-  if (ssl.SSL_CERT_FILE) {
-    Object.assign(add, ssl);
-    log(`[env] SSL_CERT_FILE -> ${ssl.SSL_CERT_FILE} (certifi; fixes CERTIFICATE_VERIFY_FAILED)`);
+  // The uninitialized trust store is specifically the macOS Homebrew-Python
+  // provisioning path, so gate the whole SSL block on darwin. This keeps it a
+  // strict no-op elsewhere — no certifi subprocess spawned, no env touched — so
+  // the "macOS-targeted" contract holds literally, not just approximately.
+  if (platform === "darwin") {
+    const ssl = resolveSsl({ env: baseEnv });
+    if (ssl.SSL_CERT_FILE) {
+      Object.assign(add, ssl);
+      log(`[env] SSL_CERT_FILE -> ${ssl.SSL_CERT_FILE} (certifi; fixes CERTIFICATE_VERIFY_FAILED)`);
+    }
   }
 
   const shimDir = ensurePythonShim({ binDir, env: baseEnv, platform });
