@@ -20,6 +20,7 @@ function runsRootFrom(config) {
 /** Bellows repo root — the host's vite-node config and bench.config.json live here. */
 const BELLOWS_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 import { provisionRun, KICKOFF_PROMPT } from "./provision.mjs";
+import { agentSpawnEnv } from "./agentEnv.mjs";
 import { PiRpc } from "./rpc.mjs";
 import {
   findNewestSessionFile,
@@ -172,6 +173,15 @@ export async function executeRun(args) {
     // A parent-shell PI_CODING_AGENT_SESSION_DIR would redirect the session
     // JSONL outside agentDir and blind the collector — force the default layout.
     delete piEnv.PI_CODING_AGENT_SESSION_DIR;
+    // Issue #16: heal macOS worker-provisioning defects before the agent's first
+    // command — wire certifi into SSL_CERT_FILE (else every HTTPS call fails with
+    // CERTIFICATE_VERIFY_FAILED) and shim `python` -> `python3` on PATH (the
+    // briefing + platform guides say `python`, but the workers expose only
+    // `python3`). Both are no-ops on a healthy env (e.g. Windows workers).
+    Object.assign(
+      piEnv,
+      agentSpawnEnv({ baseEnv: piEnv, binDir: path.join(runDir, "bin"), log }),
+    );
     pi = new PiRpc({ piCommand: "pi", cwd: workspaceDir, env: piEnv }).start();
 
     const piLog = fs.createWriteStream(path.join(runDir, "pi-rpc.log"), { flags: "a" });
