@@ -119,6 +119,11 @@ describe("headless conductor host", () => {
 			// completes without the watchdog ever firing.
 			await waitFor(() => mock.armedMessages.length > 0, 5000, "armed message from host");
 			expect(mock.armedMessages[0].armed).toBe(true);
+			// Ordering: the host can only have sent `armed` in reaction to `hello`, so per the
+			// mock's own recorded sequence the armed frame must not be timestamped before the
+			// mock sent hello.
+			expect(mock.helloSentAt).not.toBeNull();
+			expect(mock.armedMessages[0].at).toBeGreaterThanOrEqual(mock.helloSentAt);
 
 			const blocks = makeBlocks(150); // 450 blocks (user+text+result per iter)
 			const reqId = mock.sync(blocks, { full: true });

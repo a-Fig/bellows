@@ -7,7 +7,8 @@
  *   • binds a WS server on 127.0.0.1 on an OS-chosen ephemeral port;
  *   • writes a session descriptor to <accordionHome>/.accordion/sessions/<id>.json (+ heartbeat)
  *     so the host's discovery poll finds it exactly as it finds a real pi session;
- *   • on connect: sends `hello` (protocol v5), then a `full` sync with a batch of blocks;
+ *   • on connect: sends `hello` (protocol v5, recording `helloSentAt`), then a `full` sync
+ *     with a batch of blocks;
  *   • records every `plan` reply the host sends, with a receive timestamp (for cadence checks);
  *   • answers `completeRequest` with junk (so an LLM conductor doesn't hang);
  *   • accepts `{type:"armed"}` and replies `{type:"armedAck", armed}` (records receipt so
@@ -82,6 +83,7 @@ export class MockExtension {
 		this.plans = []; // { reqId, ops, groups, at }
 		this.completions = []; // { reqId, at }
 		this.armedMessages = []; // { armed, at }
+		this.helloSentAt = null; // timestamp of the `hello` frame this mock sent, for ordering checks
 		this.client = null;
 		this.reqId = 0;
 		this._onPlan = null;
@@ -106,6 +108,7 @@ export class MockExtension {
 				sessionId: this.sessionId,
 				meta: { title: "mock session", cwd: "/mock", model: "mock/model", contextWindow: this.contextWindow, format: "pi" },
 			}));
+			this.helloSentAt = Date.now();
 			ws.on("message", (d) => {
 				let m;
 				try {
