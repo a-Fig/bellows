@@ -10,6 +10,9 @@
  *   • on connect: sends `hello` (protocol v5), then a `full` sync with a batch of blocks;
  *   • records every `plan` reply the host sends, with a receive timestamp (for cadence checks);
  *   • answers `completeRequest` with junk (so an LLM conductor doesn't hang);
+ *   • accepts `{type:"armed"}` and replies `{type:"armedAck", armed}` (records receipt so
+ *     tests can assert the round-trip; `swallowArmed: true` disables the reply to exercise
+ *     the host's ack watchdog);
  *   • exposes `sync(blocks, {full})` to push further syncs, and `close()` to end the session.
  *
  * The block generator produces a set that is comfortably OVER the host's budget so the
@@ -68,13 +71,17 @@ export function makeBlocks(count, startTs = 1_000_000) {
 }
 
 export class MockExtension {
-	constructor({ accordionHome, sessionId = `mock-${process.pid}`, contextWindow = 200_000, junk = "[stub completion]" }) {
+	constructor({ accordionHome, sessionId = `mock-${process.pid}`, contextWindow = 200_000, junk = "[stub completion]", swallowArmed = false }) {
 		this.accordionHome = accordionHome;
 		this.sessionId = sessionId;
 		this.contextWindow = contextWindow;
 		this.junk = junk;
+		// When true, an incoming `{type:"armed"}` is recorded but never acked — simulates an
+		// old extension that predates armed-over-wire, for exercising the host's watchdog.
+		this.swallowArmed = swallowArmed;
 		this.plans = []; // { reqId, ops, groups, at }
 		this.completions = []; // { reqId, at }
+		this.armedMessages = []; // { armed, at }
 		this.client = null;
 		this.reqId = 0;
 		this._onPlan = null;
@@ -113,6 +120,11 @@ export class MockExtension {
 				} else if (m.type === "completeRequest") {
 					this.completions.push({ reqId: m.reqId, at: Date.now() });
 					ws.send(JSON.stringify({ type: "completeResult", reqId: m.reqId, ok: true, text: this.junk, model: "mock/model", inputTokens: 10, outputTokens: 5 }));
+				} else if (m.type === "armed") {
+					this.armedMessages.push({ armed: m.armed, at: Date.now() });
+					if (!this.swallowArmed) {
+						ws.send(JSON.stringify({ type: "armedAck", armed: m.armed }));
+					}
 				}
 				// unfoldResult / recallResult from the host: nothing to do here.
 			});

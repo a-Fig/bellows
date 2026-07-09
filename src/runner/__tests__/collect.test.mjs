@@ -123,7 +123,8 @@ describe("parseSession", () => {
 });
 
 // Accordion issue #58: the extension stamps message.usage.rttMs (plan
-// round-trip ms) on assistant messages when ACCORDION_STEERING is on.
+// round-trip ms) on assistant messages when the attached host declares
+// itself armed (see src/host/main.ts).
 const RTT_SESSION_FIXTURE = [
   JSON.stringify({
     type: "message",

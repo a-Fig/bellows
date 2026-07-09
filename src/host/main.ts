@@ -55,6 +55,11 @@ const STALE_AFTER_MS = 15_000;
 // 120 s COMPLETION_TIMEOUT_MS). Bounds a worst-case hang while allowing any real LLM call.
 const COMPLETION_TIMEOUT_MS = 120_000;
 
+// How long the host waits for an `armedAck` after declaring itself armed before it
+// concludes the attached extension predates armed-over-wire. Env-tunable so the host
+// test can shrink it without touching the production default (5s).
+const ARMED_ACK_TIMEOUT_MS = Number(process.env.BELLOWS_ARMED_ACK_TIMEOUT_MS) || 5_000;
+
 // ── CLI parsing ───────────────────────────────────────────────────────────────
 interface Args {
 	accordionHome: string;
@@ -411,6 +416,16 @@ async function main(): Promise<number> {
 			}
 			socket = ws;
 
+			// Watchdog for the armedAck round-trip declared right after hello. Scoped to this
+			// connection so a reconnect can never fire a timer left over from a prior attempt.
+			let armedAckTimer: ReturnType<typeof setTimeout> | null = null;
+			const clearArmedAckTimer = () => {
+				if (armedAckTimer) {
+					clearTimeout(armedAckTimer);
+					armedAckTimer = null;
+				}
+			};
+
 			ws.on("open", () => {
 				/* wait for hello */
 			});
@@ -436,6 +451,26 @@ async function main(): Promise<number> {
 						return;
 					}
 					helloSeen = true;
+
+					// Declare ourselves armed on every (re)connect hello — the extension is always
+					// disarmed on a fresh attach, so this must re-fire each time connectOnce reruns.
+					// A client that gets no ack is talking to an old extension: fail LOUDLY (but
+					// not fatally) rather than silently running with 250ms non-blocking plan waits.
+					try {
+						ws.send(JSON.stringify({ type: "armed", armed: true }));
+						clearArmedAckTimer();
+						armedAckTimer = setTimeout(() => {
+							armedAckTimer = null;
+							const message =
+								"extension did not acknowledge armed — it likely predates armed-over-wire; " +
+								"benchmark plan waits will NOT block; update the Accordion checkout";
+							console.error(message);
+							tel.emit({ t: "armed_unacked", at: Date.now(), message });
+						}, ARMED_ACK_TIMEOUT_MS);
+					} catch (e) {
+						tel.emit({ t: "error", at: Date.now(), message: `armed: ${e instanceof Error ? e.message : String(e)}` });
+					}
+
 					const meta = msg.meta ?? {};
 					store = new acc.AccordionStore({
 						meta: { format: "pi", title: meta.title || "live pi session", cwd: meta.cwd || "", model: meta.model || "" },
@@ -462,6 +497,11 @@ async function main(): Promise<number> {
 						budget: args.budget,
 						protectTokens: args.protect,
 					});
+					return;
+				}
+
+				if (msg.type === "armedAck") {
+					clearArmedAckTimer();
 					return;
 				}
 
@@ -586,10 +626,12 @@ async function main(): Promise<number> {
 			});
 
 			ws.on("error", (e: Error) => {
+				clearArmedAckTimer();
 				tel.emit({ t: "error", at: Date.now(), message: `ws: ${e.message}` });
 			});
 
 			ws.on("close", () => {
+				clearArmedAckTimer();
 				drainCompletions("disconnected");
 				if (socket === ws) socket = null;
 				if (fatal) {

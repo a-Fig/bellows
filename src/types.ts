@@ -172,8 +172,9 @@ export interface TurnMetric {
   wireTokens?: number;
   /**
    * Plan round-trip time in ms, stamped by the accordion extension on
-   * message.usage.rttMs when ACCORDION_STEERING is on (Accordion issue #58).
-   * Absent on old sessions / non-accordion runs — never defaulted to 0.
+   * message.usage.rttMs when the attached host declares itself armed (see
+   * src/host/main.ts) (Accordion issue #58). Absent on old sessions /
+   * non-accordion runs — never defaulted to 0.
    */
   rttMs?: number;
 }
@@ -203,6 +204,12 @@ export type HostEvent =
   // folded into RunRecord.errors — a healthy chatty remote conductor should not
   // read as error-laden. See M3/m7 in the adversarial review.
   | { t: "info"; at: number; message: string }
+  // The host declared `{type:"armed"}` after hello but got no `armedAck` within
+  // the watchdog window — the attached extension likely predates armed-over-wire
+  // and plan waits will NOT block. Folded into ConductorTelemetry.errors so a
+  // silently-degraded run surfaces loudly in the report, exactly like any other
+  // integrity failure (see src/host/main.ts).
+  | { t: "armed_unacked"; at: number; message: string }
   | { t: "detach"; at: number; reason: string };
 
 export interface ConductorTelemetry {
