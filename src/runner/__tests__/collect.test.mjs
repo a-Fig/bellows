@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseSession, foldHostTelemetry, enrichTurnsWithWire } from "../collect.mjs";
+import { parseSession, foldHostTelemetry, enrichTurnsWithWire, computePlanRtt } from "../collect.mjs";
 
 // Fixture mirrors the real pi session JSONL schema verified from
 // ~/.pi/agent/sessions: message records with message.role, message.usage
@@ -111,6 +111,105 @@ describe("parseSession", () => {
   it("skips user messages and garbage lines", () => {
     // 3 assistant only, not 4 (user) not counting the garbage line
     expect(turns.every((t) => typeof t.timestamp === "number")).toBe(true);
+  });
+
+  it("leaves rttMs absent when the session predates Accordion issue #58", () => {
+    expect(turns.every((t) => !("rttMs" in t))).toBe(true);
+  });
+
+  it("computePlanRtt is null when no turn carries rttMs", () => {
+    expect(computePlanRtt(turns)).toBeNull();
+  });
+});
+
+// Accordion issue #58: the extension stamps message.usage.rttMs (plan
+// round-trip ms) on assistant messages when ACCORDION_STEERING is on.
+const RTT_SESSION_FIXTURE = [
+  JSON.stringify({
+    type: "message",
+    id: "b1",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "..." }],
+      usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { total: 0.001 }, rttMs: 120 },
+      stopReason: "toolUse",
+      timestamp: 1000,
+    },
+  }),
+  // Present but non-numeric — must not poison the average as a 0.
+  JSON.stringify({
+    type: "message",
+    id: "b2",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "..." }],
+      usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { total: 0.001 }, rttMs: "not-a-number" },
+      stopReason: "toolUse",
+      timestamp: 2000,
+    },
+  }),
+  // No usage.rttMs at all (e.g. steering off mid-session).
+  JSON.stringify({
+    type: "message",
+    id: "b3",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "done" }],
+      usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { total: 0.001 } },
+      stopReason: "endTurn",
+      timestamp: 3000,
+    },
+  }),
+  JSON.stringify({
+    type: "message",
+    id: "b4",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "..." }],
+      usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { total: 0.001 }, rttMs: 380 },
+      stopReason: "endTurn",
+      timestamp: 4000,
+    },
+  }),
+  // Negative rttMs (clock skew / bad stamp) — must be rejected like a
+  // non-numeric value, not admitted as a valid (if odd) sample.
+  JSON.stringify({
+    type: "message",
+    id: "b5",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "..." }],
+      usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { total: 0.001 }, rttMs: -5 },
+      stopReason: "endTurn",
+      timestamp: 5000,
+    },
+  }),
+].join("\n");
+
+describe("parseSession — plan RTT (Accordion issue #58)", () => {
+  const { turns } = parseSession(RTT_SESSION_FIXTURE);
+
+  it("populates rttMs only on turns with a numeric usage.rttMs", () => {
+    expect(turns[0].rttMs).toBe(120);
+    expect(turns[1]).not.toHaveProperty("rttMs");
+    expect(turns[2]).not.toHaveProperty("rttMs");
+    expect(turns[3].rttMs).toBe(380);
+  });
+
+  it("rejects a negative rttMs — never admitted onto the TurnMetric", () => {
+    expect(turns[4]).not.toHaveProperty("rttMs");
+  });
+
+  it("computePlanRtt averages only turns with rttMs, ignoring missing/invalid/negative ones", () => {
+    const plan = computePlanRtt(turns);
+    expect(plan).toEqual({ avgMs: 250, maxMs: 380, turns: 2 });
+  });
+
+  it("computePlanRtt's own filter rejects a negative rttMs even if one reached a TurnMetric directly", () => {
+    // Exercises computePlanRtt in isolation (not routed through parseSession),
+    // so its own predicate — not just parseSession's — is under test.
+    const plan = computePlanRtt([{ rttMs: 100 }, { rttMs: -5 }, { rttMs: 200 }]);
+    expect(plan).toEqual({ avgMs: 150, maxMs: 200, turns: 2 });
   });
 });
 

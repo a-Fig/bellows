@@ -29,6 +29,7 @@ function makeRun({
   costUsd = 0.42,
   totalTokens = 12345,
   wallClockS = 300,
+  planRtt = null,
 }) {
   return {
     id,
@@ -37,6 +38,7 @@ function makeRun({
     statusDetail,
     fingerprint: { ...SHARED_FP, conductorId, ...fingerprintOverrides },
     timing: { startedAt: "2026-07-01T00:00:00.000Z", endedAt: "2026-07-01T00:05:00.000Z", wallClockS },
+    planRtt,
     usage: {
       input: 1000,
       output: 500,
@@ -251,6 +253,13 @@ describe("generateReport", () => {
     const html2 = await readFile(outFile2, "utf8");
     expect(html2).toContain("No comparable runs found");
   });
+
+  // Accordion issue #58: none of this suite's fixture runs set planRtt, so the
+  // report must render cleanly with no dash-filled plan-RTT column/stat block.
+  it("omits the median plan RTT column and per-run stat block when no run has planRtt", () => {
+    expect(html).not.toContain("median plan RTT");
+    expect(html).not.toContain("plan RTT avg / max");
+  });
 });
 
 // Issue #14 follow-through: forcing status="error" in the runner is only half
@@ -285,5 +294,79 @@ describe("score exclusion of errored runs (issue #14)", () => {
     expect(row.abortedCount).toBe(1);
     // Median of [3, 4] — 3.5. Were the errored run's row counted, this would be 4.
     expect(row.checkpointsSolved).toBe(3.5);
+  });
+});
+
+// Accordion issue #58: makeRun's default planRtt is null (no coverage of
+// aggregate.mjs's planRttMs median or render.mjs's column/stat-block gating
+// before this). These fill that gap.
+describe("plan RTT aggregation (Accordion issue #58)", () => {
+  it("aggregateGroup computes planRttMs as the median over only runs that carry it", () => {
+    const runs = [
+      makeRun({ id: "r/keel/1", conductorId: "keel", seed: 1, planRtt: { avgMs: 100, maxMs: 150, turns: 2 } }),
+      makeRun({ id: "r/keel/2", conductorId: "keel", seed: 2, planRtt: { avgMs: 200, maxMs: 250, turns: 3 } }),
+      // No planRtt at all (pre-#58 run, or steering was off) — must be
+      // dropped from the median, not treated as 0.
+      makeRun({ id: "r/keel/3", conductorId: "keel", seed: 3, planRtt: null }),
+    ];
+    const [row] = aggregateGroup({ runs });
+    expect(row.planRttMs).toBe(150);
+  });
+
+  it("planRttMs is null (not NaN/0) when no run in the group carries planRtt", () => {
+    const runs = [
+      makeRun({ id: "r/keel/4", conductorId: "keel", seed: 4, planRtt: null }),
+      makeRun({ id: "r/keel/5", conductorId: "keel", seed: 5, planRtt: null }),
+    ];
+    const [row] = aggregateGroup({ runs });
+    expect(row.planRttMs).toBeNull();
+  });
+});
+
+describe("generateReport — plan RTT column + stat block gating (Accordion issue #58)", () => {
+  let rttDir;
+  let rttHtml;
+
+  beforeAll(async () => {
+    rttDir = await mkdtemp(path.join(tmpdir(), "bellows-report-rtt-test-"));
+    const rttRunsDir = path.join(rttDir, "runs");
+    const rttOutFile = path.join(rttDir, "out", "report.html");
+    await mkdir(path.join(rttRunsDir, "example"), { recursive: true });
+
+    // One group, one conductor: one run carries planRtt, the other doesn't
+    // (steering was off for that run). At least one run in the report has
+    // planRtt, so the column + that run's stat block must appear — but only
+    // that run's stat block, not the other's.
+    const runs = [
+      makeRun({ id: "example/keel/1", conductorId: "keel", seed: 1, planRtt: { avgMs: 123.45, maxMs: 400, turns: 5 } }),
+      makeRun({ id: "example/keel/2", conductorId: "keel", seed: 2, planRtt: null }),
+    ];
+    for (const run of runs) {
+      const safeName = run.id.replace(/\//g, "_");
+      await writeFile(path.join(rttRunsDir, "example", `${safeName}.json`), JSON.stringify(run, null, 2), "utf8");
+    }
+
+    await generateReport(rttRunsDir, rttOutFile);
+    rttHtml = await readFile(rttOutFile, "utf8");
+  });
+
+  afterAll(async () => {
+    await rm(rttDir, { recursive: true, force: true });
+  });
+
+  it("includes the median plan RTT column header when at least one run has planRtt", () => {
+    expect(rttHtml).toContain("median plan RTT");
+  });
+
+  it("renders the aggregate median plan RTT value in the table", () => {
+    expect(rttHtml).toContain("123ms");
+  });
+
+  it("shows the per-run plan RTT stat block only for the run that carries planRtt", () => {
+    const matches = rttHtml.match(/plan RTT avg \/ max/g) ?? [];
+    expect(matches.length).toBe(1);
+    expect(rttHtml).toContain("example/keel/1");
+    // fmtNum defaults to 0 fraction digits: 123.45 -> "123".
+    expect(rttHtml).toContain("123ms / 400ms");
   });
 });

@@ -7,7 +7,12 @@
  *   { type:"message", id, parentId, timestamp, message:{ role, content, ... } }
  * Assistant messages carry:
  *   message.usage = { input, output, cacheRead, cacheWrite, totalTokens,
- *                     cost:{ input, output, cacheRead, cacheWrite, total } }
+ *                     cost:{ input, output, cacheRead, cacheWrite, total },
+ *                     rttMs }
+ *   rttMs (Accordion issue #58) is the plan round-trip time in ms, stamped by
+ *   the accordion extension when ACCORDION_STEERING is on. Absent on old
+ *   sessions / non-accordion runs — never defaulted to 0, since that would
+ *   poison the planRtt average with fake zero-latency turns.
  *   message.stopReason = "toolUse" | "endTurn" | "error" | ...
  *   message.timestamp  = ms epoch
  *   message.content = [ {type:"text"|"thinking"|"toolCall"|...}, ... ]
@@ -103,6 +108,12 @@ export function parseSession(text) {
     const toolCalls = Array.isArray(m.content)
       ? m.content.filter((c) => c && (c.type === "toolCall" || c.type === "tool_use" || c.type === "tool_call")).length
       : 0;
+    // Only present when the accordion extension stamped it (ACCORDION_STEERING
+    // on) — left out entirely rather than defaulted, so old/non-accordion
+    // sessions don't poison the planRtt average with fake 0ms turns. Negative
+    // values (clock skew / bad stamps) are also rejected here so they never
+    // reach a TurnMetric and drag the aggregate negative.
+    const rttMs = isValidRtt(u.rttMs) ? u.rttMs : undefined;
 
     turns.push({
       turnIndex: turnIndex++,
@@ -113,6 +124,7 @@ export function parseSession(text) {
       cacheWrite,
       costUsd,
       stopReason: typeof m.stopReason === "string" ? m.stopReason : "",
+      ...(rttMs !== undefined ? { rttMs } : {}),
     });
 
     totals.input += input;
@@ -246,9 +258,31 @@ export function enrichTurnsWithWire(turns, telemetry) {
   });
 }
 
+/**
+ * Aggregate per-turn plan RTT (Accordion issue #58) into a run-level summary.
+ * @param {import("../types.ts").TurnMetric[]} turns
+ * @returns {import("../types.ts").PlanRttSummary | null}  null when no turn has rttMs
+ */
+export function computePlanRtt(turns) {
+  const samples = turns.map((t) => t.rttMs).filter(isValidRtt);
+  if (!samples.length) return null;
+  const avgMs = samples.reduce((a, b) => a + b, 0) / samples.length;
+  return {
+    avgMs: Math.round(avgMs * 100) / 100,
+    maxMs: Math.max(...samples),
+    turns: samples.length,
+  };
+}
+
 // --- numeric helpers ---------------------------------------------------------
 function n(v) {
   return Number.isFinite(v) ? v : 0;
+}
+/** A usable plan-RTT sample: finite and non-negative. Negative rttMs (clock
+ *  skew / bad stamps) must never enter a TurnMetric or the planRtt aggregate,
+ *  or a single bad sample would silently drag avgMs negative. */
+function isValidRtt(v) {
+  return Number.isFinite(v) && v >= 0;
 }
 function round6(v) {
   return Math.round(v * 1e6) / 1e6;
