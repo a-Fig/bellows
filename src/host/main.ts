@@ -24,6 +24,12 @@
  *   5. writes HostEvent JSONL telemetry throughout;
  *   6. exits 0 when the WS closes (session ended), nonzero on a fatal error, and flushes
  *      telemetry on SIGTERM.
+ *
+ * Environment knobs:
+ *   BELLOWS_ARMED_ACK_TIMEOUT_MS — ms to wait for the extension's `armedAck` before logging
+ *     a loud (non-fatal) "extension predates armed-over-wire" warning. Default 5000. Must be
+ *     a finite number >= 0; 0 explicitly disables the watchdog. Anything else (unset,
+ *     unparseable, negative) falls back to the default.
  */
 import WebSocket from "ws";
 import { readFileSync, readdirSync, existsSync } from "node:fs";
@@ -54,6 +60,16 @@ const STALE_AFTER_MS = 15_000;
 // Backstop for an out-of-band completion the extension never answers (mirrors the GUI's
 // 120 s COMPLETION_TIMEOUT_MS). Bounds a worst-case hang while allowing any real LLM call.
 const COMPLETION_TIMEOUT_MS = 120_000;
+
+// How long the host waits for an `armedAck` after declaring itself armed before it
+// concludes the attached extension predates armed-over-wire. Env-tunable so the host
+// test can shrink it without touching the production default (5s).
+// BELLOWS_ARMED_ACK_TIMEOUT_MS: milliseconds, default 5000. Must be a finite number >= 0.
+// 0 explicitly disables the watchdog (no setTimeout is armed). Anything unparseable,
+// negative, or absent falls back to the default — `0 || 5000` would otherwise silently
+// coerce an intentional "0" into 5000, and a negative value would fire immediately.
+const armedAckTimeoutEnv = Number(process.env.BELLOWS_ARMED_ACK_TIMEOUT_MS);
+const ARMED_ACK_TIMEOUT_MS = Number.isFinite(armedAckTimeoutEnv) && armedAckTimeoutEnv >= 0 ? armedAckTimeoutEnv : 5_000;
 
 // ── CLI parsing ───────────────────────────────────────────────────────────────
 interface Args {
@@ -411,6 +427,16 @@ async function main(): Promise<number> {
 			}
 			socket = ws;
 
+			// Watchdog for the armedAck round-trip declared right after hello. Scoped to this
+			// connection so a reconnect can never fire a timer left over from a prior attempt.
+			let armedAckTimer: ReturnType<typeof setTimeout> | null = null;
+			const clearArmedAckTimer = () => {
+				if (armedAckTimer) {
+					clearTimeout(armedAckTimer);
+					armedAckTimer = null;
+				}
+			};
+
 			ws.on("open", () => {
 				/* wait for hello */
 			});
@@ -436,6 +462,33 @@ async function main(): Promise<number> {
 						return;
 					}
 					helloSeen = true;
+
+					// Declare ourselves armed right after hello. helloSeen only flips once per
+					// process — a post-hello WS close is treated as the session ending and
+					// terminates this host rather than reconnecting (see the "closed" branch
+					// below), so in practice this fires (at most) once per host lifetime, not
+					// once per connectOnce rerun. Placed here defensively, mirroring where
+					// `hello` itself is handled, in case that assumption ever changes.
+					// A client that gets no ack is talking to an old extension: fail LOUDLY (but
+					// not fatally) rather than silently running with 250ms non-blocking plan waits.
+					try {
+						ws.send(JSON.stringify({ type: "armed", armed: true }));
+						clearArmedAckTimer();
+						// 0 explicitly disables the watchdog — skip arming the timer entirely.
+						if (ARMED_ACK_TIMEOUT_MS > 0) {
+							armedAckTimer = setTimeout(() => {
+								armedAckTimer = null;
+								const message =
+									"extension did not acknowledge armed — it likely predates armed-over-wire; " +
+									"benchmark plan waits will NOT block; update the Accordion checkout";
+								console.error(message);
+								tel.emit({ t: "armed_unacked", at: Date.now(), message });
+							}, ARMED_ACK_TIMEOUT_MS);
+						}
+					} catch (e) {
+						tel.emit({ t: "error", at: Date.now(), message: `armed: ${e instanceof Error ? e.message : String(e)}` });
+					}
+
 					const meta = msg.meta ?? {};
 					store = new acc.AccordionStore({
 						meta: { format: "pi", title: meta.title || "live pi session", cwd: meta.cwd || "", model: meta.model || "" },
@@ -462,6 +515,17 @@ async function main(): Promise<number> {
 						budget: args.budget,
 						protectTokens: args.protect,
 					});
+					return;
+				}
+
+				if (msg.type === "armedAck") {
+					// Only a genuine armed===true ack disarms the watchdog. An ack with armed
+					// !== true means the extension explicitly did not arm — let the timer run
+					// out and fire the loud "not armed" telemetry/log rather than silently
+					// treating it as success.
+					if (msg.armed === true) {
+						clearArmedAckTimer();
+					}
 					return;
 				}
 
@@ -586,10 +650,12 @@ async function main(): Promise<number> {
 			});
 
 			ws.on("error", (e: Error) => {
+				clearArmedAckTimer();
 				tel.emit({ t: "error", at: Date.now(), message: `ws: ${e.message}` });
 			});
 
 			ws.on("close", () => {
+				clearArmedAckTimer();
 				drainCompletions("disconnected");
 				if (socket === ws) socket = null;
 				if (fatal) {

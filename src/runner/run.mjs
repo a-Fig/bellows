@@ -167,13 +167,14 @@ export async function executeRun(args) {
 
     // Spawn pi in RPC mode with an isolated agent dir + shared accordion home.
     // ACCORDION_PLAN_TIMEOUT_MS / ACCORDION_PLAN_DEADLINE_MS (Accordion issue #58)
-    // already flow through via the process.env spread below and nothing after
-    // it touches those keys, so an operator's values pass through untouched.
+    // still flow through via the process.env spread below untouched — they
+    // remain real tuning knobs. The armed bit that used to ride a steering env
+    // var no longer travels as env: the host (src/host/main.ts) now declares
+    // it over the wire to the attached extension on every (re)connect.
     const piEnv = {
       ...process.env,
       PI_CODING_AGENT_DIR: agentDir,
       ACCORDION_HOME: accordionHome,
-      ...accordionSteeringEnv(process.env),
     };
     // A parent-shell PI_CODING_AGENT_SESSION_DIR would redirect the session
     // JSONL outside agentDir and blind the collector — force the default layout.
@@ -587,19 +588,6 @@ function driveUntilDone({ pi, host, spec, log, label, abortSignal }) {
  */
 export function hostEnv(config) {
   return { BELLOWS_ACCORDION_REPO: config.accordionRepo };
-}
-
-/**
- * Env override that turns on Accordion steering (issue #58: blocking plan
- * wait, which stamps message.usage.rttMs) by default for bench runs, so every
- * run exercises the plan-RTT path. An operator's explicit ACCORDION_STEERING
- * in the parent env always wins — this only fills in when it's unset.
- * Exported as the unit-testable seam for the executeRun -> piEnv wiring.
- * @param {NodeJS.ProcessEnv} baseEnv  the parent env to read an existing override from
- * @returns {{ACCORDION_STEERING: string}}
- */
-export function accordionSteeringEnv(baseEnv) {
-  return { ACCORDION_STEERING: baseEnv.ACCORDION_STEERING ?? "1" };
 }
 
 /**
