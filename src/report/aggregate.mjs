@@ -58,6 +58,10 @@ export function aggregateGroup(group) {
     const costUsd = median(runs.map((r) => r.usage?.costUsd));
     const totalTokens = median(runs.map((r) => r.usage?.totalTokens));
     const wallClockS = median(runs.map((r) => r.timing?.wallClockS));
+    // Accordion issue #58: null on runs/groups predating plan-RTT collection —
+    // median() already drops non-numeric entries, so this is null only when
+    // no run in the group has planRtt.
+    const planRttMs = median(runs.map((r) => r.planRtt?.avgMs));
 
     const cacheShares = runs
       .map((r) => {
@@ -81,6 +85,7 @@ export function aggregateGroup(group) {
       totalTokens,
       wallClockS,
       cacheReadShare,
+      planRttMs,
       runs,
     });
   }

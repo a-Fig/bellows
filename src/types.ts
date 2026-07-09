@@ -111,6 +111,12 @@ export interface RunRecord {
   fingerprint: Fingerprint;
   timing: { startedAt: string; endedAt: string; wallClockS: number };
   usage: UsageTotals;
+  /**
+   * Plan round-trip aggregate (Accordion issue #58), computed over turns with
+   * an rttMs sample. Null/absent when no turn in this run carries rttMs (old
+   * sessions, non-accordion runs, or steering off).
+   */
+  planRtt?: PlanRttSummary | null;
   /** Per assistant-turn metrics parsed from the pi session JSONL. */
   turns: TurnMetric[];
   /** Telemetry from the headless host. Null for conductor "none". */
@@ -164,6 +170,20 @@ export interface TurnMetric {
   stopReason: string;
   /** Context tokens on the wire for this call, if known (from host telemetry). */
   wireTokens?: number;
+  /**
+   * Plan round-trip time in ms, stamped by the accordion extension on
+   * message.usage.rttMs when ACCORDION_STEERING is on (Accordion issue #58).
+   * Absent on old sessions / non-accordion runs — never defaulted to 0.
+   */
+  rttMs?: number;
+}
+
+/** Run-level aggregate of TurnMetric.rttMs (Accordion issue #58). */
+export interface PlanRttSummary {
+  avgMs: number;
+  maxMs: number;
+  /** Count of turns with an rttMs sample (not total assistant turns). */
+  turns: number;
 }
 
 // ---------------------------------------------------------------------------

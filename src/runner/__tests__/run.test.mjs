@@ -10,6 +10,7 @@ import {
   spawnExternalConductor,
   spawnHost,
   hostEnv,
+  accordionSteeringEnv,
   modelShortName,
   buildJoinMeta,
   conductorNeverAttached,
@@ -30,6 +31,20 @@ describe("hostEnv — the effective-accordion-repo env seam", () => {
 
   it("carries the default repo unchanged when no ref is pinned", () => {
     expect(hostEnv({ accordionRepo: "C:/acc" })).toEqual({ BELLOWS_ACCORDION_REPO: "C:/acc" });
+  });
+});
+
+describe("accordionSteeringEnv — Accordion issue #58 default-on steering", () => {
+  it("defaults ACCORDION_STEERING to \"1\" when unset in the parent env", () => {
+    expect(accordionSteeringEnv({})).toEqual({ ACCORDION_STEERING: "1" });
+  });
+
+  it("respects an operator's explicit ACCORDION_STEERING=0", () => {
+    expect(accordionSteeringEnv({ ACCORDION_STEERING: "0" })).toEqual({ ACCORDION_STEERING: "0" });
+  });
+
+  it("respects any other explicit non-empty value", () => {
+    expect(accordionSteeringEnv({ ACCORDION_STEERING: "false" })).toEqual({ ACCORDION_STEERING: "false" });
   });
 });
 

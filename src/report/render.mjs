@@ -32,6 +32,7 @@ function renderGroupTable(rows) {
         <td>${fmtNum(r.totalTokens)}</td>
         <td>${fmtDuration(r.wallClockS)}</td>
         <td>${fmtPct(r.cacheReadShare)}</td>
+        <td>${fmtNum(r.planRttMs, 0)}${r.planRttMs !== null ? "ms" : ""}</td>
       </tr>`;
     })
     .join("");
@@ -40,6 +41,7 @@ function renderGroupTable(rows) {
       <th>conductor</th><th>runs</th><th>aborted</th><th>completion</th>
       <th>median checkpoints solved</th><th>median attempted</th>
       <th>median cost</th><th>median tokens</th><th>median wall clock</th><th>cache-read share</th>
+      <th>median plan RTT</th>
     </tr></thead>
     <tbody>${body}</tbody>
   </table>`;
@@ -134,6 +136,7 @@ function renderRunDetail(run) {
         <div class="stat-block"><div class="label">assistant turns / tool calls</div><div class="value">${fmtNum(run.usage?.assistantTurns)} / ${fmtNum(run.usage?.toolCalls)}</div></div>
         <div class="stat-block"><div class="label">input / output tokens</div><div class="value">${fmtNum(run.usage?.input)} / ${fmtNum(run.usage?.output)}</div></div>
         <div class="stat-block"><div class="label">cache read / write</div><div class="value">${fmtNum(run.usage?.cacheRead)} / ${fmtNum(run.usage?.cacheWrite)}</div></div>
+        ${run.planRtt ? `<div class="stat-block"><div class="label">plan RTT avg / max (${fmtNum(run.planRtt.turns)} turns)</div><div class="value">${fmtNum(run.planRtt.avgMs)}ms / ${fmtNum(run.planRtt.maxMs)}ms</div></div>` : ""}
       </div>
     </div>
   </details>`;
