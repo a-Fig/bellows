@@ -110,8 +110,10 @@ export function parseSession(text) {
       : 0;
     // Only present when the accordion extension stamped it (ACCORDION_STEERING
     // on) — left out entirely rather than defaulted, so old/non-accordion
-    // sessions don't poison the planRtt average with fake 0ms turns.
-    const rttMs = Number.isFinite(u.rttMs) ? u.rttMs : undefined;
+    // sessions don't poison the planRtt average with fake 0ms turns. Negative
+    // values (clock skew / bad stamps) are also rejected here so they never
+    // reach a TurnMetric and drag the aggregate negative.
+    const rttMs = isValidRtt(u.rttMs) ? u.rttMs : undefined;
 
     turns.push({
       turnIndex: turnIndex++,
@@ -262,7 +264,7 @@ export function enrichTurnsWithWire(turns, telemetry) {
  * @returns {import("../types.ts").PlanRttSummary | null}  null when no turn has rttMs
  */
 export function computePlanRtt(turns) {
-  const samples = turns.map((t) => t.rttMs).filter((v) => Number.isFinite(v));
+  const samples = turns.map((t) => t.rttMs).filter(isValidRtt);
   if (!samples.length) return null;
   const avgMs = samples.reduce((a, b) => a + b, 0) / samples.length;
   return {
@@ -275,6 +277,12 @@ export function computePlanRtt(turns) {
 // --- numeric helpers ---------------------------------------------------------
 function n(v) {
   return Number.isFinite(v) ? v : 0;
+}
+/** A usable plan-RTT sample: finite and non-negative. Negative rttMs (clock
+ *  skew / bad stamps) must never enter a TurnMetric or the planRtt aggregate,
+ *  or a single bad sample would silently drag avgMs negative. */
+function isValidRtt(v) {
+  return Number.isFinite(v) && v >= 0;
 }
 function round6(v) {
   return Math.round(v * 1e6) / 1e6;

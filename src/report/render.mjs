@@ -15,7 +15,7 @@ function renderFingerprintTable(fp, softWarnings) {
   return `<table class="fp-table">${rows}</table>`;
 }
 
-function renderGroupTable(rows) {
+function renderGroupTable(rows, hasPlanRtt) {
   if (rows.length === 0) return `<p class="section-empty">No runs in this group.</p>`;
   const best = rows[0]?.conductorId;
   const body = rows
@@ -32,7 +32,7 @@ function renderGroupTable(rows) {
         <td>${fmtNum(r.totalTokens)}</td>
         <td>${fmtDuration(r.wallClockS)}</td>
         <td>${fmtPct(r.cacheReadShare)}</td>
-        <td>${fmtNum(r.planRttMs, 0)}${r.planRttMs !== null ? "ms" : ""}</td>
+        ${hasPlanRtt ? `<td>${fmtNum(r.planRttMs, 0)}${r.planRttMs !== null ? "ms" : ""}</td>` : ""}
       </tr>`;
     })
     .join("");
@@ -41,7 +41,7 @@ function renderGroupTable(rows) {
       <th>conductor</th><th>runs</th><th>aborted</th><th>completion</th>
       <th>median checkpoints solved</th><th>median attempted</th>
       <th>median cost</th><th>median tokens</th><th>median wall clock</th><th>cache-read share</th>
-      <th>median plan RTT</th>
+      ${hasPlanRtt ? "<th>median plan RTT</th>" : ""}
     </tr></thead>
     <tbody>${body}</tbody>
   </table>`;
@@ -142,7 +142,7 @@ function renderRunDetail(run) {
   </details>`;
 }
 
-function renderGroupSection(group, index) {
+function renderGroupSection(group, index, hasPlanRtt) {
   const rows = aggregateGroup(group);
   const anchorId = `group-${index}`;
   const allRuns = [...group.runs].sort((a, b) => (a.id < b.id ? -1 : 1));
@@ -157,7 +157,7 @@ function renderGroupSection(group, index) {
       ${group.softWarnings.size > 0 ? `<span class="badge badge-warn">varies: ${[...group.softWarnings].join(", ")}</span>` : ""}
     </div>
 
-    ${renderGroupTable(rows)}
+    ${renderGroupTable(rows, hasPlanRtt)}
 
     <details class="fp-details">
       <summary>fingerprint (shared hard fields)</summary>
@@ -180,6 +180,9 @@ function renderSkippedFiles(skipped) {
 
 export function renderReport({ runs, skipped, groups, mismatches, runsDir, generatedAt }) {
   const abortedTotal = runs.filter(isAborted).length;
+  // Column + per-run stat block only when data exists (Accordion issue #58):
+  // reports for pre-plan-RTT runs (or runs with steering off) show no dash-filled column.
+  const hasPlanRtt = runs.some((r) => r.planRtt != null);
 
   const toc = groups
     .map((g, i) => `<a href="#group-${i}">group ${i + 1}</a>`)
@@ -202,7 +205,7 @@ export function renderReport({ runs, skipped, groups, mismatches, runsDir, gener
     ${
       groups.length === 0
         ? `<p class="section-empty">No comparable runs found under ${esc(runsDir)}.</p>`
-        : groups.map(renderGroupSection).join("\n")
+        : groups.map((g, i) => renderGroupSection(g, i, hasPlanRtt)).join("\n")
     }
 
     <footer>bellows report generator — static, self-contained, no network calls.</footer>

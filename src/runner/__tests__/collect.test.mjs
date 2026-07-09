@@ -171,6 +171,19 @@ const RTT_SESSION_FIXTURE = [
       timestamp: 4000,
     },
   }),
+  // Negative rttMs (clock skew / bad stamp) — must be rejected like a
+  // non-numeric value, not admitted as a valid (if odd) sample.
+  JSON.stringify({
+    type: "message",
+    id: "b5",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "..." }],
+      usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { total: 0.001 }, rttMs: -5 },
+      stopReason: "endTurn",
+      timestamp: 5000,
+    },
+  }),
 ].join("\n");
 
 describe("parseSession — plan RTT (Accordion issue #58)", () => {
@@ -183,9 +196,20 @@ describe("parseSession — plan RTT (Accordion issue #58)", () => {
     expect(turns[3].rttMs).toBe(380);
   });
 
-  it("computePlanRtt averages only turns with rttMs, ignoring missing/invalid ones", () => {
+  it("rejects a negative rttMs — never admitted onto the TurnMetric", () => {
+    expect(turns[4]).not.toHaveProperty("rttMs");
+  });
+
+  it("computePlanRtt averages only turns with rttMs, ignoring missing/invalid/negative ones", () => {
     const plan = computePlanRtt(turns);
     expect(plan).toEqual({ avgMs: 250, maxMs: 380, turns: 2 });
+  });
+
+  it("computePlanRtt's own filter rejects a negative rttMs even if one reached a TurnMetric directly", () => {
+    // Exercises computePlanRtt in isolation (not routed through parseSession),
+    // so its own predicate — not just parseSession's — is under test.
+    const plan = computePlanRtt([{ rttMs: 100 }, { rttMs: -5 }, { rttMs: 200 }]);
+    expect(plan).toEqual({ avgMs: 150, maxMs: 200, turns: 2 });
   });
 });
 
