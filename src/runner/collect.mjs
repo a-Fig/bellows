@@ -10,9 +10,10 @@
  *                     cost:{ input, output, cacheRead, cacheWrite, total },
  *                     rttMs }
  *   rttMs (Accordion issue #58) is the plan round-trip time in ms, stamped by
- *   the accordion extension when ACCORDION_STEERING is on. Absent on old
- *   sessions / non-accordion runs — never defaulted to 0, since that would
- *   poison the planRtt average with fake zero-latency turns.
+ *   the accordion extension when the attached host declares itself armed (see
+ *   src/host/main.ts). Absent on old sessions / non-accordion runs — never
+ *   defaulted to 0, since that would poison the planRtt average with fake
+ *   zero-latency turns.
  *   message.stopReason = "toolUse" | "endTurn" | "error" | ...
  *   message.timestamp  = ms epoch
  *   message.content = [ {type:"text"|"thinking"|"toolCall"|...}, ... ]
@@ -108,11 +109,12 @@ export function parseSession(text) {
     const toolCalls = Array.isArray(m.content)
       ? m.content.filter((c) => c && (c.type === "toolCall" || c.type === "tool_use" || c.type === "tool_call")).length
       : 0;
-    // Only present when the accordion extension stamped it (ACCORDION_STEERING
-    // on) — left out entirely rather than defaulted, so old/non-accordion
-    // sessions don't poison the planRtt average with fake 0ms turns. Negative
-    // values (clock skew / bad stamps) are also rejected here so they never
-    // reach a TurnMetric and drag the aggregate negative.
+    // Only present when the accordion extension stamped it (the attached host
+    // declared itself armed — see src/host/main.ts) — left out entirely rather
+    // than defaulted, so old/non-accordion sessions don't poison the planRtt
+    // average with fake 0ms turns. Negative values (clock skew / bad stamps)
+    // are also rejected here so they never reach a TurnMetric and drag the
+    // aggregate negative.
     const rttMs = isValidRtt(u.rttMs) ? u.rttMs : undefined;
 
     turns.push({
@@ -210,6 +212,12 @@ export function foldHostTelemetry(text, fallbackConductorId = "") {
         if (typeof e.costUsd === "number") completeCostUsd += e.costUsd;
         break;
       case "error":
+        if (e.message) errors.push(String(e.message));
+        break;
+      case "armed_unacked":
+        // Unlike "info", this IS a real degradation (silent 250ms-window fallback) —
+        // fold it into errors[] so the report surfaces it exactly like any other
+        // integrity failure, not as benign chatter.
         if (e.message) errors.push(String(e.message));
         break;
       case "info":

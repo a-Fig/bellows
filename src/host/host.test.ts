@@ -41,9 +41,11 @@ function spawnHost(opts: {
 	protect: number;
 	telemetryOut: string;
 	slowConductMs?: number;
+	armedAckTimeoutMs?: number;
 }): Spawned {
 	const env = { ...process.env };
 	if (opts.slowConductMs) env.BELLOWS_TEST_SLOW_CONDUCT_MS = String(opts.slowConductMs);
+	if (opts.armedAckTimeoutMs) env.BELLOWS_ARMED_ACK_TIMEOUT_MS = String(opts.armedAckTimeoutMs);
 	const child = spawn(
 		process.execPath,
 		[
@@ -112,6 +114,17 @@ describe("headless conductor host", () => {
 		try {
 			// Wait for the host to connect (mock sees a client), then push the big sync.
 			await waitFor(() => mock.client !== null, 60_000, "host WS connect");
+
+			// The host declares itself armed right after hello, and the mock's ack round-trip
+			// completes without the watchdog ever firing.
+			await waitFor(() => mock.armedMessages.length > 0, 5000, "armed message from host");
+			expect(mock.armedMessages[0].armed).toBe(true);
+			// Ordering: the host can only have sent `armed` in reaction to `hello`, so per the
+			// mock's own recorded sequence the armed frame must not be timestamped before the
+			// mock sent hello.
+			expect(mock.helloSentAt).not.toBeNull();
+			expect(mock.armedMessages[0].at).toBeGreaterThanOrEqual(mock.helloSentAt);
+
 			const blocks = makeBlocks(150); // 450 blocks (user+text+result per iter)
 			const reqId = mock.sync(blocks, { full: true });
 			const plan = await mock.waitForPlan(reqId, 8000);
@@ -148,6 +161,8 @@ describe("headless conductor host", () => {
 			expect(tel.some((e) => e.t === "plan")).toBe(true);
 			const conductWithFolds = tel.find((e) => e.t === "conduct" && e.commands > 0);
 			expect(conductWithFolds).toBeTruthy();
+			// The mock acked promptly, so the watchdog never fired.
+			expect(tel.some((e) => e.t === "armed_unacked")).toBe(false);
 
 			// The host exits 0 when the session (WS) closes.
 			await mock.close();
@@ -245,5 +260,47 @@ describe("headless conductor host", () => {
 		expect(String(errorLines[0].message)).toMatch(/unknown conductor/);
 		expect(tel.some((e) => e.t === "attach")).toBe(false);
 		expect(tel.some((e) => e.t === "sync")).toBe(false);
+	}, 30_000);
+
+	it("degrades loudly (does not crash) when the extension never acks armed", async () => {
+		const home = mkdtempSync(path.join(tmpdir(), "bellows-host-noack-"));
+		const telemetryOut = path.join(home, "telemetry.jsonl");
+		// swallowArmed: true simulates an old extension that predates armed-over-wire —
+		// it never replies with armedAck.
+		const mock = await new MockExtension({ accordionHome: home, swallowArmed: true }).start();
+
+		// Shrink the watchdog well below its 5s production default so the test stays fast.
+		const spawned = spawnHost({
+			accordionHome: home,
+			conductor: "builtin",
+			budget: 30_000,
+			protect: 5_000,
+			telemetryOut,
+			armedAckTimeoutMs: 300,
+		});
+
+		try {
+			await waitFor(() => mock.client !== null, 60_000, "host WS connect");
+			await waitFor(() => mock.armedMessages.length > 0, 5000, "armed message from host");
+
+			// The watchdog fires: a loud telemetry line, but the host stays alive and attached
+			// (this is a degrade-loudly path, never a fatal one).
+			await waitFor(
+				() => readTelemetry(telemetryOut).some((e) => e.t === "armed_unacked"),
+				5000,
+				"armed_unacked telemetry",
+			);
+			const tel = readTelemetry(telemetryOut);
+			const unacked = tel.find((e) => e.t === "armed_unacked");
+			expect(unacked).toBeTruthy();
+			expect(String(unacked.message)).toMatch(/did not acknowledge armed/);
+			expect(tel.some((e) => e.t === "attach")).toBe(true);
+
+			await mock.close();
+			const code = await spawned.exit;
+			expect(code).toBe(0);
+		} finally {
+			await mock.close().catch(() => {});
+		}
 	}, 30_000);
 });
