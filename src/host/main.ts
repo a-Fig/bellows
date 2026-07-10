@@ -10,10 +10,11 @@
  * It is the GUI live-client, headless. It:
  *   1. polls $ACCORDION_HOME/.accordion/sessions/ for the single session descriptor the
  *      runner's pi session advertises, then dials its ws:// URL (retrying until timeout);
- *   2. speaks pi-wire protocol v5 exactly like `liveClient.svelte.ts` — pins the protocol
- *      version on `hello`, folds `sync` blocks into a REAL `AccordionStore`, answers the
- *      agent's `unfold` / `recall` tools, and services `host.complete()` over the
- *      `completeRequest`/`completeResult` relay;
+ *   2. speaks pi-wire protocol like `liveClient.svelte.ts` — accepts any protocol version in
+ *      COMPATIBLE_PROTOCOL_VERSIONS on `hello` (currently v5-v7, additive across that range),
+ *      folds `sync` blocks into a REAL `AccordionStore`, answers the agent's `unfold` /
+ *      `recall` tools, and services `host.complete()` over the `completeRequest`/
+ *      `completeResult` relay;
  *   3. attaches the requested conductor from `IN_PROCESS_CONDUCTORS`;
  *   4. THE CRUX — honors the extension's ~250 ms plan-reply window: it answers each `sync`
  *      IMMEDIATELY with the plan computed from the store's LAST completed conduct pass, then
@@ -21,7 +22,9 @@
  *      used for the NEXT sync's reply. This mirrors the async cadence of
  *      `conductorClient.svelte.ts` (reply now with last plan, recompute in the background)
  *      and is faithful for both synchronous in-process conductors and slow / LLM ones.
- *   5. writes HostEvent JSONL telemetry throughout;
+ *   5. writes HostEvent JSONL telemetry throughout, including the extension's `passthrough`
+ *      acks (Accordion issue #60/#22, ADR 0020) and best-effort `/__accordion/meta`
+ *      `planOutcomes` snapshots taken at attach and at detach/shutdown;
  *   6. exits 0 when the WS closes (session ended), nonzero on a fatal error, and flushes
  *      telemetry on SIGTERM.
  *
@@ -30,9 +33,13 @@
  *     a loud (non-fatal) "extension predates armed-over-wire" warning. Default 5000. Must be
  *     a finite number >= 0; 0 explicitly disables the watchdog. Anything else (unset,
  *     unparseable, negative) falls back to the default.
+ *   BELLOWS_META_REFRESH_MS — interval between periodic `/__accordion/meta` "end"-candidate
+ *     snapshots. Default 45000. Must be a finite number > 0; anything else falls back to
+ *     the default. Test knob only — production uses the default.
  */
 import WebSocket from "ws";
 import { readFileSync, readdirSync, existsSync } from "node:fs";
+import { get as httpGet } from "node:http";
 import path from "node:path";
 import { Telemetry } from "./telemetry";
 import {
@@ -48,10 +55,21 @@ import {
 } from "./accordion";
 import { RemoteConductorClient } from "./remoteConductor";
 
-// The pi-wire protocol version the host pins. Matches Accordion's protocol.ts (v5). Kept
-// as a literal so a checkout on a DIFFERENT protocol version hard-fails loudly on hello,
-// rather than silently driving a wire shape one side doesn't understand.
-const PROTOCOL_VERSION = 5;
+// The pi-wire protocol versions this host understands. Accordion's protocol.ts has moved
+// v5 -> v7 additively (SyncMessage.planned?, PlanMessage.recalls?, plus the additive
+// armed/armedAck and passthrough message types — all shipped WITHOUT a PROTOCOL_VERSION
+// bump, per that file's version-history comment: an old peer just drops an unknown message
+// type). The host never SENDS `recalls`, ignores `planned`, and already ignores unknown
+// incoming message types, so it can safely speak to any extension in this range. v8+ (a
+// future breaking change) and v4- (pre-armed-over-wire) still hard-fail loudly on hello
+// rather than silently driving a wire shape this host doesn't understand.
+const COMPATIBLE_PROTOCOL_VERSIONS = new Set([5, 6, 7]);
+
+// The 5 `PassthroughCause` values the extension acks over the wire (Accordion ADR 0020) —
+// `no-gui`/`unsent` have no reachable client and are never sent as a `passthrough` message.
+// A cause outside this set is malformed/unknown and must be ignored, exactly like
+// liveClient.svelte.ts's `msg.cause in live.planOutcomes` guard on the GUI side.
+const ACKABLE_PASSTHROUGH_CAUSES = new Set(["applied", "empty-plan", "timeout-stale", "timeout-raw", "epoch-mismatch"]);
 
 const REGISTRY_DIR = ".accordion";
 const SESSIONS_SUBDIR = "sessions";
@@ -70,6 +88,17 @@ const COMPLETION_TIMEOUT_MS = 120_000;
 // coerce an intentional "0" into 5000, and a negative value would fire immediately.
 const armedAckTimeoutEnv = Number(process.env.BELLOWS_ARMED_ACK_TIMEOUT_MS);
 const ARMED_ACK_TIMEOUT_MS = Number.isFinite(armedAckTimeoutEnv) && armedAckTimeoutEnv >= 0 ? armedAckTimeoutEnv : 5_000;
+
+// How often the host re-fetches `/__accordion/meta` mid-run as an "end"-candidate snapshot
+// (Accordion issue #22). On the real fleet the runner tears pi down BEFORE the host, so the
+// detach-time snapshot usually hits a dead process — without a periodic refresh, production
+// planOutcomes would always degrade to the WS ack tally, which cannot see `no-gui`/`unsent`
+// (the exact blind spot this feature exists to close). The collector uses the LATEST good
+// snapshot as the end of the diff, so a mid-run refresh is a strictly-better fallback and a
+// successful shutdown snapshot (newer) still wins. Env-tunable so the host test can shrink
+// it; must be a finite number > 0, anything else falls back to the 45 s default.
+const metaRefreshEnv = Number(process.env.BELLOWS_META_REFRESH_MS);
+const META_REFRESH_INTERVAL_MS = Number.isFinite(metaRefreshEnv) && metaRefreshEnv > 0 ? metaRefreshEnv : 45_000;
 
 // ── CLI parsing ───────────────────────────────────────────────────────────────
 interface Args {
@@ -178,6 +207,77 @@ function findSession(accordionHome: string): SessionEntry | null {
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+// Best-effort GET of the extension's `/__accordion/meta` endpoint (Accordion issue #22,
+// ADR 0020's `planOutcomes`). Strictly best-effort: bounded, never rejects, never retries —
+// a failure/timeout/oversized/malformed body all resolve `null` so a caller can fall back
+// to the WS `passthrough` ack tally without special-casing errors.
+//
+// TWO independent bounds, because the `timeout` request option alone is only a socket-IDLE
+// timeout — a drip-feeding peer that writes a byte every few hundred ms never idles, so
+// without a wall-clock deadline the request could run forever (and at shutdown hang the
+// host until the runner's SIGKILL) while `body` grows unboundedly:
+//   • META_FETCH_TIMEOUT_MS — both the idle timeout AND an overall unref'd deadline that
+//     destroys the request outright;
+//   • META_BODY_MAX_BYTES — response-size cap; the real payload is a few hundred bytes,
+//     so anything past 64KB is garbage → abort + null.
+const META_FETCH_TIMEOUT_MS = 2_000;
+const META_BODY_MAX_BYTES = 64 * 1024;
+function fetchMetaPlanOutcomes(port: number): Promise<Record<string, number> | null> {
+	return new Promise((resolve) => {
+		let settled = false;
+		let deadline: ReturnType<typeof setTimeout> | null = null;
+		const done = (v: Record<string, number> | null) => {
+			if (!settled) {
+				settled = true;
+				if (deadline) clearTimeout(deadline);
+				resolve(v);
+			}
+		};
+		let req: ReturnType<typeof httpGet> | undefined;
+		const abort = () => {
+			try {
+				req?.destroy();
+			} catch {
+				/* ignore */
+			}
+			done(null);
+		};
+		try {
+			req = httpGet(
+				{ host: "127.0.0.1", port, path: "/__accordion/meta", timeout: META_FETCH_TIMEOUT_MS },
+				(res) => {
+					let body = "";
+					res.on("data", (d) => {
+						body += d;
+						if (body.length > META_BODY_MAX_BYTES) abort();
+					});
+					res.on("end", () => {
+						try {
+							const json = JSON.parse(body);
+							if (json && typeof json === "object" && json.planOutcomes && typeof json.planOutcomes === "object") {
+								done(json.planOutcomes as Record<string, number>);
+							} else {
+								done(null);
+							}
+						} catch {
+							done(null);
+						}
+					});
+					res.on("error", () => done(null));
+				},
+			);
+		} catch {
+			done(null);
+			return;
+		}
+		// Wall-clock deadline (unref'd — must never keep the host process alive on its own).
+		deadline = setTimeout(abort, META_FETCH_TIMEOUT_MS);
+		deadline.unref?.();
+		req.on("timeout", abort);
+		req.on("error", () => done(null));
+	});
+}
+
 // ── the host ────────────────────────────────────────────────────────────────────
 async function main(): Promise<number> {
 	const args = parseArgs(scriptArgs());
@@ -233,6 +333,38 @@ async function main(): Promise<number> {
 	// conduct can send host/commandResult with the store's clamp reports after applying
 	// the remote's last batch. Null for an in-process conductor (no wire round-trip).
 	let remoteConductor: RemoteConductorClient | null = null;
+
+	// ── /__accordion/meta planOutcomes snapshots (Accordion issue #22, ADR 0020) ────────
+	// Best-effort snapshots bracket the run so the collector can diff them (the endpoint's
+	// counters are lifetime totals, not per-run): one "start" right after hello, periodic
+	// "end"-candidates mid-run (see META_REFRESH_INTERVAL_MS — the fleet's runner tears pi
+	// down before the host, so the detach-time fetch usually hits a dead process), and a
+	// final "end" attempt at detach/shutdown. The collector keeps the LATEST non-null "end"
+	// snapshot, so the shutdown one wins when it succeeds. The end path is guarded so it
+	// fires AT MOST ONCE per host lifetime even if both the SIGTERM path and the normal
+	// post-loop teardown race to call snapshotMetaEnd().
+	let metaStartSent = false;
+	let metaEndSnapshotted = false;
+	let metaRefreshTimer: ReturnType<typeof setInterval> | null = null;
+	function stopMetaRefresh(): void {
+		if (metaRefreshTimer) {
+			clearInterval(metaRefreshTimer);
+			metaRefreshTimer = null;
+		}
+	}
+	async function snapshotMetaEnd(): Promise<void> {
+		// Stop the periodic refresh unconditionally — even when the end snapshot itself is
+		// skipped (never attached), a live interval must not outlast the run.
+		stopMetaRefresh();
+		if (metaEndSnapshotted || !attached || !session) return;
+		metaEndSnapshotted = true;
+		try {
+			const planOutcomes = await fetchMetaPlanOutcomes(session.port);
+			tel.emit({ t: "meta_snapshot", at: Date.now(), when: "end", planOutcomes });
+		} catch {
+			/* best-effort — never throw out of shutdown */
+		}
+	}
 
 	/** Build a fresh conductor instance for a (re)attach — in-process id or external URL. */
 	function buildConductor(meta?: { title?: string; model?: string; cwd?: string }): Conductor {
@@ -451,8 +583,9 @@ async function main(): Promise<number> {
 				if (!msg || typeof msg.type !== "string") return;
 
 				if (msg.type === "hello") {
-					if (msg.protocolVersion !== PROTOCOL_VERSION) {
-						fatal = new Error(`protocol mismatch — extension v${msg.protocolVersion}, host v${PROTOCOL_VERSION}`);
+					if (!COMPATIBLE_PROTOCOL_VERSIONS.has(msg.protocolVersion)) {
+						const supported = [...COMPATIBLE_PROTOCOL_VERSIONS].sort((a, b) => a - b).join(", ");
+						fatal = new Error(`protocol mismatch — extension v${msg.protocolVersion}, host supports v${supported}`);
 						tel.emit({ t: "error", at: Date.now(), message: fatal.message });
 						try {
 							ws.close();
@@ -515,6 +648,35 @@ async function main(): Promise<number> {
 						budget: args.budget,
 						protectTokens: args.protect,
 					});
+					// Fire the "start" meta snapshot once, fire-and-forget — never delays hello
+					// handling or the first sync reply (see fetchMetaPlanOutcomes: bounded, never
+					// rejects). helloSeen only flips once per host lifetime, so this fires at most
+					// once regardless of reconnect churn.
+					if (!metaStartSent) {
+						metaStartSent = true;
+						const port = session!.port;
+						void fetchMetaPlanOutcomes(port).then((planOutcomes) => {
+							tel.emit({ t: "meta_snapshot", at: Date.now(), when: "start", planOutcomes });
+							// Periodic "end"-candidate refresh — only worth starting when the
+							// extension actually serves planOutcomes (an older extension never
+							// will, and its shutdown fetch is bounded anyway). Unref'd: must
+							// never keep the host alive. Each tick is one bounded best-effort
+							// fetch — no retries; a failed tick simply emits nothing and the
+							// previous good snapshot stands. Guarded on metaEndSnapshotted so
+							// a tick's late-resolving fetch can never emit AFTER the shutdown
+							// snapshot and shadow it (the collector keeps the latest non-null).
+							if (planOutcomes && !metaRefreshTimer && !metaEndSnapshotted) {
+								metaRefreshTimer = setInterval(() => {
+									void fetchMetaPlanOutcomes(port).then((p) => {
+										if (p && !metaEndSnapshotted) {
+											tel.emit({ t: "meta_snapshot", at: Date.now(), when: "end", planOutcomes: p });
+										}
+									});
+								}, META_REFRESH_INTERVAL_MS);
+								metaRefreshTimer.unref?.();
+							}
+						});
+					}
 					return;
 				}
 
@@ -525,6 +687,37 @@ async function main(): Promise<number> {
 					// treating it as success.
 					if (msg.armed === true) {
 						clearArmedAckTimer();
+					}
+					return;
+				}
+
+				if (msg.type === "passthrough") {
+					// The extension's per-`context`-hook-resolution ack (Accordion issue #60/#22,
+					// ADR 0020). Needs no store — record it even before/without an attach. A
+					// malformed/unknown `cause` must not create an event, mirroring liveClient's
+					// `msg.cause in live.planOutcomes` guard: an unrecognized cause here is either
+					// a future extension-side addition this host predates, or a corrupt frame, and
+					// either way must not be silently miscounted as one of the known 5.
+					//
+					// Unlike Accordion's liveClient.svelte.ts, this host does NOT reconcile any
+					// birth-fold bookkeeping off this ack: the host's AccordionStore structural
+					// interface (src/host/accordion.ts) has no `markSent`, and this host has no
+					// optimistic "my reply rode the wire" assumption to walk back — `lastPlan` here
+					// is only a reply cache, not a birth-fold cursor. If this host ever grows
+					// `markSent`/birth-fold semantics, it must adopt liveClient's timeout-ack
+					// reconciliation (reconcile on `timeout-stale`/`timeout-raw` matching the last
+					// planned reqId; never on `epoch-mismatch`) — see liveClient.svelte.ts on
+					// Accordion devmain.
+					if (typeof msg.cause === "string" && ACKABLE_PASSTHROUGH_CAUSES.has(msg.cause)) {
+						tel.emit({
+							t: "passthrough",
+							at: Date.now(),
+							reqId: typeof msg.reqId === "number" ? msg.reqId : -1,
+							cause: msg.cause,
+							ops: Number.isFinite(msg.ops) ? msg.ops : 0,
+							groups: Number.isFinite(msg.groups) ? msg.groups : 0,
+							recalls: Number.isFinite(msg.recalls) ? msg.recalls : 0,
+						});
 					}
 					return;
 				}
@@ -693,8 +886,15 @@ async function main(): Promise<number> {
 		} catch {
 			/* ignore */
 		}
-		// Flush and exit; the WS close resolve races with this, so force-exit after flush.
-		void tel.close().then(() => process.exit(0));
+		// Best-effort "end" meta snapshot before flushing telemetry (bounded ~2s by
+		// fetchMetaPlanOutcomes — never blocks indefinitely). Flush and exit; the WS close
+		// resolve races with this, so force-exit after flush.
+		void snapshotMetaEnd()
+			.catch(() => {
+				/* best-effort */
+			})
+			.then(() => tel.close())
+			.then(() => process.exit(0));
 	};
 	process.on("SIGTERM", () => onSignal("SIGTERM"));
 	process.on("SIGINT", () => onSignal("SIGINT"));
@@ -713,6 +913,10 @@ async function main(): Promise<number> {
 	} else if (closedCleanly) {
 		tel.emit({ t: "detach", at: Date.now(), reason: "session-closed" });
 	}
+
+	// Best-effort "end" meta snapshot (guarded against double-firing alongside onSignal's
+	// own call — see metaEndSnapshotted). No-op if we never attached.
+	await snapshotMetaEnd();
 
 	drainCompletions("shutdown");
 	try {
