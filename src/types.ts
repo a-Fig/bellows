@@ -210,6 +210,20 @@ export type HostEvent =
   // silently-degraded run surfaces loudly in the report, exactly like any other
   // integrity failure (see src/host/main.ts).
   | { t: "armed_unacked"; at: number; message: string }
+  // The extension's per-`context`-hook-resolution ack (Accordion issue #60/#22, ADR 0020).
+  // `cause` is one of the 5 ackable `PassthroughCause` values (`applied | empty-plan |
+  // timeout-stale | timeout-raw | epoch-mismatch`) — `no-gui`/`unsent` have no reachable
+  // client and are never sent over the wire. `ops`/`groups`/`recalls` are the counts
+  // ACTUALLY applied to the wire for that call (0 for raw/empty causes). See
+  // src/host/main.ts's passthrough branch.
+  | { t: "passthrough"; at: number; reqId: number; cause: string; ops: number; groups: number; recalls: number }
+  // A snapshot of the extension's lifetime `/__accordion/meta` `planOutcomes` counters,
+  // taken once shortly after a successful hello (`when: "start"`) and once at detach/
+  // shutdown (`when: "end"`). `planOutcomes` is the raw response field (all 7 causes plus
+  // `total`) or null when the endpoint was unreachable or predates Accordion PR #64/#22
+  // (older extension with no `planOutcomes` field). Best-effort only — never blocks or
+  // retries (see src/host/main.ts `fetchMeta`).
+  | { t: "meta_snapshot"; at: number; when: "start" | "end"; planOutcomes: Record<string, number> | null }
   | { t: "detach"; at: number; reason: string };
 
 export interface ConductorTelemetry {
@@ -229,6 +243,34 @@ export interface ConductorTelemetry {
   errors: string[];
   /** Non-error informational notes (greet/status/disconnect, "died — cleared to raw", ...). */
   infos: string[];
+  /**
+   * Per-cause tally of every `context` hook resolution the attached Accordion extension
+   * acked during this run (Accordion issue #60/#22, ADR 0020). Preferentially the diff of
+   * two `/__accordion/meta` snapshots (start-of-run vs end-of-run — the endpoint's counters
+   * are lifetime totals, not per-run, so a raw end snapshot would double-count anything the
+   * extension process saw before this run attached); falls back to the WS `passthrough` ack
+   * tally when a meta snapshot is unavailable/unusable. `null` means the attached extension
+   * never acked ANYTHING (predates Accordion PR #64/#22) — downstream MUST render this as
+   * "n/a", never as 0% or 100% of calls applied.
+   */
+  planOutcomes: PlanOutcomes | null;
+}
+
+/**
+ * Per-`PlanOutcomeCause` counts (Accordion ADR 0020). All per-cause keys are optional —
+ * only causes actually observed are present — except `total` (= context-hook invocations
+ * this run, across ALL 7 causes), which is always required whenever a `PlanOutcomes` value
+ * exists at all.
+ */
+export interface PlanOutcomes {
+  applied?: number;
+  "empty-plan"?: number;
+  "timeout-stale"?: number;
+  "timeout-raw"?: number;
+  "no-gui"?: number;
+  "epoch-mismatch"?: number;
+  unsent?: number;
+  total: number;
 }
 
 // ---------------------------------------------------------------------------
