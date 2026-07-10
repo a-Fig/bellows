@@ -390,6 +390,105 @@ describe("foldHostTelemetry — planOutcomes (Accordion issue #60/#22, ADR 0020)
     const tel = foldHostTelemetry(fixture, "keel");
     expect(tel.planOutcomes).toEqual({ applied: 1, total: 1 });
   });
+
+  it("whitelists diff keys: an unknown key from the untrusted meta endpoint neither leaks nor trips the negative-diff fallback", () => {
+    const fixture = [
+      { t: "attach", at: 100, sessionId: "s", conductor: "keel", budget: 70000, protectTokens: 20000 },
+      {
+        t: "meta_snapshot",
+        at: 105,
+        when: "start",
+        // `bogus` decreases end-vs-start (99 -> 0) — without the whitelist that would
+        // falsely read as an extension restart and discard a perfectly good diff.
+        planOutcomes: { applied: 1, total: 1, bogus: 99 },
+      },
+      {
+        t: "meta_snapshot",
+        at: 500,
+        when: "end",
+        planOutcomes: { applied: 3, total: 3, bogus: 0, alsoBogus: 7 },
+      },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join("\n");
+    const tel = foldHostTelemetry(fixture, "keel");
+    expect(tel.planOutcomes).toEqual({ applied: 2, total: 2 });
+    expect(tel.planOutcomes).not.toHaveProperty("bogus");
+    expect(tel.planOutcomes).not.toHaveProperty("alsoBogus");
+    expect(tel.infos).toEqual([]);
+  });
+
+  it("notes 'lacks a usable total' (not a restart claim) when both snapshots exist but carry no total", () => {
+    const fixture = [
+      { t: "attach", at: 100, sessionId: "s", conductor: "keel", budget: 70000, protectTokens: 20000 },
+      { t: "meta_snapshot", at: 105, when: "start", planOutcomes: { applied: 1 } },
+      { t: "passthrough", at: 200, reqId: 1, cause: "applied", ops: 1, groups: 0, recalls: 0 },
+      { t: "meta_snapshot", at: 500, when: "end", planOutcomes: { applied: 2 } },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join("\n");
+    const tel = foldHostTelemetry(fixture, "keel");
+    expect(tel.planOutcomes).toEqual({ applied: 1, total: 1 }); // the WS tally
+    expect(tel.infos.length).toBe(1);
+    expect(tel.infos[0]).toMatch(/usable total/);
+    expect(tel.infos[0]).not.toMatch(/restart/);
+  });
+
+  it("returns null with NO info note when the meta diff is unusable and there is no WS tally to fall back to", () => {
+    const fixture = [
+      { t: "attach", at: 100, sessionId: "s", conductor: "keel", budget: 70000, protectTokens: 20000 },
+      { t: "meta_snapshot", at: 105, when: "start", planOutcomes: { applied: 5, total: 5 } },
+      // Negative diff (restart) — but zero passthrough acks ever arrived, so there is no
+      // fallback to note; a restart claim with no reportable outcome would be noise.
+      { t: "meta_snapshot", at: 500, when: "end", planOutcomes: { applied: 1, total: 1 } },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join("\n");
+    const tel = foldHostTelemetry(fixture, "keel");
+    expect(tel.planOutcomes).toBeNull();
+    expect(tel.infos).toEqual([]);
+  });
+
+  it("filters the WS tally to the 5 ackable causes — a crafted cause like 'total' or 'no-gui' cannot poison it", () => {
+    const fixture = [
+      { t: "attach", at: 100, sessionId: "s", conductor: "keel", budget: 70000, protectTokens: 20000 },
+      { t: "passthrough", at: 200, reqId: 1, cause: "total", ops: 0, groups: 0, recalls: 0 },
+      { t: "passthrough", at: 210, reqId: 2, cause: "no-gui", ops: 0, groups: 0, recalls: 0 },
+      { t: "passthrough", at: 220, reqId: 3, cause: "applied", ops: 1, groups: 0, recalls: 0 },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join("\n");
+    const tel = foldHostTelemetry(fixture, "keel");
+    expect(tel.planOutcomes).toEqual({ applied: 1, total: 1 });
+  });
+
+  it("WS tally stays null (not {total:0}) when the only passthrough lines carry invalid causes", () => {
+    const fixture = [
+      { t: "attach", at: 100, sessionId: "s", conductor: "keel", budget: 70000, protectTokens: 20000 },
+      { t: "passthrough", at: 200, reqId: 1, cause: "total", ops: 0, groups: 0, recalls: 0 },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join("\n");
+    const tel = foldHostTelemetry(fixture, "keel");
+    expect(tel.planOutcomes).toBeNull();
+  });
+
+  it("uses the LATEST good end snapshot (mid-run refresh) and a null shutdown attempt never clobbers it", () => {
+    const fixture = [
+      { t: "attach", at: 100, sessionId: "s", conductor: "keel", budget: 70000, protectTokens: 20000 },
+      { t: "meta_snapshot", at: 105, when: "start", planOutcomes: { applied: 1, "no-gui": 0, total: 1 } },
+      // Two periodic mid-run end-candidates; the later one supersedes the earlier.
+      { t: "meta_snapshot", at: 300, when: "end", planOutcomes: { applied: 2, "no-gui": 1, total: 3 } },
+      { t: "meta_snapshot", at: 400, when: "end", planOutcomes: { applied: 3, "no-gui": 2, total: 5 } },
+      // Shutdown fetch hit a dead extension (fleet teardown order) — planOutcomes null.
+      // Must NOT clobber the last good candidate.
+      { t: "meta_snapshot", at: 500, when: "end", planOutcomes: null },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join("\n");
+    const tel = foldHostTelemetry(fixture, "keel");
+    expect(tel.planOutcomes).toEqual({ applied: 2, "no-gui": 2, total: 4 });
+  });
 });
 
 // Issue #14: a host that dies during attach (e.g. "unknown conductor") writes only an

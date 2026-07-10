@@ -42,10 +42,12 @@ function spawnHost(opts: {
 	telemetryOut: string;
 	slowConductMs?: number;
 	armedAckTimeoutMs?: number;
+	metaRefreshMs?: number;
 }): Spawned {
 	const env = { ...process.env };
 	if (opts.slowConductMs) env.BELLOWS_TEST_SLOW_CONDUCT_MS = String(opts.slowConductMs);
 	if (opts.armedAckTimeoutMs) env.BELLOWS_ARMED_ACK_TIMEOUT_MS = String(opts.armedAckTimeoutMs);
+	if (opts.metaRefreshMs) env.BELLOWS_META_REFRESH_MS = String(opts.metaRefreshMs);
 	const child = spawn(
 		process.execPath,
 		[
@@ -418,6 +420,97 @@ describe("headless conductor host", () => {
 
 			await mock.close();
 			await spawned.exit;
+		} finally {
+			await mock.close().catch(() => {});
+		}
+	}, 30_000);
+
+	it("issue #22 review: meta fetch is deadline-bounded against a drip-feeding endpoint (null snapshot, no hang)", async () => {
+		const home = mkdtempSync(path.join(tmpdir(), "bellows-host-dripmeta-"));
+		const telemetryOut = path.join(home, "telemetry.jsonl");
+		// hangMeta: the mock's /__accordion/meta drips a byte every 100ms forever — the
+		// socket never idles, so only fetchMetaPlanOutcomes' WALL-CLOCK deadline can end
+		// the fetch. Without it, the start snapshot would never arrive and shutdown would
+		// hang until the runner's SIGKILL.
+		const mock = await new MockExtension({ accordionHome: home, hangMeta: true }).start();
+
+		const spawned = spawnHost({ accordionHome: home, conductor: "builtin", budget: 30_000, protect: 5_000, telemetryOut });
+
+		try {
+			await waitFor(() => mock.client !== null, 60_000, "host WS connect");
+			await waitFor(() => readTelemetry(telemetryOut).some((e) => e.t === "attach"), 5000, "attach telemetry");
+
+			// The deadline (~2s) must abort the drip and emit a NULL start snapshot rather
+			// than hanging forever accumulating body bytes.
+			await waitFor(
+				() => readTelemetry(telemetryOut).some((e) => e.t === "meta_snapshot" && e.when === "start"),
+				10_000,
+				"deadline-aborted start meta_snapshot",
+			);
+			const startSnap = readTelemetry(telemetryOut).find((e) => e.t === "meta_snapshot" && e.when === "start");
+			expect(startSnap.planOutcomes).toBeNull();
+
+			// Shutdown must also complete promptly — the end fetch is bounded by the same
+			// deadline. A hang here would blow the 30s test timeout.
+			await mock.endSession();
+			const code = await spawned.exit;
+			expect(code).toBe(0);
+			const endSnap = readTelemetry(telemetryOut).find((e) => e.t === "meta_snapshot" && e.when === "end");
+			expect(endSnap.planOutcomes).toBeNull();
+		} finally {
+			await mock.close().catch(() => {});
+		}
+	}, 30_000);
+
+	it("issue #22 review: periodic meta refresh emits mid-run end-candidates so a dead-at-shutdown extension still yields a diff", async () => {
+		const home = mkdtempSync(path.join(tmpdir(), "bellows-host-metarefresh-"));
+		const telemetryOut = path.join(home, "telemetry.jsonl");
+		const mock = await new MockExtension({ accordionHome: home }).start();
+		mock.setMetaPlanOutcomes({ applied: 1 });
+
+		// Shrink the 45s production interval so the test can observe several ticks.
+		const spawned = spawnHost({
+			accordionHome: home,
+			conductor: "builtin",
+			budget: 30_000,
+			protect: 5_000,
+			telemetryOut,
+			metaRefreshMs: 250,
+		});
+
+		try {
+			await waitFor(() => mock.client !== null, 60_000, "host WS connect");
+			await waitFor(
+				() => readTelemetry(telemetryOut).some((e) => e.t === "meta_snapshot" && e.when === "start"),
+				5000,
+				"start meta_snapshot",
+			);
+
+			// Advance the extension's counters mid-run; a PERIODIC refresh (the WS is still
+			// open — this is not the shutdown fetch) must pick the new values up as an
+			// "end"-candidate snapshot.
+			mock.bumpMetaCause("no-gui", 2);
+			await waitFor(
+				() =>
+					readTelemetry(telemetryOut).some(
+						(e) => e.t === "meta_snapshot" && e.when === "end" && e.planOutcomes && e.planOutcomes["no-gui"] === 2,
+					),
+				5000,
+				"periodic end-candidate meta_snapshot with updated counters",
+			);
+			expect(mock.client).not.toBeNull(); // still mid-run: the WS never closed
+
+			// Session ends; the shutdown snapshot (newest) also lands and remains the last
+			// end event in the file — the collector keeps the LATEST non-null end snapshot.
+			mock.bumpMetaCause("applied", 1);
+			await mock.endSession();
+			const code = await spawned.exit;
+			expect(code).toBe(0);
+
+			const ends = readTelemetry(telemetryOut).filter((e) => e.t === "meta_snapshot" && e.when === "end" && e.planOutcomes);
+			expect(ends.length).toBeGreaterThanOrEqual(2); // at least one periodic + the shutdown one
+			const last = ends[ends.length - 1];
+			expect(last.planOutcomes).toMatchObject({ applied: 2, "no-gui": 2, total: 4 });
 		} finally {
 			await mock.close().catch(() => {});
 		}

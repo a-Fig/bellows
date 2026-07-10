@@ -33,6 +33,9 @@
  *     a loud (non-fatal) "extension predates armed-over-wire" warning. Default 5000. Must be
  *     a finite number >= 0; 0 explicitly disables the watchdog. Anything else (unset,
  *     unparseable, negative) falls back to the default.
+ *   BELLOWS_META_REFRESH_MS — interval between periodic `/__accordion/meta` "end"-candidate
+ *     snapshots. Default 45000. Must be a finite number > 0; anything else falls back to
+ *     the default. Test knob only — production uses the default.
  */
 import WebSocket from "ws";
 import { readFileSync, readdirSync, existsSync } from "node:fs";
@@ -85,6 +88,17 @@ const COMPLETION_TIMEOUT_MS = 120_000;
 // coerce an intentional "0" into 5000, and a negative value would fire immediately.
 const armedAckTimeoutEnv = Number(process.env.BELLOWS_ARMED_ACK_TIMEOUT_MS);
 const ARMED_ACK_TIMEOUT_MS = Number.isFinite(armedAckTimeoutEnv) && armedAckTimeoutEnv >= 0 ? armedAckTimeoutEnv : 5_000;
+
+// How often the host re-fetches `/__accordion/meta` mid-run as an "end"-candidate snapshot
+// (Accordion issue #22). On the real fleet the runner tears pi down BEFORE the host, so the
+// detach-time snapshot usually hits a dead process — without a periodic refresh, production
+// planOutcomes would always degrade to the WS ack tally, which cannot see `no-gui`/`unsent`
+// (the exact blind spot this feature exists to close). The collector uses the LATEST good
+// snapshot as the end of the diff, so a mid-run refresh is a strictly-better fallback and a
+// successful shutdown snapshot (newer) still wins. Env-tunable so the host test can shrink
+// it; must be a finite number > 0, anything else falls back to the 45 s default.
+const metaRefreshEnv = Number(process.env.BELLOWS_META_REFRESH_MS);
+const META_REFRESH_INTERVAL_MS = Number.isFinite(metaRefreshEnv) && metaRefreshEnv > 0 ? metaRefreshEnv : 45_000;
 
 // ── CLI parsing ───────────────────────────────────────────────────────────────
 interface Args {
@@ -194,20 +208,40 @@ function findSession(accordionHome: string): SessionEntry | null {
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 // Best-effort GET of the extension's `/__accordion/meta` endpoint (Accordion issue #22,
-// ADR 0020's `planOutcomes`). Strictly best-effort: bounded timeout, never rejects, never
-// retries — a failure/timeout/malformed body all resolve `null` so a caller can fall back
+// ADR 0020's `planOutcomes`). Strictly best-effort: bounded, never rejects, never retries —
+// a failure/timeout/oversized/malformed body all resolve `null` so a caller can fall back
 // to the WS `passthrough` ack tally without special-casing errors.
+//
+// TWO independent bounds, because the `timeout` request option alone is only a socket-IDLE
+// timeout — a drip-feeding peer that writes a byte every few hundred ms never idles, so
+// without a wall-clock deadline the request could run forever (and at shutdown hang the
+// host until the runner's SIGKILL) while `body` grows unboundedly:
+//   • META_FETCH_TIMEOUT_MS — both the idle timeout AND an overall unref'd deadline that
+//     destroys the request outright;
+//   • META_BODY_MAX_BYTES — response-size cap; the real payload is a few hundred bytes,
+//     so anything past 64KB is garbage → abort + null.
 const META_FETCH_TIMEOUT_MS = 2_000;
+const META_BODY_MAX_BYTES = 64 * 1024;
 function fetchMetaPlanOutcomes(port: number): Promise<Record<string, number> | null> {
 	return new Promise((resolve) => {
 		let settled = false;
+		let deadline: ReturnType<typeof setTimeout> | null = null;
 		const done = (v: Record<string, number> | null) => {
 			if (!settled) {
 				settled = true;
+				if (deadline) clearTimeout(deadline);
 				resolve(v);
 			}
 		};
-		let req: ReturnType<typeof httpGet>;
+		let req: ReturnType<typeof httpGet> | undefined;
+		const abort = () => {
+			try {
+				req?.destroy();
+			} catch {
+				/* ignore */
+			}
+			done(null);
+		};
 		try {
 			req = httpGet(
 				{ host: "127.0.0.1", port, path: "/__accordion/meta", timeout: META_FETCH_TIMEOUT_MS },
@@ -215,6 +249,7 @@ function fetchMetaPlanOutcomes(port: number): Promise<Record<string, number> | n
 					let body = "";
 					res.on("data", (d) => {
 						body += d;
+						if (body.length > META_BODY_MAX_BYTES) abort();
 					});
 					res.on("end", () => {
 						try {
@@ -235,10 +270,10 @@ function fetchMetaPlanOutcomes(port: number): Promise<Record<string, number> | n
 			done(null);
 			return;
 		}
-		req.on("timeout", () => {
-			req.destroy();
-			done(null);
-		});
+		// Wall-clock deadline (unref'd — must never keep the host process alive on its own).
+		deadline = setTimeout(abort, META_FETCH_TIMEOUT_MS);
+		deadline.unref?.();
+		req.on("timeout", abort);
 		req.on("error", () => done(null));
 	});
 }
@@ -300,13 +335,27 @@ async function main(): Promise<number> {
 	let remoteConductor: RemoteConductorClient | null = null;
 
 	// ── /__accordion/meta planOutcomes snapshots (Accordion issue #22, ADR 0020) ────────
-	// Two best-effort snapshots bracket the run so the collector can diff them (the
-	// endpoint's counters are lifetime totals, not per-run). Guarded so each fires AT MOST
-	// ONCE per host lifetime even if both the SIGTERM path and the normal post-loop
-	// teardown race to call snapshotMetaEnd().
+	// Best-effort snapshots bracket the run so the collector can diff them (the endpoint's
+	// counters are lifetime totals, not per-run): one "start" right after hello, periodic
+	// "end"-candidates mid-run (see META_REFRESH_INTERVAL_MS — the fleet's runner tears pi
+	// down before the host, so the detach-time fetch usually hits a dead process), and a
+	// final "end" attempt at detach/shutdown. The collector keeps the LATEST non-null "end"
+	// snapshot, so the shutdown one wins when it succeeds. The end path is guarded so it
+	// fires AT MOST ONCE per host lifetime even if both the SIGTERM path and the normal
+	// post-loop teardown race to call snapshotMetaEnd().
 	let metaStartSent = false;
 	let metaEndSnapshotted = false;
+	let metaRefreshTimer: ReturnType<typeof setInterval> | null = null;
+	function stopMetaRefresh(): void {
+		if (metaRefreshTimer) {
+			clearInterval(metaRefreshTimer);
+			metaRefreshTimer = null;
+		}
+	}
 	async function snapshotMetaEnd(): Promise<void> {
+		// Stop the periodic refresh unconditionally — even when the end snapshot itself is
+		// skipped (never attached), a live interval must not outlast the run.
+		stopMetaRefresh();
 		if (metaEndSnapshotted || !attached || !session) return;
 		metaEndSnapshotted = true;
 		try {
@@ -608,6 +657,24 @@ async function main(): Promise<number> {
 						const port = session!.port;
 						void fetchMetaPlanOutcomes(port).then((planOutcomes) => {
 							tel.emit({ t: "meta_snapshot", at: Date.now(), when: "start", planOutcomes });
+							// Periodic "end"-candidate refresh — only worth starting when the
+							// extension actually serves planOutcomes (an older extension never
+							// will, and its shutdown fetch is bounded anyway). Unref'd: must
+							// never keep the host alive. Each tick is one bounded best-effort
+							// fetch — no retries; a failed tick simply emits nothing and the
+							// previous good snapshot stands. Guarded on metaEndSnapshotted so
+							// a tick's late-resolving fetch can never emit AFTER the shutdown
+							// snapshot and shadow it (the collector keeps the latest non-null).
+							if (planOutcomes && !metaRefreshTimer && !metaEndSnapshotted) {
+								metaRefreshTimer = setInterval(() => {
+									void fetchMetaPlanOutcomes(port).then((p) => {
+										if (p && !metaEndSnapshotted) {
+											tel.emit({ t: "meta_snapshot", at: Date.now(), when: "end", planOutcomes: p });
+										}
+									});
+								}, META_REFRESH_INTERVAL_MS);
+								metaRefreshTimer.unref?.();
+							}
 						});
 					}
 					return;

@@ -88,6 +88,7 @@ export class MockExtension {
 		junk = "[stub completion]",
 		swallowArmed = false,
 		protocolVersion = DEFAULT_PROTOCOL_VERSION,
+		hangMeta = false,
 	}) {
 		this.accordionHome = accordionHome;
 		this.sessionId = sessionId;
@@ -96,6 +97,11 @@ export class MockExtension {
 		// When true, an incoming `{type:"armed"}` is recorded but never acked — simulates an
 		// old extension that predates armed-over-wire, for exercising the host's watchdog.
 		this.swallowArmed = swallowArmed;
+		// When true, `GET /__accordion/meta` never completes: it sends 200 headers then
+		// drip-feeds a byte every 100 ms forever — the socket never idles, so ONLY the
+		// host's wall-clock deadline (not its idle timeout) can stop the fetch. Exercises
+		// the drip-feed hang the adversarial review flagged in fetchMetaPlanOutcomes.
+		this.hangMeta = hangMeta;
 		// The protocolVersion this mock declares on `hello` (and in its session descriptor) —
 		// configurable so the host's dual-version-handshake tests can dial v5/v6/v7/v8 without
 		// three separate mock classes.
@@ -233,6 +239,21 @@ export class MockExtension {
 			/* malformed URL: fall through to 404 below */
 		}
 		if (pathname === "/__accordion/meta") {
+			if (this.hangMeta) {
+				// Drip-feed forever: the connection never idles and never ends. The host's
+				// wall-clock deadline must destroy the request; that destroy fires "close"
+				// here, which stops the drip so the mock can still shut down cleanly.
+				res.writeHead(200, { "content-type": "application/json" });
+				const drip = setInterval(() => {
+					try {
+						res.write(" ");
+					} catch {
+						clearInterval(drip);
+					}
+				}, 100);
+				res.on("close", () => clearInterval(drip));
+				return;
+			}
 			res.writeHead(200, { "content-type": "application/json" });
 			res.end(
 				JSON.stringify({
@@ -302,6 +323,9 @@ export class MockExtension {
 
 	async close() {
 		await this.endSession();
+		// A hangMeta drip (or any straggling keep-alive request) holds its connection open,
+		// and http.Server.close() waits for open connections — sever them so close resolves.
+		this.httpServer.closeAllConnections?.();
 		await new Promise((resolve) => this.httpServer.close(resolve));
 	}
 }
