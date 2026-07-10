@@ -364,10 +364,39 @@ describe("headless conductor host", () => {
 		}
 	}, 30_000);
 
-	it("issue #22: rejects hello v8 fatally with a clear supported-versions error", async () => {
+	it("Accordion PR #68: accepts hello v8 (wire-identical to v7) and attaches normally", async () => {
 		const home = mkdtempSync(path.join(tmpdir(), "bellows-host-v8-"));
 		const telemetryOut = path.join(home, "telemetry.jsonl");
 		const mock = await new MockExtension({ accordionHome: home, protocolVersion: 8 }).start();
+
+		const spawned = spawnHost({ accordionHome: home, conductor: "builtin", budget: 30_000, protect: 5_000, telemetryOut });
+
+		try {
+			await waitFor(() => mock.client !== null, 60_000, "host WS connect");
+			await waitFor(() => readTelemetry(telemetryOut).some((e) => e.t === "attach"), 5000, "attach telemetry");
+
+			// A v8 extension can still send a `passthrough` ack — v8 is wire-identical to v7,
+			// it only makes that ack mandatory on the Accordion side, so the host must fold it
+			// into telemetry exactly as it does for v7.
+			mock.sendPassthrough({ reqId: 7, cause: "applied", ops: 1, groups: 0, recalls: 0 });
+			await waitFor(() => readTelemetry(telemetryOut).some((e) => e.t === "passthrough"), 5000, "passthrough telemetry");
+			const tel = readTelemetry(telemetryOut);
+			const pt = tel.find((e) => e.t === "passthrough");
+			expect(pt).toMatchObject({ reqId: 7, cause: "applied", ops: 1, groups: 0, recalls: 0 });
+			expect(tel.some((e) => e.t === "error" && /protocol mismatch/.test(String(e.message)))).toBe(false);
+
+			await mock.close();
+			const code = await spawned.exit;
+			expect(code).toBe(0);
+		} finally {
+			await mock.close().catch(() => {});
+		}
+	}, 30_000);
+
+	it("issue #22: rejects hello v9 fatally with a clear supported-versions error", async () => {
+		const home = mkdtempSync(path.join(tmpdir(), "bellows-host-v9-"));
+		const telemetryOut = path.join(home, "telemetry.jsonl");
+		const mock = await new MockExtension({ accordionHome: home, protocolVersion: 9 }).start();
 
 		const spawned = spawnHost({ accordionHome: home, conductor: "builtin", budget: 30_000, protect: 5_000, telemetryOut });
 
@@ -378,8 +407,8 @@ describe("headless conductor host", () => {
 			const tel = readTelemetry(telemetryOut);
 			const errorLine = tel.find((e) => e.t === "error" && /protocol mismatch/.test(String(e.message)));
 			expect(errorLine, "a protocol-mismatch error must be recorded").toBeTruthy();
-			expect(String(errorLine.message)).toMatch(/extension v8/);
-			expect(String(errorLine.message)).toMatch(/host supports v5, 6, 7/);
+			expect(String(errorLine.message)).toMatch(/extension v9/);
+			expect(String(errorLine.message)).toMatch(/host supports v5, 6, 7, 8/);
 			expect(tel.some((e) => e.t === "attach")).toBe(false);
 		} finally {
 			await mock.close().catch(() => {});

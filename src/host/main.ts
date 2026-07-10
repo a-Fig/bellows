@@ -11,7 +11,7 @@
  *   1. polls $ACCORDION_HOME/.accordion/sessions/ for the single session descriptor the
  *      runner's pi session advertises, then dials its ws:// URL (retrying until timeout);
  *   2. speaks pi-wire protocol like `liveClient.svelte.ts` — accepts any protocol version in
- *      COMPATIBLE_PROTOCOL_VERSIONS on `hello` (currently v5-v7, additive across that range),
+ *      COMPATIBLE_PROTOCOL_VERSIONS on `hello` (currently v5-v8, additive across that range),
  *      folds `sync` blocks into a REAL `AccordionStore`, answers the agent's `unfold` /
  *      `recall` tools, and services `host.complete()` over the `completeRequest`/
  *      `completeResult` relay;
@@ -59,11 +59,14 @@ import { RemoteConductorClient } from "./remoteConductor";
 // v5 -> v7 additively (SyncMessage.planned?, PlanMessage.recalls?, plus the additive
 // armed/armedAck and passthrough message types — all shipped WITHOUT a PROTOCOL_VERSION
 // bump, per that file's version-history comment: an old peer just drops an unknown message
-// type). The host never SENDS `recalls`, ignores `planned`, and already ignores unknown
-// incoming message types, so it can safely speak to any extension in this range. v8+ (a
-// future breaking change) and v4- (pre-armed-over-wire) still hard-fail loudly on hello
-// rather than silently driving a wire shape this host doesn't understand.
-const COMPATIBLE_PROTOCOL_VERSIONS = new Set([5, 6, 7]);
+// type). v8 (Accordion PR #68) is wire-identical to v7 — no new/changed message shapes — it
+// only makes the `passthrough` plan-applied ack (which shipped inside v7 above) an explicitly
+// MANDATORY capability on the Accordion side, so it warranted a version bump even though this
+// host's wire handling is unchanged. The host never SENDS `recalls`, ignores `planned`, and
+// already ignores unknown incoming message types, so it can safely speak to any extension in
+// this range. v9+ (a future breaking change) and v4- (pre-armed-over-wire) still hard-fail
+// loudly on hello rather than silently driving a wire shape this host doesn't understand.
+const COMPATIBLE_PROTOCOL_VERSIONS = new Set([5, 6, 7, 8]);
 
 // The 5 `PassthroughCause` values the extension acks over the wire (Accordion ADR 0020) —
 // `no-gui`/`unsent` have no reachable client and are never sent as a `passthrough` message.
