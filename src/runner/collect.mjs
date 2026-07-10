@@ -188,6 +188,18 @@ export function foldHostTelemetry(text, fallbackConductorId = "") {
   const errors = [];
   const infos = [];
 
+  // Plan-outcome observability (Accordion issue #60/#22, ADR 0020). Two independent
+  // sources, reconciled below: the WS `passthrough` ack tally (only the 5 "ackable"
+  // causes — no-gui/unsent have no reachable client), and the `/__accordion/meta`
+  // start/end snapshot diff (all 7 causes + a true `total`, since the endpoint's
+  // counters are a lifetime total the extension tracks itself).
+  /** @type {Record<string, number> | null} */
+  let wsTally = null;
+  /** @type {Record<string, number> | null} */
+  let metaStart = null;
+  /** @type {Record<string, number> | null} */
+  let metaEnd = null;
+
   for (const e of events) {
     switch (e.t) {
       case "attach":
@@ -225,10 +237,26 @@ export function foldHostTelemetry(text, fallbackConductorId = "") {
         // folded into errors[], so a healthy remote conductor doesn't read as error-laden.
         if (e.message) infos.push(String(e.message));
         break;
+      case "passthrough":
+        // WS-tally semantics: `total` = number of acks seen, per-cause keys only for
+        // causes actually seen (lazily created on the first ack; a run with zero acks
+        // never allocates this and planOutcomes falls through to null below).
+        if (!wsTally) wsTally = { total: 0 };
+        if (typeof e.cause === "string") {
+          wsTally[e.cause] = n(wsTally[e.cause]) + 1;
+          wsTally.total += 1;
+        }
+        break;
+      case "meta_snapshot":
+        if (e.when === "start") metaStart = e.planOutcomes ?? null;
+        else if (e.when === "end") metaEnd = e.planOutcomes ?? null;
+        break;
       default:
         break;
     }
   }
+
+  const planOutcomes = resolvePlanOutcomes({ wsTally, metaStart, metaEnd, infos });
 
   return {
     conductorId,
@@ -242,7 +270,67 @@ export function foldHostTelemetry(text, fallbackConductorId = "") {
     completeCostUsd: round6(completeCostUsd),
     errors,
     infos,
+    planOutcomes,
   };
+}
+
+/**
+ * Reconcile the two plan-outcome sources into one canonical `PlanOutcomes` (Accordion
+ * issue #60/#22, ADR 0020). Preference order:
+ *
+ *   1. The `/__accordion/meta` start/end snapshot diff, when BOTH snapshots exist and
+ *      carry `planOutcomes` and every per-key diff is non-negative. This is authoritative:
+ *      it includes `no-gui`/`unsent` (which never ride the WS as acks) and a true `total`
+ *      (the extension's own lifetime `contextHookCount`, diffed). Cross-checked against
+ *      the WS ack tally on the 5 ackable causes; a disagreement doesn't change which
+ *      source wins (the diff still does) but is noted in `infos` for the report.
+ *   2. A negative diff on any key means the extension process restarted between the two
+ *      snapshots (its lifetime counters reset) — the diff is unusable; fall back to the
+ *      WS tally and note it.
+ *   3. If no usable meta diff exists (missing snapshot(s), or negative-diff fallback), use
+ *      the WS ack tally as-is.
+ *   4. If neither source ever fired, `null` — the attached extension predates plan-outcome
+ *      acks entirely (pre Accordion PR #64/#22).
+ *
+ * @param {{ wsTally: Record<string, number> | null, metaStart: Record<string, number> | null, metaEnd: Record<string, number> | null, infos: string[] }} args
+ * @returns {import("../types.ts").PlanOutcomes | null}
+ */
+function resolvePlanOutcomes({ wsTally, metaStart, metaEnd, infos }) {
+  const ACKABLE = ["applied", "empty-plan", "timeout-stale", "timeout-raw", "epoch-mismatch"];
+
+  if (metaStart && metaEnd) {
+    const keys = new Set([...Object.keys(metaStart), ...Object.keys(metaEnd)]);
+    /** @type {Record<string, number>} */
+    const diff = {};
+    let negative = false;
+    for (const k of keys) {
+      const d = n(metaEnd[k]) - n(metaStart[k]);
+      if (d < 0) {
+        negative = true;
+        break;
+      }
+      diff[k] = d;
+    }
+    if (!negative && Number.isFinite(diff.total)) {
+      if (wsTally) {
+        const mismatched = ACKABLE.filter((c) => n(wsTally[c]) !== n(diff[c]));
+        if (mismatched.length) {
+          infos.push(
+            `plan-outcomes mismatch: WS ack tally and /__accordion/meta diff disagree on ${mismatched.join(", ")} ` +
+              `(ws=${JSON.stringify(wsTally)}, meta-diff=${JSON.stringify(diff)}) — using the meta diff`,
+          );
+        }
+      }
+      return /** @type {import("../types.ts").PlanOutcomes} */ (diff);
+    }
+    infos.push(
+      "plan-outcomes: /__accordion/meta snapshot diff has a negative value (extension likely restarted " +
+        "mid-run) — discarding it in favor of the WS ack tally",
+    );
+  }
+
+  if (wsTally) return /** @type {import("../types.ts").PlanOutcomes} */ (wsTally);
+  return null;
 }
 
 /** Read + fold host telemetry file. Returns null if absent (conductor "none"). */

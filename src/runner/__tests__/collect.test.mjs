@@ -261,6 +261,135 @@ describe("foldHostTelemetry", () => {
     const t2 = foldHostTelemetry(JSON.stringify({ t: "sync", at: 1, liveTokens: 1, budget: 2 }), "cold-score");
     expect(t2.conductorId).toBe("cold-score");
   });
+  it("planOutcomes is null when no passthrough/meta_snapshot events were ever recorded", () => {
+    expect(tel.planOutcomes).toBeNull();
+  });
+});
+
+// Accordion issue #60/#22 (ADR 0020): plan-outcome observability. foldHostTelemetry folds
+// two independent sources — the WS `passthrough` ack tally and the `/__accordion/meta`
+// start/end snapshot diff — into one canonical `planOutcomes`, preferring the meta diff.
+describe("foldHostTelemetry — planOutcomes (Accordion issue #60/#22, ADR 0020)", () => {
+  it("uses the WS ack tally when no meta snapshot was ever taken", () => {
+    const fixture = [
+      { t: "attach", at: 100, sessionId: "s", conductor: "keel", budget: 70000, protectTokens: 20000 },
+      { t: "passthrough", at: 200, reqId: 1, cause: "applied", ops: 4, groups: 1, recalls: 0 },
+      { t: "passthrough", at: 300, reqId: 2, cause: "applied", ops: 2, groups: 0, recalls: 0 },
+      { t: "passthrough", at: 400, reqId: 3, cause: "empty-plan", ops: 0, groups: 0, recalls: 0 },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join("\n");
+    const tel = foldHostTelemetry(fixture, "keel");
+    expect(tel.planOutcomes).toEqual({ applied: 2, "empty-plan": 1, total: 3 });
+  });
+
+  it("prefers the /__accordion/meta start/end snapshot diff when both are present and non-negative", () => {
+    const fixture = [
+      { t: "attach", at: 100, sessionId: "s", conductor: "keel", budget: 70000, protectTokens: 20000 },
+      {
+        t: "meta_snapshot",
+        at: 105,
+        when: "start",
+        planOutcomes: { applied: 10, "empty-plan": 2, "timeout-stale": 0, "timeout-raw": 0, "no-gui": 5, "epoch-mismatch": 0, unsent: 0, total: 17 },
+      },
+      { t: "passthrough", at: 200, reqId: 1, cause: "applied", ops: 4, groups: 1, recalls: 0 },
+      {
+        t: "meta_snapshot",
+        at: 500,
+        when: "end",
+        planOutcomes: { applied: 11, "empty-plan": 2, "timeout-stale": 0, "timeout-raw": 0, "no-gui": 7, "epoch-mismatch": 0, unsent: 0, total: 20 },
+      },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join("\n");
+    const tel = foldHostTelemetry(fixture, "keel");
+    // Diff: applied +1, no-gui +2 (never acked over WS — only observable via meta), total +3.
+    expect(tel.planOutcomes).toEqual({ applied: 1, "empty-plan": 0, "timeout-stale": 0, "timeout-raw": 0, "no-gui": 2, "epoch-mismatch": 0, unsent: 0, total: 3 });
+    // No mismatch note: the WS tally (applied:1) and the meta diff (applied:1) agree on every
+    // ackable cause, so infos must stay empty.
+    expect(tel.infos).toEqual([]);
+  });
+
+  it("appends a mismatch note when the WS tally and meta diff disagree on an ackable cause, but still uses the meta diff", () => {
+    const fixture = [
+      { t: "attach", at: 100, sessionId: "s", conductor: "keel", budget: 70000, protectTokens: 20000 },
+      {
+        t: "meta_snapshot",
+        at: 105,
+        when: "start",
+        planOutcomes: { applied: 0, "empty-plan": 0, "timeout-stale": 0, "timeout-raw": 0, "no-gui": 0, "epoch-mismatch": 0, unsent: 0, total: 0 },
+      },
+      // Only ONE passthrough ack rode the WS (e.g. a dropped ack), but the extension's own
+      // lifetime counters show TWO applied outcomes actually happened.
+      { t: "passthrough", at: 200, reqId: 1, cause: "applied", ops: 4, groups: 1, recalls: 0 },
+      {
+        t: "meta_snapshot",
+        at: 500,
+        when: "end",
+        planOutcomes: { applied: 2, "empty-plan": 0, "timeout-stale": 0, "timeout-raw": 0, "no-gui": 0, "epoch-mismatch": 0, unsent: 0, total: 2 },
+      },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join("\n");
+    const tel = foldHostTelemetry(fixture, "keel");
+    // The meta diff still wins even though it disagrees with the WS tally.
+    expect(tel.planOutcomes.applied).toBe(2);
+    expect(tel.planOutcomes.total).toBe(2);
+    expect(tel.infos.length).toBe(1);
+    expect(tel.infos[0]).toMatch(/mismatch/);
+    expect(tel.infos[0]).toMatch(/applied/);
+  });
+
+  it("falls back to the WS tally when the meta diff has a negative value (extension restarted mid-run)", () => {
+    const fixture = [
+      { t: "attach", at: 100, sessionId: "s", conductor: "keel", budget: 70000, protectTokens: 20000 },
+      {
+        t: "meta_snapshot",
+        at: 105,
+        when: "start",
+        planOutcomes: { applied: 50, "empty-plan": 0, "timeout-stale": 0, "timeout-raw": 0, "no-gui": 0, "epoch-mismatch": 0, unsent: 0, total: 50 },
+      },
+      { t: "passthrough", at: 200, reqId: 1, cause: "applied", ops: 1, groups: 0, recalls: 0 },
+      // Extension restarted: its lifetime counters reset lower than the start snapshot.
+      {
+        t: "meta_snapshot",
+        at: 500,
+        when: "end",
+        planOutcomes: { applied: 1, "empty-plan": 0, "timeout-stale": 0, "timeout-raw": 0, "no-gui": 0, "epoch-mismatch": 0, unsent: 0, total: 1 },
+      },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join("\n");
+    const tel = foldHostTelemetry(fixture, "keel");
+    expect(tel.planOutcomes).toEqual({ applied: 1, total: 1 });
+    expect(tel.infos.some((m) => /negative/.test(m))).toBe(true);
+  });
+
+  it("is null when neither a passthrough ack nor a meta snapshot ever arrived", () => {
+    const fixture = [{ t: "attach", at: 100, sessionId: "s", conductor: "keel", budget: 70000, protectTokens: 20000 }]
+      .map((e) => JSON.stringify(e))
+      .join("\n");
+    const tel = foldHostTelemetry(fixture, "keel");
+    expect(tel.planOutcomes).toBeNull();
+  });
+
+  it("falls back to the WS tally when only ONE of the two meta snapshots exists", () => {
+    const fixture = [
+      { t: "attach", at: 100, sessionId: "s", conductor: "keel", budget: 70000, protectTokens: 20000 },
+      {
+        t: "meta_snapshot",
+        at: 105,
+        when: "start",
+        planOutcomes: { applied: 5, "empty-plan": 0, "timeout-stale": 0, "timeout-raw": 0, "no-gui": 0, "epoch-mismatch": 0, unsent: 0, total: 5 },
+      },
+      { t: "passthrough", at: 200, reqId: 1, cause: "applied", ops: 1, groups: 0, recalls: 0 },
+      // No "end" snapshot — e.g. the extension was unreachable at shutdown.
+    ]
+      .map((e) => JSON.stringify(e))
+      .join("\n");
+    const tel = foldHostTelemetry(fixture, "keel");
+    expect(tel.planOutcomes).toEqual({ applied: 1, total: 1 });
+  });
 });
 
 // Issue #14: a host that dies during attach (e.g. "unknown conductor") writes only an
