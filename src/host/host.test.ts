@@ -25,6 +25,8 @@ const HOST_DIR = fileURLToPath(new URL(".", import.meta.url));
 const REPO_ROOT = path.resolve(HOST_DIR, "../..");
 const CONFIG = path.join(REPO_ROOT, "vite-node.config.ts");
 const MAIN = path.join(HOST_DIR, "main.ts");
+const TEST_ACCORDION_REPO = process.env.BELLOWS_ACCORDION_REPO?.trim()
+	|| JSON.parse(readFileSync(path.join(REPO_ROOT, "bench.config.example.json"), "utf8")).accordionRepo;
 
 interface Spawned {
 	child: ChildProcess;
@@ -45,6 +47,7 @@ function spawnHost(opts: {
 	metaRefreshMs?: number;
 }): Spawned {
 	const env = { ...process.env };
+	env.BELLOWS_ACCORDION_REPO = TEST_ACCORDION_REPO;
 	if (opts.slowConductMs) env.BELLOWS_TEST_SLOW_CONDUCT_MS = String(opts.slowConductMs);
 	if (opts.armedAckTimeoutMs) env.BELLOWS_ARMED_ACK_TIMEOUT_MS = String(opts.armedAckTimeoutMs);
 	if (opts.metaRefreshMs) env.BELLOWS_META_REFRESH_MS = String(opts.metaRefreshMs);
@@ -393,10 +396,44 @@ describe("headless conductor host", () => {
 		}
 	}, 30_000);
 
-	it("issue #22: rejects hello v9 fatally with a clear supported-versions error", async () => {
+	it("Accordion PR #81: accepts hello v9 and normalizes its removed passthrough recalls field", async () => {
 		const home = mkdtempSync(path.join(tmpdir(), "bellows-host-v9-"));
 		const telemetryOut = path.join(home, "telemetry.jsonl");
 		const mock = await new MockExtension({ accordionHome: home, protocolVersion: 9 }).start();
+
+		const spawned = spawnHost({ accordionHome: home, conductor: "builtin", budget: 30_000, protect: 5_000, telemetryOut });
+
+		try {
+			await waitFor(() => mock.client !== null, 60_000, "host WS connect");
+			await waitFor(() => readTelemetry(telemetryOut).some((e) => e.t === "attach"), 5000, "attach telemetry");
+
+			// Protocol v9 removed `PassthroughMessage.recalls`. The mock omits it on the wire;
+			// Bellows keeps its historical telemetry schema stable by normalizing it to zero.
+			const sent = mock.sendPassthrough({ reqId: 9, cause: "applied", ops: 2, groups: 1 });
+			expect("recalls" in sent).toBe(false);
+			await waitFor(() => readTelemetry(telemetryOut).some((e) => e.t === "passthrough"), 5000, "passthrough telemetry");
+			const tel = readTelemetry(telemetryOut);
+			expect(tel.find((e) => e.t === "passthrough")).toMatchObject({
+				reqId: 9,
+				cause: "applied",
+				ops: 2,
+				groups: 1,
+				recalls: 0,
+			});
+			expect(tel.some((e) => e.t === "error" && /protocol mismatch/.test(String(e.message)))).toBe(false);
+
+			await mock.close();
+			const code = await spawned.exit;
+			expect(code).toBe(0);
+		} finally {
+			await mock.close().catch(() => {});
+		}
+	}, 30_000);
+
+	it("issue #22: rejects hello v10 fatally with a clear supported-versions error", async () => {
+		const home = mkdtempSync(path.join(tmpdir(), "bellows-host-v10-"));
+		const telemetryOut = path.join(home, "telemetry.jsonl");
+		const mock = await new MockExtension({ accordionHome: home, protocolVersion: 10 }).start();
 
 		const spawned = spawnHost({ accordionHome: home, conductor: "builtin", budget: 30_000, protect: 5_000, telemetryOut });
 
@@ -407,8 +444,8 @@ describe("headless conductor host", () => {
 			const tel = readTelemetry(telemetryOut);
 			const errorLine = tel.find((e) => e.t === "error" && /protocol mismatch/.test(String(e.message)));
 			expect(errorLine, "a protocol-mismatch error must be recorded").toBeTruthy();
-			expect(String(errorLine.message)).toMatch(/extension v9/);
-			expect(String(errorLine.message)).toMatch(/host supports v5, 6, 7, 8/);
+			expect(String(errorLine.message)).toMatch(/extension v10/);
+			expect(String(errorLine.message)).toMatch(/host supports v5, 6, 7, 8, 9/);
 			expect(tel.some((e) => e.t === "attach")).toBe(false);
 		} finally {
 			await mock.close().catch(() => {});

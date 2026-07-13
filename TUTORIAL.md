@@ -135,9 +135,10 @@ What bellows does differently for an `external:<id>` arm:
    `heartbeatAt`, stale after 15s) for up to ~20s, then fails the run with a clear
    timeout error if the conductor never advertises itself.
 5. The headless host is launched with `--conductor-url <ws url> --conductor-id <id>`
-   instead of `--conductor <id>` — it dials the conductor as a WebSocket **client**
-   (conductor wire protocol v3; the conductor process hosts the server, same topology
-   as Accordion's own remote-conductor support) rather than instantiating it in-process.
+   instead of `--conductor <id>` — it dials the conductor as a WebSocket **client**.
+   The conductor contract version comes from the trial's effective Accordion checkout
+   (including a pinned `accordionRef`), so host and conductor stay in lockstep; the
+   conductor process hosts the server, matching Accordion's own remote-conductor topology.
 6. The conductor process is killed alongside pi and the host when the run ends —
    success, cap, crash, or teardown — so nothing is left running after a trial
    (on Windows this is a `taskkill /T` process-tree kill, so a conductor's own
