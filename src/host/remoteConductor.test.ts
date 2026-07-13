@@ -40,8 +40,8 @@ const HOST_DIR = fileURLToPath(new URL(".", import.meta.url));
 const REPO_ROOT = path.resolve(HOST_DIR, "../..");
 const CONFIG = path.join(REPO_ROOT, "vite-node.config.ts");
 const MAIN = path.join(HOST_DIR, "main.ts");
-
-const CONDUCTOR_PROTOCOL_VERSION = 3;
+const TEST_ACCORDION_REPO = process.env.BELLOWS_ACCORDION_REPO?.trim()
+	|| JSON.parse(readFileSync(path.join(REPO_ROOT, "bench.config.example.json"), "utf8")).accordionRepo;
 
 const children: ChildProcess[] = [];
 const servers: WebSocketServer[] = [];
@@ -94,7 +94,11 @@ function spawnHost(opts: {
 			"--timeout-min",
 			"1",
 		],
-		{ cwd: REPO_ROOT, env: { ...process.env }, stdio: ["ignore", "pipe", "pipe"] },
+		{
+			cwd: REPO_ROOT,
+			env: { ...process.env, BELLOWS_ACCORDION_REPO: TEST_ACCORDION_REPO },
+			stdio: ["ignore", "pipe", "pipe"],
+		},
 	);
 	children.push(child);
 	child.stderr?.on("data", (d) => process.stderr.write(`[host] ${d}`));
@@ -152,10 +156,14 @@ class FakeConductor {
 				}
 				if (m.type === "host/hello") {
 					this.hostHello = m;
+					// Bellows loads the conductor contract from the trial's effective Accordion
+					// checkout. Mirror a conductor launched from that same checkout by greeting
+					// with the version the host advertised, instead of pinning this cross-ref
+					// fixture to whichever protocol happened to be current when it was written.
 					ws.send(
 						JSON.stringify({
 							type: "conductor/hello",
-							conductorProtocol: CONDUCTOR_PROTOCOL_VERSION,
+							conductorProtocol: m.conductorProtocol,
 							id: "fake-conductor",
 							label: "Fake Conductor",
 							wants: { content: opts.wants ?? "full" },
@@ -318,7 +326,8 @@ describe("RemoteConductorClient — protocol unit tests (fake conductor server)"
 			await waitFor(() => mock.client !== null, 60_000, "host <-pi extension connect");
 			await waitFor(() => fake.hostHello !== null, 10_000, "host/hello at the fake conductor");
 
-			expect(fake.hostHello.conductorProtocol).toBe(CONDUCTOR_PROTOCOL_VERSION);
+			expect(Number.isSafeInteger(fake.hostHello.conductorProtocol)).toBe(true);
+			expect(fake.hostHello.conductorProtocol).toBeGreaterThan(0);
 			expect(typeof fake.hostHello.budget).toBe("number");
 			expect(fake.hostHello.budget).toBe(30_000);
 

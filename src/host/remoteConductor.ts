@@ -1,6 +1,7 @@
 /*
  * remoteConductor.ts — bellows' Node client for an EXTERNAL conductor process
- * (ADR 0007 escape hatch, conductor wire protocol v3).
+ * (ADR 0007 escape hatch; the conductor wire protocol version comes from the
+ * trial's effective Accordion checkout).
  *
  * Mirrors the topology and behavior of Accordion's `RemoteRunner`
  * (app/src/lib/live/conductorClient.svelte.ts) — READ AS A BLUEPRINT, not imported

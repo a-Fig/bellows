@@ -17,7 +17,8 @@
  *     tests can assert the round-trip; `swallowArmed: true` disables the reply to exercise
  *     the host's ack watchdog);
  *   • exposes `sendPassthrough({reqId, cause, ops, groups, recalls})` to push a `passthrough`
- *     ack to the host (Accordion issue #60/#22, ADR 0020), and serves `planOutcomes` counters
+ *     ack to the host (omitting `recalls` for protocol v9+, where that field was removed),
+ *     and serves `planOutcomes` counters
  *     over `GET /__accordion/meta` (mutable via `bumpMetaCause`/`setMetaPlanOutcomes`) so the
  *     host's meta-snapshot fetch (src/host/main.ts `fetchMetaPlanOutcomes`) has something real
  *     to hit;
@@ -103,13 +104,13 @@ export class MockExtension {
 		// the drip-feed hang the adversarial review flagged in fetchMetaPlanOutcomes.
 		this.hangMeta = hangMeta;
 		// The protocolVersion this mock declares on `hello` (and in its session descriptor) —
-		// configurable so the host's dual-version-handshake tests can dial v5/v6/v7/v8 without
-		// three separate mock classes.
+		// configurable so the host's handshake tests can dial v5/v6/v7/v8/v9 without
+		// separate mock classes.
 		this.protocolVersion = protocolVersion;
 		this.plans = []; // { reqId, ops, groups, at }
 		this.completions = []; // { reqId, at }
 		this.armedMessages = []; // { armed, at }
-		this.passthroughsSent = []; // { reqId, cause, ops, groups, recalls, at } — mock -> host
+		this.passthroughsSent = []; // { reqId, cause, ops, groups, recalls?, at } — mock -> host
 		this.helloSentAt = null; // timestamp of the `hello` frame this mock sent, for ordering checks
 		this.client = null;
 		this.reqId = 0;
@@ -201,7 +202,14 @@ export class MockExtension {
 	 */
 	sendPassthrough({ reqId, cause, ops = 0, groups = 0, recalls = 0 }) {
 		if (!this.client) throw new Error("mock: no client connected");
-		const rec = { reqId, cause, ops, groups, recalls, at: Date.now() };
+		const rec = {
+			reqId,
+			cause,
+			ops,
+			groups,
+			...(this.protocolVersion < 9 ? { recalls } : {}),
+			at: Date.now(),
+		};
 		this.passthroughsSent.push(rec);
 		this.client.send(JSON.stringify({ type: "passthrough", ...rec }));
 		return rec;

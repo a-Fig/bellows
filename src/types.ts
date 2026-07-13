@@ -214,7 +214,9 @@ export type HostEvent =
   // `cause` is one of the 5 ackable `PassthroughCause` values (`applied | empty-plan |
   // timeout-stale | timeout-raw | epoch-mismatch`) — `no-gui`/`unsent` have no reachable
   // client and are never sent over the wire. `ops`/`groups`/`recalls` are the counts
-  // ACTUALLY applied to the wire for that call (0 for raw/empty causes). See
+  // ACTUALLY applied to the wire for that call (0 for raw/empty causes). Accordion
+  // protocol v9 removes the wire-level `recalls` field; Bellows records zero for v9+
+  // to preserve this telemetry/report shape across mixed historical runs. See
   // src/host/main.ts's passthrough branch.
   | { t: "passthrough"; at: number; reqId: number; cause: string; ops: number; groups: number; recalls: number }
   // A snapshot of the extension's lifetime `/__accordion/meta` `planOutcomes` counters,

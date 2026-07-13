@@ -11,7 +11,7 @@
  *   1. polls $ACCORDION_HOME/.accordion/sessions/ for the single session descriptor the
  *      runner's pi session advertises, then dials its ws:// URL (retrying until timeout);
  *   2. speaks pi-wire protocol like `liveClient.svelte.ts` — accepts any protocol version in
- *      COMPATIBLE_PROTOCOL_VERSIONS on `hello` (currently v5-v8, additive across that range),
+ *      COMPATIBLE_PROTOCOL_VERSIONS on `hello` (currently v5-v9),
  *      folds `sync` blocks into a REAL `AccordionStore`, answers the agent's `unfold` /
  *      `recall` tools, and services `host.complete()` over the `completeRequest`/
  *      `completeResult` relay;
@@ -60,13 +60,12 @@ import { RemoteConductorClient } from "./remoteConductor";
 // armed/armedAck and passthrough message types — all shipped WITHOUT a PROTOCOL_VERSION
 // bump, per that file's version-history comment: an old peer just drops an unknown message
 // type). v8 (Accordion PR #68) is wire-identical to v7 — no new/changed message shapes — it
-// only makes the `passthrough` plan-applied ack (which shipped inside v7 above) an explicitly
-// MANDATORY capability on the Accordion side, so it warranted a version bump even though this
-// host's wire handling is unchanged. The host never SENDS `recalls`, ignores `planned`, and
-// already ignores unknown incoming message types, so it can safely speak to any extension in
-// this range. v9+ (a future breaking change) and v4- (pre-armed-over-wire) still hard-fail
-// loudly on hello rather than silently driving a wire shape this host doesn't understand.
-const COMPATIBLE_PROTOCOL_VERSIONS = new Set([5, 6, 7, 8]);
+// only makes the `passthrough` plan-applied ack mandatory. v9 removes `SyncMessage.planned`,
+// `PlanMessage.recalls`, and `PassthroughMessage.recalls`. Bellows never sends conductor
+// recalls or consumes `planned`; a missing passthrough recall count is normalized to zero
+// below so the stable telemetry shape still works across v5-v9. v10+ and v4-
+// (pre-armed-over-wire) hard-fail loudly rather than silently driving an unknown wire shape.
+const COMPATIBLE_PROTOCOL_VERSIONS = new Set([5, 6, 7, 8, 9]);
 
 // The 5 `PassthroughCause` values the extension acks over the wire (Accordion ADR 0020) —
 // `no-gui`/`unsent` have no reachable client and are never sent as a `passthrough` message.
@@ -702,15 +701,8 @@ async function main(): Promise<number> {
 					// a future extension-side addition this host predates, or a corrupt frame, and
 					// either way must not be silently miscounted as one of the known 5.
 					//
-					// Unlike Accordion's liveClient.svelte.ts, this host does NOT reconcile any
-					// birth-fold bookkeeping off this ack: the host's AccordionStore structural
-					// interface (src/host/accordion.ts) has no `markSent`, and this host has no
-					// optimistic "my reply rode the wire" assumption to walk back — `lastPlan` here
-					// is only a reply cache, not a birth-fold cursor. If this host ever grows
-					// `markSent`/birth-fold semantics, it must adopt liveClient's timeout-ack
-					// reconciliation (reconcile on `timeout-stale`/`timeout-raw` matching the last
-					// planned reqId; never on `epoch-mismatch`) — see liveClient.svelte.ts on
-					// Accordion devmain.
+					// v5-v8 include `recalls`; v9 removes it with conductor recall. Keep the
+					// historical Bellows telemetry schema stable by recording zero when absent.
 					if (typeof msg.cause === "string" && ACKABLE_PASSTHROUGH_CAUSES.has(msg.cause)) {
 						tel.emit({
 							t: "passthrough",
