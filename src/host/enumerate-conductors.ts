@@ -11,11 +11,20 @@
  * Kept separate from main.ts (rather than adding a "--list-conductors" mode to
  * it) so the worker's polling path never touches the run-driving host logic.
  */
-import { loadAccordion } from "./accordion";
+import { existsSync } from "node:fs";
+import path from "node:path";
+import { accordionRepo, loadAccordion } from "./accordion";
+import { loadAccordionV15 } from "./accordionV15";
 
 async function main(): Promise<number> {
-	const acc = await loadAccordion();
-	process.stdout.write(JSON.stringify(acc.IN_PROCESS_CONDUCTORS.map((c) => c.id)));
+	const isV15 = existsSync(path.join(accordionRepo(), "core", "protocol.ts"));
+	if (isV15) {
+		const acc = await loadAccordionV15();
+		process.stdout.write(JSON.stringify(acc.ENTRIES.filter((entry) => entry.kind !== "none").map((entry) => entry.id)));
+	} else {
+		const acc = await loadAccordion();
+		process.stdout.write(JSON.stringify(acc.IN_PROCESS_CONDUCTORS.map((c) => c.id)));
+	}
 	return 0;
 }
 

@@ -9,11 +9,26 @@ import {
   getFreePort,
   spawnExternalConductor,
   spawnHost,
+  hostEntryForAccordion,
   hostEnv,
   modelShortName,
   buildJoinMeta,
   conductorNeverAttached,
 } from "../run.mjs";
+
+describe("hostEntryForAccordion", () => {
+  it("selects the v15 controller for a truth-in-extension checkout", () => {
+    const repo = fs.mkdtempSync(path.join(tmpdir(), "accordion-v15-"));
+    fs.mkdirSync(path.join(repo, "core"));
+    fs.writeFileSync(path.join(repo, "core", "protocol.ts"), "export const PROTOCOL_VERSION = 15;\n");
+    expect(hostEntryForAccordion(repo)).toBe("src/host/main-v15.ts");
+    fs.rmSync(repo, { recursive: true, force: true });
+  });
+
+  it("keeps legacy refs on the existing controller", () => {
+    expect(hostEntryForAccordion("C:/missing/legacy-accordion")).toBe("src/host/main.ts");
+  });
+});
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE_DIR = path.resolve(HERE, "..", "..", "..", "test", "fixtures");
