@@ -157,6 +157,31 @@ describe("driveUntilDone — sentinel-echo / degenerate terminal response (2026-
     await expect(outcome).resolves.toEqual({ status: "completed", statusDetail: undefined });
     expect(telemetry.sawAgentFinalize).toBe(false);
   });
+
+  it("keeps a degenerate terminal message completed when the agent already finalized", async () => {
+    const pi = new FakePi();
+    const telemetry = { sawAgentFinalize: false };
+    const outcome = driveUntilDone({ pi, host: null, spec: DRIVER_SPEC, log: () => {}, label: "test", telemetry });
+
+    pi.emit("event", {
+      type: "tool_execution_start",
+      toolCallId: "call-1",
+      toolName: "bash",
+      args: { command: "python slopcode_client.py finalize", timeout: 30 },
+    });
+    pi.emit("event", {
+      type: "message_end",
+      message: {
+        role: "assistant",
+        stopReason: "stop",
+        content: [{ type: "thinking", thinking: "[reasoning unavailable from provider]" }],
+      },
+    });
+    pi.emit("event", { type: "agent_end", willRetry: false });
+
+    await expect(outcome).resolves.toEqual({ status: "completed", statusDetail: undefined });
+    expect(telemetry.sawAgentFinalize).toBe(true);
+  });
 });
 
 describe("isDegenerateAssistantMessage", () => {
@@ -217,24 +242,48 @@ describe("looksLikeAgentFinalizeCall", () => {
 });
 
 describe("appendAgentFinalizeNote", () => {
-  it("appends the note when completed and the agent never finalized", () => {
-    expect(appendAgentFinalizeNote("completed", undefined, false)).toBe(
+  it("appends the sweep-succeeded note when completed, the agent never finalized, and the sweep finalized", () => {
+    expect(appendAgentFinalizeNote("completed", undefined, false, "finalized")).toBe(
       "agent never invoked platform finalize; game finalized by post-run sweep",
     );
   });
 
   it("joins onto existing statusDetail with '; '", () => {
-    expect(appendAgentFinalizeNote("completed", "platform row present but not finalized", false)).toBe(
+    expect(appendAgentFinalizeNote("completed", "platform row present but not finalized", false, "finalized")).toBe(
       "platform row present but not finalized; agent never invoked platform finalize; game finalized by post-run sweep",
     );
   });
 
   it("is a no-op when the agent itself finalized", () => {
-    expect(appendAgentFinalizeNote("completed", "x", true)).toBe("x");
+    expect(appendAgentFinalizeNote("completed", "x", true, "finalized")).toBe("x");
   });
 
   it("is a no-op for a non-completed status", () => {
-    expect(appendAgentFinalizeNote("error", "some detail", false)).toBe("some detail");
+    expect(appendAgentFinalizeNote("error", "some detail", false, "finalized")).toBe("some detail");
+  });
+
+  it("does not overclaim when the sweep failed to finalize", () => {
+    expect(appendAgentFinalizeNote("completed", undefined, false, "failed")).toBe(
+      "agent never invoked platform finalize; sweep result: failed",
+    );
+  });
+
+  it("does not overclaim when the sweep found no session", () => {
+    expect(appendAgentFinalizeNote("completed", undefined, false, "no-session")).toBe(
+      "agent never invoked platform finalize; sweep result: no-session",
+    );
+  });
+
+  it("does not overclaim when the sweep gave up on grade-pending", () => {
+    expect(appendAgentFinalizeNote("completed", undefined, false, "grade-pending-gave-up")).toBe(
+      "agent never invoked platform finalize; sweep result: grade-pending-gave-up",
+    );
+  });
+
+  it("does not overclaim when the sweep itself threw (sweepFinalize null)", () => {
+    expect(appendAgentFinalizeNote("completed", undefined, false, null)).toBe(
+      "agent never invoked platform finalize; sweep result: null",
+    );
   });
 });
 

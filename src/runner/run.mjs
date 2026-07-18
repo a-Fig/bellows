@@ -148,8 +148,6 @@ export async function executeRun(args) {
   let workspaceDir = path.join(runDir, "workspace");
   let agentDir = path.join(runDir, "agent");
   let accordionHome = path.join(runDir, "accordion-home");
-  /** @type {string[]} */
-  let warnings = [];
 
   /** @type {PiRpc | null} */
   let pi = null;
@@ -170,10 +168,8 @@ export async function executeRun(args) {
       runLabel: label,
       apiKey,
       meta: joinMeta,
-      log,
     });
     workspaceDir = prov.workspaceDir;
-    warnings = prov.warnings || [];
     agentDir = prov.agentDir;
     accordionHome = prov.accordionHome;
 
@@ -433,7 +429,7 @@ export async function executeRun(args) {
   // Surface non-agent finalization even when the harvest above found nothing
   // to append to (e.g. the row wasn't visible yet) — this is about the
   // finalize CALLER, not the leaderboard row's final flag.
-  statusDetail = appendAgentFinalizeNote(status, statusDetail, driveTelemetry.sawAgentFinalize);
+  statusDetail = appendAgentFinalizeNote(status, statusDetail, driveTelemetry.sawAgentFinalize, sweepFinalize);
 
   /** @type {import("../types.ts").RunRecord} */
   const record = {
@@ -454,7 +450,6 @@ export async function executeRun(args) {
     platform,
     agentFinalized: driveTelemetry.sawAgentFinalize,
     sweepFinalize,
-    ...(warnings.length ? { warnings } : {}),
     artifacts: {
       piSessionFile: sessionFile,
       hostTelemetryFile,
@@ -627,13 +622,19 @@ export function driveUntilDone({ pi, host, spec, log, label, abortSignal, teleme
         } else if (latestAssistantError) {
           log(`[${label}] terminal model error: ${latestAssistantError}`);
           finish("error", `terminal model error: ${latestAssistantError}`);
-        } else if (isDegenerateAssistantMessage(latestAssistantMessage)) {
+        } else if (isDegenerateAssistantMessage(latestAssistantMessage) && !telemetry?.sawAgentFinalize) {
           // Sentinel-echo failure mode (2026-07-18 investigation): the final
           // response is a syntactically normal stop (stopReason "stop", not
           // "error") whose content is reasoning-only — no text, no tool call.
           // Pi reports this identically to a genuine success, so without this
           // check the run is misclassified "completed" and the post-run sweep
           // finalizes an unfinished game on the agent's behalf.
+          //
+          // Gated on !sawAgentFinalize: a run that already called
+          // `slopcode_client ... finalize` has a legitimate graded result —
+          // a trailing reasoning-only message after that (e.g. the agent
+          // musing post-finalize) must not demote a real completion to error
+          // and drop it from scored aggregates.
           const detail =
             "terminal degenerate response: final assistant message has no text and no tool call (reasoning-only stop)";
           log(`[${label}] ${detail}`);
@@ -718,20 +719,27 @@ export function looksLikeAgentFinalizeCall(args) {
 }
 
 /**
- * Append the "agent never invoked platform finalize" note to statusDetail
- * when a run reports completed but no agent-issued finalize tool call was
- * observed — i.e. any platform finalization for this run came solely from the
- * runner's own post-run sweep. Follows the same append pattern as the
- * post-harvest guard (join with "; "). Exported as the unit-testable seam for
- * executeRun's record-assembly step.
+ * Append an "agent never invoked platform finalize" note to statusDetail when
+ * a run reports completed but no agent-issued finalize tool call was
+ * observed. The wording depends on what the post-run sweep (finalizeStaleAgent)
+ * actually achieved: on "finalized" it correctly claims the sweep closed the
+ * game; any other result ("no-session" | "failed" | "grade-pending-gave-up" |
+ * null) means the sweep did NOT finalize either, so the note must not
+ * overclaim — it instead reports the sweep's own result string. Follows the
+ * same append pattern as the post-harvest guard (join with "; "). Exported as
+ * the unit-testable seam for executeRun's record-assembly step.
  * @param {import("../types.ts").RunStatus} status
  * @param {string|undefined} statusDetail
  * @param {boolean} sawAgentFinalize
+ * @param {string|null} sweepFinalize  finalizeStaleAgent's return value
  * @returns {string|undefined}
  */
-export function appendAgentFinalizeNote(status, statusDetail, sawAgentFinalize) {
+export function appendAgentFinalizeNote(status, statusDetail, sawAgentFinalize, sweepFinalize) {
   if (status !== "completed" || sawAgentFinalize) return statusDetail;
-  const note = "agent never invoked platform finalize; game finalized by post-run sweep";
+  const note =
+    sweepFinalize === "finalized"
+      ? "agent never invoked platform finalize; game finalized by post-run sweep"
+      : `agent never invoked platform finalize; sweep result: ${sweepFinalize}`;
   return statusDetail ? `${statusDetail}; ${note}` : note;
 }
 

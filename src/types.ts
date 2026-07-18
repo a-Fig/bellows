@@ -137,10 +137,6 @@ export interface RunRecord {
    * itself threw before returning a result.
    */
   sweepFinalize: string | null;
-  /** Best-effort non-fatal warnings surfaced during provisioning (e.g. a
-   * requested thinkingLevel that models.json cannot honor). Absent/empty when
-   * there are none. */
-  warnings?: string[];
   /** Provenance pointers for debugging. */
   artifacts: {
     piSessionFile: string;
