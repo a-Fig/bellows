@@ -78,7 +78,7 @@ export function findNewestSessionFile(agentDir) {
 /**
  * Parse a pi session JSONL into UsageTotals + TurnMetric[].
  * @param {string} text  raw JSONL
- * @returns {{ usage: import("../types.ts").UsageTotals, turns: import("../types.ts").TurnMetric[] }}
+ * @returns {{ usage: import("../types.ts").UsageTotals, turns: import("../types.ts").TurnMetric[], terminalError?: string }}
  */
 export function parseSession(text) {
   /** @type {import("../types.ts").TurnMetric[]} */
@@ -94,10 +94,12 @@ export function parseSession(text) {
     toolCalls: 0,
   };
   let turnIndex = 0;
+  let lastAssistant = null;
   for (const rec of parseJsonl(text)) {
     if (!rec || rec.type !== "message") continue;
     const m = rec.message;
     if (!m || m.role !== "assistant") continue;
+    lastAssistant = m;
     const u = m.usage || {};
     const cost = (u.cost && typeof u.cost === "object" ? u.cost.total : u.cost) || 0;
     const input = n(u.input);
@@ -140,7 +142,13 @@ export function parseSession(text) {
   }
   // round cost to avoid fp noise in reports
   totals.costUsd = round6(totals.costUsd);
-  return { usage: totals, turns };
+  const terminalError =
+    lastAssistant?.stopReason === "error"
+      ? typeof lastAssistant.errorMessage === "string" && lastAssistant.errorMessage.trim()
+        ? lastAssistant.errorMessage.trim()
+        : "model response ended with stopReason=error"
+      : undefined;
+  return { usage: totals, turns, ...(terminalError ? { terminalError } : {}) };
 }
 
 /** Convenience: read + parse a session file. Returns empty result if missing. */
