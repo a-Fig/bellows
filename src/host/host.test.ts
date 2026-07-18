@@ -28,6 +28,23 @@ const MAIN = path.join(HOST_DIR, "main.ts");
 const TEST_ACCORDION_REPO = process.env.BELLOWS_ACCORDION_REPO?.trim()
 	|| JSON.parse(readFileSync(path.join(REPO_ROOT, "bench.config.example.json"), "utf8")).accordionRepo;
 
+/*
+ * The legacy host (src/host/main.ts) compiles the Accordion engine and the
+ * `$conductors` alias out of the LOCAL Accordion checkout. A protocol-v15
+ * ("truth-in-extension") checkout no longer carries `conductors/contract/` —
+ * the contract moved into `core/` — so the legacy host cannot even boot
+ * against one (vite-node dies at import time with ERR_MODULE_NOT_FOUND on
+ * `$conductors/contract/conductor`, and every test here then times out
+ * waiting for a WS connect that can never happen). The runner never creates
+ * that pairing either: hostEntryForAccordion (src/runner/run.mjs) dispatches
+ * v15-shaped checkouts to main-v15.ts, which is covered by the hermetic
+ * __tests__/main-v15.integration.test.mjs (it builds its own fixture repo and
+ * is independent of the local checkout's branch). Mirror that dispatch here:
+ * skip the legacy-host e2e suite when the resolved checkout is v15-shaped,
+ * using the same `core/protocol.ts` predicate as hostEntryForAccordion.
+ */
+const ACCORDION_IS_V15 = existsSync(path.join(TEST_ACCORDION_REPO, "core", "protocol.ts"));
+
 interface Spawned {
 	child: ChildProcess;
 	telemetryOut: string;
@@ -107,7 +124,7 @@ afterEach(async () => {
 	}
 });
 
-describe("headless conductor host", () => {
+describe.skipIf(ACCORDION_IS_V15)("headless conductor host", () => {
 	it("attaches, folds an over-budget context with the built-in conductor, and writes valid telemetry", async () => {
 		const home = mkdtempSync(path.join(tmpdir(), "bellows-host-"));
 		const telemetryOut = path.join(home, "telemetry.jsonl");
