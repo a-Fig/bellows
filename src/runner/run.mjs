@@ -29,7 +29,7 @@ import {
   enrichTurnsWithWire,
   computePlanRtt,
 } from "./collect.mjs";
-import { harvestLeaderboard, normalizeLabel, finalizeStaleAgent } from "./platform.mjs";
+import { harvestLeaderboard, normalizeLabel, finalizeStaleAgent, resolveSessionRoomId } from "./platform.mjs";
 
 const CONDUCTOR_HEARTBEAT_TIMEOUT_MS = 20_000;
 const CONDUCTOR_HEARTBEAT_STALE_MS = 15_000; // mirrors Accordion's STALE_AFTER_MS
@@ -74,6 +74,10 @@ export async function executeRun(args) {
   /** @type {import("../types.ts").RunStatus} */
   let status = "error";
   let statusDetail;
+  // Out-param driveUntilDone mutates when it sees the agent itself call
+  // `slopcode_client ... finalize` — read after the run settles to attribute
+  // platform finalization to the agent vs. the post-run sweep (record.agentFinalized).
+  const driveTelemetry = { sawAgentFinalize: false };
 
   fs.mkdirSync(runDir, { recursive: true });
   const hostTelemetryFile = arm === "none" ? null : path.join(runDir, "host.jsonl");
@@ -120,6 +124,10 @@ export async function executeRun(args) {
         turns: [],
         conductor: null,
         platform: null,
+        // This run never got as far as spawning an agent, so neither finalize
+        // path ever had a chance to run.
+        agentFinalized: false,
+        sweepFinalize: null,
         // hostTelemetryFile is null (not the would-be path): this run never spawned
         // a host, so the file will never exist — matches schedule.mjs's errorRecord
         // convention for never-started runs.
@@ -226,7 +234,7 @@ export async function executeRun(args) {
     // Kick off the agent.
     pi.send({ type: "prompt", message: KICKOFF_PROMPT });
 
-    const outcome = await driveUntilDone({ pi, host, spec, log, label, abortSignal });
+    const outcome = await driveUntilDone({ pi, host, spec, log, label, abortSignal, telemetry: driveTelemetry });
     status = outcome.status;
     statusDetail = outcome.statusDetail;
   } catch (e) {
@@ -370,8 +378,11 @@ export async function executeRun(args) {
   // E_GRADE_PENDING (grading is async and can take a couple of minutes even
   // when healthy) — the run is already over, so that bounded wait here is
   // acceptable and does not block the runner's own model calls.
+  // Its return value is provenance (record.sweepFinalize): "finalized" means
+  // THIS sweep — not the agent — is what closed the platform game.
+  let sweepFinalize = null;
   try {
-    await finalizeStaleAgent({
+    sweepFinalize = await finalizeStaleAgent({
       base: spec.room.base || config.platformBase,
       apiKey,
       workspaceDir,
@@ -381,6 +392,13 @@ export async function executeRun(args) {
     log(`[${label}] finalize sweep error: ${e.message}`);
   }
 
+  // Room-scoped harvest (2026-07-18 investigation): a reused trial name can
+  // collide with an older leaderboard partition, letting harvestLeaderboard
+  // pick a row from a DIFFERENT room. Scope by the room the agent actually
+  // joined (.slopcode_session.json), falling back to this run's pre-assigned
+  // pooled room when the agent never got that far.
+  const harvestRoomId = resolveSessionRoomId(workspaceDir, roomId);
+
   let platform = null;
   try {
     // Always harvest — even a capped/aborted run leaves a non-final leaderboard
@@ -389,6 +407,7 @@ export async function executeRun(args) {
     platform = await harvestLeaderboard({
       base: spec.room.base || config.platformBase,
       label,
+      roomId: harvestRoomId,
       log,
     });
   } catch (e) {
@@ -407,6 +426,11 @@ export async function executeRun(args) {
     }
   }
 
+  // Surface non-agent finalization even when the harvest above found nothing
+  // to append to (e.g. the row wasn't visible yet) — this is about the
+  // finalize CALLER, not the leaderboard row's final flag.
+  statusDetail = appendAgentFinalizeNote(status, statusDetail, driveTelemetry.sawAgentFinalize, sweepFinalize);
+
   /** @type {import("../types.ts").RunRecord} */
   const record = {
     id: label,
@@ -424,6 +448,8 @@ export async function executeRun(args) {
     turns,
     conductor,
     platform,
+    agentFinalized: driveTelemetry.sawAgentFinalize,
+    sweepFinalize,
     artifacts: {
       piSessionFile: sessionFile,
       hostTelemetryFile,
@@ -449,9 +475,13 @@ export async function executeRun(args) {
  * Watch pi's event stream and enforce caps. Resolves with a status.
  * @param {import("node:child_process").ChildProcess | null} [host]  conductor host process, if spawned (see Layer 1, issue #14)
  * @param {AbortSignal} [abortSignal]  external cancellation (see executeRun's jsdoc)
+ * @param {{sawAgentFinalize:boolean}} [telemetry]  optional mutable out-param the
+ *   caller reads after this promise settles (e.g. for record.agentFinalized).
+ *   Kept OUT of the resolved value so the {status, statusDetail} shape driven
+ *   callers/tests already depend on never changes.
  * @returns {Promise<{status:import("../types.ts").RunStatus, statusDetail?:string}>}
  */
-export function driveUntilDone({ pi, host, spec, log, label, abortSignal }) {
+export function driveUntilDone({ pi, host, spec, log, label, abortSignal, telemetry }) {
   return new Promise((resolve) => {
     const deadline = Date.now() + spec.caps.minutes * 60 * 1000;
     // Stall detection must never pre-empt the wall-clock cap. The run contract is
@@ -465,6 +495,7 @@ export function driveUntilDone({ pi, host, spec, log, label, abortSignal }) {
     let settled = false;
     let statsInFlight = false;
     let latestAssistantError = null;
+    let latestAssistantMessage = null;
 
     const finish = (status, statusDetail) => {
       if (settled) return;
@@ -563,6 +594,7 @@ export function driveUntilDone({ pi, host, spec, log, label, abortSignal }) {
       const type = ev && ev.type;
       if (type === "message_end" && ev.message && ev.message.role === "assistant") {
         assistantTurns++;
+        latestAssistantMessage = ev.message;
         if (ev.message.stopReason === "error") {
           latestAssistantError =
             typeof ev.message.errorMessage === "string" && ev.message.errorMessage.trim()
@@ -574,6 +606,13 @@ export function driveUntilDone({ pi, host, spec, log, label, abortSignal }) {
           log(`[${label}] turn cap hit: ${assistantTurns} >= ${spec.caps.turns}`);
           finish("aborted-turns", `${assistantTurns} assistant turns >= cap ${spec.caps.turns}`);
         }
+      } else if (type === "tool_execution_start") {
+        // Agent-issued platform finalize (as opposed to the runner's own
+        // post-run sweep) — tracked here so executeRun can record provenance
+        // (record.agentFinalized) without re-deriving it from the session file.
+        if (telemetry && !telemetry.sawAgentFinalize && looksLikeAgentFinalizeCall(ev.args)) {
+          telemetry.sawAgentFinalize = true;
+        }
       } else if (type === "agent_end") {
         // Pi also emits agent_end between automatic provider retries. Keep driving
         // while willRetry=true; only the final agent_end can settle the run.
@@ -583,6 +622,23 @@ export function driveUntilDone({ pi, host, spec, log, label, abortSignal }) {
         } else if (latestAssistantError) {
           log(`[${label}] terminal model error: ${latestAssistantError}`);
           finish("error", `terminal model error: ${latestAssistantError}`);
+        } else if (isDegenerateAssistantMessage(latestAssistantMessage) && !telemetry?.sawAgentFinalize) {
+          // Sentinel-echo failure mode (2026-07-18 investigation): the final
+          // response is a syntactically normal stop (stopReason "stop", not
+          // "error") whose content is reasoning-only — no text, no tool call.
+          // Pi reports this identically to a genuine success, so without this
+          // check the run is misclassified "completed" and the post-run sweep
+          // finalizes an unfinished game on the agent's behalf.
+          //
+          // Gated on !sawAgentFinalize: a run that already called
+          // `slopcode_client ... finalize` has a legitimate graded result —
+          // a trailing reasoning-only message after that (e.g. the agent
+          // musing post-finalize) must not demote a real completion to error
+          // and drop it from scored aggregates.
+          const detail =
+            "terminal degenerate response: final assistant message has no text and no tool call (reasoning-only stop)";
+          log(`[${label}] ${detail}`);
+          finish("error", detail);
         } else {
           finish("completed");
         }
@@ -614,6 +670,77 @@ export function driveUntilDone({ pi, host, spec, log, label, abortSignal }) {
     pi.on("event", onEvent);
     pi.on("exit", onExit);
   });
+}
+
+/**
+ * True iff `message` is a reasoning-only (or empty) terminal assistant
+ * response: no `toolCall` content block, and no `text` content block whose
+ * text is non-whitespace. A plain-string `content` counts as text — degenerate
+ * only when that string is itself whitespace-only. A falsy `message` (no
+ * assistant message was ever observed for this run) is NOT degenerate, so a
+ * bare `agent_end` with no prior message_end still resolves "completed".
+ * Exported as the unit-testable seam for driveUntilDone's terminal check.
+ * @param {unknown} message
+ * @returns {boolean}
+ */
+export function isDegenerateAssistantMessage(message) {
+  if (!message || typeof message !== "object") return false;
+  const content = message.content;
+  if (typeof content === "string") return content.trim().length === 0;
+  if (!Array.isArray(content)) return true;
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    if (block.type === "toolCall") return false;
+    if (block.type === "text" && typeof block.text === "string" && block.text.trim().length > 0) return false;
+  }
+  return true;
+}
+
+/**
+ * True iff a tool call's arguments look like the agent invoking the SlopCode
+ * client's `finalize` command (case-insensitive substring match over the
+ * serialized args) — e.g. a bash tool call running
+ * `python slopcode_client.py finalize`. Used to distinguish an agent-issued
+ * finalize from the runner's own post-run `finalizeStaleAgent` sweep.
+ * @param {unknown} args  tool_execution_start's `.args`
+ * @returns {boolean}
+ */
+export function looksLikeAgentFinalizeCall(args) {
+  if (args === undefined) return false;
+  let s;
+  try {
+    s = JSON.stringify(args);
+  } catch {
+    return false;
+  }
+  if (typeof s !== "string") return false;
+  s = s.toLowerCase();
+  return s.includes("slopcode_client") && s.includes("finalize");
+}
+
+/**
+ * Append an "agent never invoked platform finalize" note to statusDetail when
+ * a run reports completed but no agent-issued finalize tool call was
+ * observed. The wording depends on what the post-run sweep (finalizeStaleAgent)
+ * actually achieved: on "finalized" it correctly claims the sweep closed the
+ * game; any other result ("no-session" | "failed" | "grade-pending-gave-up" |
+ * null) means the sweep did NOT finalize either, so the note must not
+ * overclaim — it instead reports the sweep's own result string. Follows the
+ * same append pattern as the post-harvest guard (join with "; "). Exported as
+ * the unit-testable seam for executeRun's record-assembly step.
+ * @param {import("../types.ts").RunStatus} status
+ * @param {string|undefined} statusDetail
+ * @param {boolean} sawAgentFinalize
+ * @param {string|null} sweepFinalize  finalizeStaleAgent's return value
+ * @returns {string|undefined}
+ */
+export function appendAgentFinalizeNote(status, statusDetail, sawAgentFinalize, sweepFinalize) {
+  if (status !== "completed" || sawAgentFinalize) return statusDetail;
+  const note =
+    sweepFinalize === "finalized"
+      ? "agent never invoked platform finalize; game finalized by post-run sweep"
+      : `agent never invoked platform finalize; sweep result: ${sweepFinalize}`;
+  return statusDetail ? `${statusDetail}; ${note}` : note;
 }
 
 /**

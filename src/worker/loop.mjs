@@ -492,6 +492,10 @@ function syntheticRecord(claimed, error) {
     turns: [],
     conductor: null,
     platform: null,
+    // This run never got as far as spawning an agent, so neither finalize
+    // path (agent-issued or the post-run sweep) ever had a chance to run.
+    agentFinalized: false,
+    sweepFinalize: null,
     artifacts: { piSessionFile: "", hostTelemetryFile: null, workspaceDir: "", agentDir: "" },
   };
 }

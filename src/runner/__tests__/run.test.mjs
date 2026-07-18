@@ -16,6 +16,9 @@ import {
   buildJoinMeta,
   conductorNeverAttached,
   driveUntilDone,
+  isDegenerateAssistantMessage,
+  looksLikeAgentFinalizeCall,
+  appendAgentFinalizeNote,
 } from "../run.mjs";
 
 class FakePi extends EventEmitter {
@@ -66,6 +69,221 @@ describe("driveUntilDone terminal model errors", () => {
     const outcome = driveUntilDone({ pi, host: null, spec: DRIVER_SPEC, log: () => {}, label: "test" });
     pi.emit("event", { type: "agent_end" });
     await expect(outcome).resolves.toEqual({ status: "completed", statusDetail: undefined });
+  });
+});
+
+describe("driveUntilDone — sentinel-echo / degenerate terminal response (2026-07-18)", () => {
+  it("classifies a thinking-only final assistant message (normal stop) as an error", async () => {
+    const pi = new FakePi();
+    const outcome = driveUntilDone({ pi, host: null, spec: DRIVER_SPEC, log: () => {}, label: "test" });
+
+    pi.emit("event", {
+      type: "message_end",
+      message: {
+        role: "assistant",
+        stopReason: "stop",
+        content: [{ type: "thinking", thinking: "[reasoning unavailable from provider]" }],
+      },
+    });
+    pi.emit("event", { type: "agent_end", willRetry: false });
+
+    await expect(outcome).resolves.toEqual({
+      status: "error",
+      statusDetail:
+        "terminal degenerate response: final assistant message has no text and no tool call (reasoning-only stop)",
+    });
+  });
+
+  it("still completes when the final assistant message carries substantive text", async () => {
+    const pi = new FakePi();
+    const outcome = driveUntilDone({ pi, host: null, spec: DRIVER_SPEC, log: () => {}, label: "test" });
+
+    pi.emit("event", {
+      type: "message_end",
+      message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "All done." }] },
+    });
+    pi.emit("event", { type: "agent_end", willRetry: false });
+
+    await expect(outcome).resolves.toEqual({ status: "completed", statusDetail: undefined });
+  });
+
+  it("still completes when the final assistant message carries a tool call (no text needed)", async () => {
+    const pi = new FakePi();
+    const outcome = driveUntilDone({ pi, host: null, spec: DRIVER_SPEC, log: () => {}, label: "test" });
+
+    pi.emit("event", {
+      type: "message_end",
+      message: {
+        role: "assistant",
+        stopReason: "toolUse",
+        content: [{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: "ls" } }],
+      },
+    });
+    pi.emit("event", { type: "agent_end", willRetry: false });
+
+    await expect(outcome).resolves.toEqual({ status: "completed", statusDetail: undefined });
+  });
+
+  it("tracks an agent-issued platform finalize call via tool_execution_start, without changing the resolved shape", async () => {
+    const pi = new FakePi();
+    const telemetry = { sawAgentFinalize: false };
+    const outcome = driveUntilDone({ pi, host: null, spec: DRIVER_SPEC, log: () => {}, label: "test", telemetry });
+
+    pi.emit("event", {
+      type: "tool_execution_start",
+      toolCallId: "call-1",
+      toolName: "bash",
+      args: { command: "python slopcode_client.py finalize", timeout: 30 },
+    });
+    pi.emit("event", { type: "agent_end" });
+
+    await expect(outcome).resolves.toEqual({ status: "completed", statusDetail: undefined });
+    expect(telemetry.sawAgentFinalize).toBe(true);
+  });
+
+  it("leaves telemetry.sawAgentFinalize false for unrelated tool calls", async () => {
+    const pi = new FakePi();
+    const telemetry = { sawAgentFinalize: false };
+    const outcome = driveUntilDone({ pi, host: null, spec: DRIVER_SPEC, log: () => {}, label: "test", telemetry });
+
+    pi.emit("event", {
+      type: "tool_execution_start",
+      toolCallId: "call-1",
+      toolName: "bash",
+      args: { command: "python slopcode_client.py submit", timeout: 30 },
+    });
+    pi.emit("event", { type: "agent_end" });
+
+    await expect(outcome).resolves.toEqual({ status: "completed", statusDetail: undefined });
+    expect(telemetry.sawAgentFinalize).toBe(false);
+  });
+
+  it("keeps a degenerate terminal message completed when the agent already finalized", async () => {
+    const pi = new FakePi();
+    const telemetry = { sawAgentFinalize: false };
+    const outcome = driveUntilDone({ pi, host: null, spec: DRIVER_SPEC, log: () => {}, label: "test", telemetry });
+
+    pi.emit("event", {
+      type: "tool_execution_start",
+      toolCallId: "call-1",
+      toolName: "bash",
+      args: { command: "python slopcode_client.py finalize", timeout: 30 },
+    });
+    pi.emit("event", {
+      type: "message_end",
+      message: {
+        role: "assistant",
+        stopReason: "stop",
+        content: [{ type: "thinking", thinking: "[reasoning unavailable from provider]" }],
+      },
+    });
+    pi.emit("event", { type: "agent_end", willRetry: false });
+
+    await expect(outcome).resolves.toEqual({ status: "completed", statusDetail: undefined });
+    expect(telemetry.sawAgentFinalize).toBe(true);
+  });
+});
+
+describe("isDegenerateAssistantMessage", () => {
+  it("is false for a falsy message (no assistant message ever observed)", () => {
+    expect(isDegenerateAssistantMessage(null)).toBe(false);
+    expect(isDegenerateAssistantMessage(undefined)).toBe(false);
+  });
+
+  it("is true for thinking-only content", () => {
+    expect(isDegenerateAssistantMessage({ content: [{ type: "thinking", thinking: "..." }] })).toBe(true);
+  });
+
+  it("is true for an empty content array", () => {
+    expect(isDegenerateAssistantMessage({ content: [] })).toBe(true);
+  });
+
+  it("is false when a text block has non-whitespace text", () => {
+    expect(isDegenerateAssistantMessage({ content: [{ type: "text", text: "hi" }] })).toBe(false);
+  });
+
+  it("is true when the only text block is whitespace-only", () => {
+    expect(isDegenerateAssistantMessage({ content: [{ type: "text", text: "   \n" }] })).toBe(true);
+  });
+
+  it("is false when a toolCall block is present, even with no text", () => {
+    expect(isDegenerateAssistantMessage({ content: [{ type: "toolCall", id: "c1", name: "bash" }] })).toBe(false);
+  });
+
+  it("treats a non-whitespace plain-string content as text", () => {
+    expect(isDegenerateAssistantMessage({ content: "All done." })).toBe(false);
+  });
+
+  it("treats a whitespace-only plain-string content as degenerate", () => {
+    expect(isDegenerateAssistantMessage({ content: "   " })).toBe(true);
+  });
+});
+
+describe("looksLikeAgentFinalizeCall", () => {
+  it("matches a bash call running slopcode_client.py finalize", () => {
+    expect(looksLikeAgentFinalizeCall({ command: "python slopcode_client.py finalize", timeout: 30 })).toBe(true);
+  });
+
+  it("is case-insensitive", () => {
+    expect(looksLikeAgentFinalizeCall({ command: "PYTHON SLOPCODE_CLIENT.PY FINALIZE" })).toBe(true);
+  });
+
+  it("does not match an unrelated slopcode_client command", () => {
+    expect(looksLikeAgentFinalizeCall({ command: "python slopcode_client.py submit" })).toBe(false);
+  });
+
+  it("does not match finalize mentioned without slopcode_client", () => {
+    expect(looksLikeAgentFinalizeCall({ command: "echo finalize" })).toBe(false);
+  });
+
+  it("is false for undefined args", () => {
+    expect(looksLikeAgentFinalizeCall(undefined)).toBe(false);
+  });
+});
+
+describe("appendAgentFinalizeNote", () => {
+  it("appends the sweep-succeeded note when completed, the agent never finalized, and the sweep finalized", () => {
+    expect(appendAgentFinalizeNote("completed", undefined, false, "finalized")).toBe(
+      "agent never invoked platform finalize; game finalized by post-run sweep",
+    );
+  });
+
+  it("joins onto existing statusDetail with '; '", () => {
+    expect(appendAgentFinalizeNote("completed", "platform row present but not finalized", false, "finalized")).toBe(
+      "platform row present but not finalized; agent never invoked platform finalize; game finalized by post-run sweep",
+    );
+  });
+
+  it("is a no-op when the agent itself finalized", () => {
+    expect(appendAgentFinalizeNote("completed", "x", true, "finalized")).toBe("x");
+  });
+
+  it("is a no-op for a non-completed status", () => {
+    expect(appendAgentFinalizeNote("error", "some detail", false, "finalized")).toBe("some detail");
+  });
+
+  it("does not overclaim when the sweep failed to finalize", () => {
+    expect(appendAgentFinalizeNote("completed", undefined, false, "failed")).toBe(
+      "agent never invoked platform finalize; sweep result: failed",
+    );
+  });
+
+  it("does not overclaim when the sweep found no session", () => {
+    expect(appendAgentFinalizeNote("completed", undefined, false, "no-session")).toBe(
+      "agent never invoked platform finalize; sweep result: no-session",
+    );
+  });
+
+  it("does not overclaim when the sweep gave up on grade-pending", () => {
+    expect(appendAgentFinalizeNote("completed", undefined, false, "grade-pending-gave-up")).toBe(
+      "agent never invoked platform finalize; sweep result: grade-pending-gave-up",
+    );
+  });
+
+  it("does not overclaim when the sweep itself threw (sweepFinalize null)", () => {
+    expect(appendAgentFinalizeNote("completed", undefined, false, null)).toBe(
+      "agent never invoked platform finalize; sweep result: null",
+    );
   });
 });
 
