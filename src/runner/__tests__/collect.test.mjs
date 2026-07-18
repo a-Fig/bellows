@@ -80,7 +80,7 @@ const SESSION_FIXTURE = [
 ].join("\n");
 
 describe("parseSession", () => {
-  const { usage, turns } = parseSession(SESSION_FIXTURE);
+  const { usage, turns, terminalError } = parseSession(SESSION_FIXTURE);
 
   it("counts exactly the assistant turns", () => {
     expect(usage.assistantTurns).toBe(3);
@@ -119,6 +119,34 @@ describe("parseSession", () => {
 
   it("computePlanRtt is null when no turn carries rttMs", () => {
     expect(computePlanRtt(turns)).toBeNull();
+  });
+
+  it("does not report a terminal error after a normal final assistant message", () => {
+    expect(terminalError).toBeUndefined();
+  });
+
+  it("returns the error message when the last assistant response failed", () => {
+    const failed = [
+      JSON.stringify({
+        type: "message",
+        message: { role: "assistant", content: [], stopReason: "error", errorMessage: "400: bad history" },
+      }),
+    ].join("\n");
+    expect(parseSession(failed).terminalError).toBe("400: bad history");
+  });
+
+  it("clears an earlier retryable error when a later assistant response succeeds", () => {
+    const recovered = [
+      JSON.stringify({
+        type: "message",
+        message: { role: "assistant", content: [], stopReason: "error", errorMessage: "temporary" },
+      }),
+      JSON.stringify({
+        type: "message",
+        message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "endTurn" },
+      }),
+    ].join("\n");
+    expect(parseSession(recovered).terminalError).toBeUndefined();
   });
 });
 

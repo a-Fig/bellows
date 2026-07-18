@@ -298,11 +298,13 @@ export async function executeRun(args) {
   let sessionFile = "";
   let usage;
   let turns;
+  let terminalError;
   try {
     sessionFile = findNewestSessionFile(agentDir) || "";
     const s = collectSession(sessionFile);
     usage = s.usage;
     turns = s.turns;
+    terminalError = s.terminalError;
     // Custom providers (e.g. token-router entries with no cost rates) make pi
     // price every message at $0. If the config carries fallback pricing for
     // this model, estimate the real spend and mark it as an estimate.
@@ -325,6 +327,17 @@ export async function executeRun(args) {
     log(`[${label}] session collect error: ${e.message}`);
     usage = emptyUsage();
     turns = [];
+  }
+
+  // Pi emits agent_end after a terminal provider/model failure too. The live
+  // driver normally catches the assistant message_end error, but retain a
+  // persisted-session guard so an event-stream race or older Pi build can
+  // never turn stopReason=error into a gradeable "completed" run.
+  if (status === "completed" && terminalError) {
+    const detail = `terminal model error: ${terminalError}`;
+    log(`[${label}] integrity guard: ${detail} — forcing status=error`);
+    status = "error";
+    statusDetail = statusDetail ? `${statusDetail}; ${detail}` : detail;
   }
 
   let conductor = null;
@@ -438,7 +451,7 @@ export async function executeRun(args) {
  * @param {AbortSignal} [abortSignal]  external cancellation (see executeRun's jsdoc)
  * @returns {Promise<{status:import("../types.ts").RunStatus, statusDetail?:string}>}
  */
-function driveUntilDone({ pi, host, spec, log, label, abortSignal }) {
+export function driveUntilDone({ pi, host, spec, log, label, abortSignal }) {
   return new Promise((resolve) => {
     const deadline = Date.now() + spec.caps.minutes * 60 * 1000;
     // Stall detection must never pre-empt the wall-clock cap. The run contract is
@@ -451,6 +464,7 @@ function driveUntilDone({ pi, host, spec, log, label, abortSignal }) {
     let lastStatsAt = 0;
     let settled = false;
     let statsInFlight = false;
+    let latestAssistantError = null;
 
     const finish = (status, statusDetail) => {
       if (settled) return;
@@ -549,16 +563,29 @@ function driveUntilDone({ pi, host, spec, log, label, abortSignal }) {
       const type = ev && ev.type;
       if (type === "message_end" && ev.message && ev.message.role === "assistant") {
         assistantTurns++;
+        if (ev.message.stopReason === "error") {
+          latestAssistantError =
+            typeof ev.message.errorMessage === "string" && ev.message.errorMessage.trim()
+              ? ev.message.errorMessage.trim()
+              : "model response ended with stopReason=error";
+        } else latestAssistantError = null;
         void maybePollCost();
         if (assistantTurns >= spec.caps.turns) {
           log(`[${label}] turn cap hit: ${assistantTurns} >= ${spec.caps.turns}`);
           finish("aborted-turns", `${assistantTurns} assistant turns >= cap ${spec.caps.turns}`);
         }
       } else if (type === "agent_end") {
-        // Agent loop finished for this prompt. Without a follow-up, the agent has
-        // stopped — mark completed. The leaderboard harvest is the score of record.
+        // Pi also emits agent_end between automatic provider retries. Keep driving
+        // while willRetry=true; only the final agent_end can settle the run.
         void maybePollCost();
-        finish("completed");
+        if (ev.willRetry === true) {
+          log(`[${label}] model response failed; pi will retry automatically`);
+        } else if (latestAssistantError) {
+          log(`[${label}] terminal model error: ${latestAssistantError}`);
+          finish("error", `terminal model error: ${latestAssistantError}`);
+        } else {
+          finish("completed");
+        }
       }
     };
 

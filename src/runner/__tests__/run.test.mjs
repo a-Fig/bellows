@@ -1,4 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,7 +15,59 @@ import {
   modelShortName,
   buildJoinMeta,
   conductorNeverAttached,
+  driveUntilDone,
 } from "../run.mjs";
+
+class FakePi extends EventEmitter {
+  async getSessionStats() {
+    return { cost: 0, tokens: { total: 1 } };
+  }
+}
+
+const DRIVER_SPEC = { caps: { minutes: 1, turns: 100, costUsd: 10 } };
+
+describe("driveUntilDone terminal model errors", () => {
+  it("classifies an assistant stopReason=error on the final agent_end", async () => {
+    const pi = new FakePi();
+    const outcome = driveUntilDone({ pi, host: null, spec: DRIVER_SPEC, log: () => {}, label: "test" });
+
+    pi.emit("event", {
+      type: "message_end",
+      message: { role: "assistant", stopReason: "error", errorMessage: "400: reasoning_content is required" },
+    });
+    pi.emit("event", { type: "agent_end", willRetry: false });
+
+    await expect(outcome).resolves.toEqual({
+      status: "error",
+      statusDetail: "terminal model error: 400: reasoning_content is required",
+    });
+  });
+
+  it("waits through a retryable model error and completes after a successful retry", async () => {
+    const pi = new FakePi();
+    const outcome = driveUntilDone({ pi, host: null, spec: DRIVER_SPEC, log: () => {}, label: "test" });
+
+    pi.emit("event", {
+      type: "message_end",
+      message: { role: "assistant", stopReason: "error", errorMessage: "429: retry me" },
+    });
+    pi.emit("event", { type: "agent_end", willRetry: true });
+    pi.emit("event", {
+      type: "message_end",
+      message: { role: "assistant", stopReason: "endTurn", content: [{ type: "text", text: "done" }] },
+    });
+    pi.emit("event", { type: "agent_end", willRetry: false });
+
+    await expect(outcome).resolves.toEqual({ status: "completed", statusDetail: undefined });
+  });
+
+  it("still treats a normal agent_end as completed", async () => {
+    const pi = new FakePi();
+    const outcome = driveUntilDone({ pi, host: null, spec: DRIVER_SPEC, log: () => {}, label: "test" });
+    pi.emit("event", { type: "agent_end" });
+    await expect(outcome).resolves.toEqual({ status: "completed", statusDetail: undefined });
+  });
+});
 
 describe("hostEntryForAccordion", () => {
   it("selects the v15 controller for a truth-in-extension checkout", () => {
