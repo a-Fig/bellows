@@ -44,6 +44,9 @@ async function httpJson(url, { method = "GET", headers = {}, body, timeoutMs = 3
  * @param {object} args
  * @param {string} args.base
  * @param {string} args.label
+ * @param {string} [args.roomId]  when set, scope the picked row to this room
+ *   (see pickLeaderboardRow) — guards against a reused trial name colliding
+ *   with an older leaderboard partition from a DIFFERENT room.
  * @param {number} [args.timeoutTotalMs]  overall budget (default ~5 min — grading
  *   is platform-capped at ~3 concurrent, so under parallel runs a just-submitted
  *   grade can take minutes to land on the board)
@@ -54,6 +57,7 @@ async function httpJson(url, { method = "GET", headers = {}, body, timeoutMs = 3
 export async function harvestLeaderboard({
   base,
   label,
+  roomId,
   timeoutTotalMs = 300_000,
   pollIntervalMs = 18_000,
   log = () => {},
@@ -70,6 +74,10 @@ export async function harvestLeaderboard({
   let attempt = 0;
   /** @type {import("../types.ts").PlatformResult | null} */
   let lastPartial = null;
+  // True once a poll saw label-matching rows that were all filtered out by
+  // roomId — distinct from "no rows at all", so the give-up log can name the
+  // actual cause (cross-room collision) instead of a generic "no row" message.
+  let roomMismatch = false;
   while (Date.now() < deadline) {
     attempt++;
     let rows = [];
@@ -80,13 +88,15 @@ export async function harvestLeaderboard({
     } catch (e) {
       log(`[platform] leaderboard fetch error: ${e.message}`);
     }
-    const result = pickLeaderboardRow(rows);
+    const result = pickLeaderboardRow(rows, roomId);
     if (result) {
       lastPartial = result;
       // A finalized row is the answer of record; return immediately. Otherwise
       // keep polling (a final row may still appear) but retain the partial.
       const isFinal = result.raw && result.raw.final === true;
       if (isFinal) return result;
+    } else if (roomId && rows.length > 0) {
+      roomMismatch = true;
     }
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
@@ -96,6 +106,8 @@ export async function harvestLeaderboard({
   // still emit non-final leaderboard snapshots per graded submission), or null.
   if (lastPartial) {
     log(`[platform] label "${q}": only a non-final row after ${attempt} poll(s) — recording as partial`);
+  } else if (roomMismatch) {
+    log(`[harvest] no leaderboard row for room ${roomId}; refusing cross-room row`);
   } else {
     log(`[platform] no leaderboard row for label "${q}" after ${attempt} attempt(s)`);
   }
@@ -111,16 +123,33 @@ export function normalizeLabel(label) {
  * Reduce a set of leaderboard rows (already filtered by label) to one
  * PlatformResult. Prefers a finalized (final:true) row; falls back to the
  * highest-scoring row. Returns null for an empty set.
+ *
  * @param {any[]} rows
+ * @param {string} [roomId]  when provided AND at least one row carries a
+ *   `room_id` field, only rows whose `room_id` matches are considered — if
+ *   none match, returns null rather than falling back to a row from a
+ *   different room. This guards against a reused trial name colliding with an
+ *   older leaderboard partition (observed live: a stale room's row was
+ *   harvested for a differently-scoped current run). When roomId is omitted,
+ *   or no row in the set carries a `room_id` at all (older platform
+ *   responses), behavior is exactly the legacy label-only selection.
  * @returns {import("../types.ts").PlatformResult | null}
  */
-export function pickLeaderboardRow(rows) {
+export function pickLeaderboardRow(rows, roomId) {
   if (!Array.isArray(rows) || rows.length === 0) return null;
-  const finals = rows.filter((r) => r && r.final === true);
-  const pool = finals.length ? finals : rows;
+  let pool = rows;
+  if (roomId) {
+    const anyHasRoomId = rows.some((r) => r && r.room_id !== undefined && r.room_id !== null);
+    if (anyHasRoomId) {
+      pool = rows.filter((r) => r && str(r.room_id) === str(roomId));
+      if (pool.length === 0) return null;
+    }
+  }
+  const finals = pool.filter((r) => r && r.final === true);
+  const scoped = finals.length ? finals : pool;
   // Highest run_score wins ties; treat null score as -Infinity.
   const score = (r) => (typeof r.run_score === "number" ? r.run_score : -Infinity);
-  const row = pool.reduce((best, r) => (score(r) > score(best) ? r : best), pool[0]);
+  const row = scoped.reduce((best, r) => (score(r) > score(best) ? r : best), scoped[0]);
   return {
     gameId: str(row.game_id),
     roomId: str(row.room_id),
@@ -221,6 +250,29 @@ export async function probeRoomJoinable({ base, apiKey, roomId, probeName: _prob
 
 export function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Read the room id the agent actually joined from `.slopcode_session.json`
+ * (`room_id`) — the same file finalizeStaleAgent reads. This is the
+ * authoritative room for a run once the agent has joined, and is what a
+ * room-scoped leaderboard harvest should filter by. Falls back to
+ * `fallbackRoomId` (the run's pre-assigned pooled room) when the file is
+ * missing, unparsable, or lacks `room_id` — e.g. the agent never got as far
+ * as joining. Never throws.
+ * @param {string} workspaceDir
+ * @param {string} [fallbackRoomId]
+ * @returns {string|undefined}
+ */
+export function resolveSessionRoomId(workspaceDir, fallbackRoomId) {
+  try {
+    const raw = fs.readFileSync(path.join(workspaceDir, ".slopcode_session.json"), "utf8");
+    const session = JSON.parse(raw);
+    if (session && session.room_id) return String(session.room_id);
+  } catch {
+    /* no session file yet / agent never joined — fall back below */
+  }
+  return fallbackRoomId;
 }
 
 /**
