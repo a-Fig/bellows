@@ -13,6 +13,13 @@ import { REPO_ROOT, splitModel } from "./config.mjs";
 
 export const TEMPLATE_DIR = path.join(REPO_ROOT, "templates", "workspace");
 export const BRIEFING_TMPL = path.join(TEMPLATE_DIR, "AGENT_BRIEFING.md.tmpl");
+export const DEEPSEEK_REPLAY_EXTENSION = path.join(
+  REPO_ROOT,
+  "src",
+  "runner",
+  "extensions",
+  "deepseekReplayCompat.mjs",
+);
 
 /** The kickoff prompt sent over RPC to start the agent. Stable string. */
 export const KICKOFF_PROMPT =
@@ -108,7 +115,10 @@ export function buildSettings({ model, thinkingLevel, accordionRepo }) {
     defaultModel: modelId,
     defaultThinkingLevel: thinkingLevel,
     compaction: { enabled: false },
-    extensions: [path.join(accordionRepo, "extension", "accordion.ts").split(path.sep).join("/")],
+    extensions: [
+      path.join(accordionRepo, "extension", "accordion.ts").split(path.sep).join("/"),
+      DEEPSEEK_REPLAY_EXTENSION.split(path.sep).join("/"),
+    ],
   };
 }
 
