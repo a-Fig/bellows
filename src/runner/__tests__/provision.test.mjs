@@ -148,7 +148,7 @@ describe("renderBriefing", () => {
 });
 
 describe("buildSettings", () => {
-  it("splits provider:model, disables compaction, wires the accordion extension", () => {
+  it("splits provider:model, disables compaction, and wires both runtime extensions", () => {
     const s = buildSettings({
       model: "token-router:deepseek/deepseek-v4-flash",
       thinkingLevel: "medium",
@@ -163,6 +163,7 @@ describe("buildSettings", () => {
     expect(s.defaultThinkingLevel).toBe("medium");
     expect(s.compaction).toEqual({ enabled: false });
     expect(s.extensions[0]).toContain("extension/accordion.ts");
+    expect(s.extensions[1]).toContain("src/runner/extensions/deepseekReplayCompat.mjs");
   });
 
   it("points the accordion extension at the EFFECTIVE repo (a pinned accordionRef worktree)", () => {
