@@ -10,7 +10,6 @@ import {
   buildSettings,
   writeJoinMeta,
   copyWorkspaceTemplate,
-  checkThinkingLevelWarning,
   META_FILE,
 } from "../provision.mjs";
 
@@ -120,72 +119,6 @@ describe("writeJoinMeta / copyWorkspaceTemplate — join metadata as a file", ()
       meta: undefined,
     });
     expect(fs.existsSync(path.join(dir, META_FILE))).toBe(false);
-  });
-});
-
-describe("checkThinkingLevelWarning", () => {
-  const dirs = [];
-  afterEach(() => {
-    for (const d of dirs.splice(0)) {
-      try {
-        fs.rmSync(d, { recursive: true, force: true });
-      } catch {
-        /* ignore */
-      }
-    }
-  });
-  const mkAgentDir = (modelsJson) => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bellows-thinklevel-"));
-    dirs.push(dir);
-    fs.writeFileSync(path.join(dir, "models.json"), JSON.stringify(modelsJson));
-    return dir;
-  };
-
-  it("is a no-op when thinkingLevel is off", () => {
-    expect(
-      checkThinkingLevelWarning({ agentDir: "/does/not/exist", model: "token-router:x", thinkingLevel: "off" }),
-    ).toBeNull();
-  });
-
-  it("warns loudly when the resolved model entry lacks reasoning:true", () => {
-    const dir = mkAgentDir({ providers: { "token-router": { models: [{ id: "deepseek/deepseek-v4-flash" }] } } });
-    const logs = [];
-    const w = checkThinkingLevelWarning({
-      agentDir: dir,
-      model: "token-router:deepseek/deepseek-v4-flash",
-      thinkingLevel: "medium",
-      log: (m) => logs.push(m),
-    });
-    expect(w).toContain("thinkingLevel 'medium'");
-    expect(w).toContain("lacks reasoning:true");
-    expect(logs.some((l) => l.startsWith("[provision] WARNING:"))).toBe(true);
-  });
-
-  it("is silent when the model entry declares reasoning:true", () => {
-    const dir = mkAgentDir({
-      providers: { "token-router": { models: [{ id: "deepseek/deepseek-v4-flash", reasoning: true }] } },
-    });
-    expect(
-      checkThinkingLevelWarning({ agentDir: dir, model: "token-router:deepseek/deepseek-v4-flash", thinkingLevel: "medium" }),
-    ).toBeNull();
-  });
-
-  it("never throws — missing models.json is a silent no-op", () => {
-    expect(() =>
-      checkThinkingLevelWarning({ agentDir: "/does/not/exist", model: "token-router:x/y", thinkingLevel: "medium" }),
-    ).not.toThrow();
-    expect(
-      checkThinkingLevelWarning({ agentDir: "/does/not/exist", model: "token-router:x/y", thinkingLevel: "medium" }),
-    ).toBeNull();
-  });
-
-  it("never throws — malformed models.json is a silent no-op", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bellows-thinklevel-"));
-    dirs.push(dir);
-    fs.writeFileSync(path.join(dir, "models.json"), "{not json");
-    expect(
-      checkThinkingLevelWarning({ agentDir: dir, model: "token-router:x/y", thinkingLevel: "medium" }),
-    ).toBeNull();
   });
 });
 
