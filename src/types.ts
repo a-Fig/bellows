@@ -94,7 +94,7 @@ export interface RoomSupply {
 // ---------------------------------------------------------------------------
 
 export type RunStatus =
-  | "completed"        // agent finalized on the platform
+  | "completed"        // agent loop ended normally with a substantive final message; see agentFinalized/sweepFinalize in the record for platform finalization provenance
   | "aborted-cost"     // cost cap hit
   | "aborted-turns"    // turn cap hit
   | "aborted-time"     // wall-clock cap hit
@@ -123,6 +123,24 @@ export interface RunRecord {
   conductor: ConductorTelemetry | null;
   /** Platform outcome pulled by label. Null if the run never finalized. */
   platform: PlatformResult | null;
+  /**
+   * True iff the agent itself was observed invoking a `slopcode_client`
+   * `finalize` tool call (case-insensitive substring match over the tool
+   * call's serialized args). False means any platform finalization for this
+   * run came from the runner's own post-run sweep, not the agent — see
+   * `sweepFinalize`.
+   */
+  agentFinalized: boolean;
+  /**
+   * Result of the post-run `finalizeStaleAgent` sweep: "finalized" |
+   * "no-session" | "failed" | "grade-pending-gave-up", or null if the sweep
+   * itself threw before returning a result.
+   */
+  sweepFinalize: string | null;
+  /** Best-effort non-fatal warnings surfaced during provisioning (e.g. a
+   * requested thinkingLevel that models.json cannot honor). Absent/empty when
+   * there are none. */
+  warnings?: string[];
   /** Provenance pointers for debugging. */
   artifacts: {
     piSessionFile: string;
