@@ -234,7 +234,25 @@ export async function executeRun(args) {
     statusDetail = `run driver failed: ${e && e.stack ? e.stack.split("\n")[0] : String(e)}`;
     log(`[${label}] ERROR: ${statusDetail}`);
   } finally {
-    // Teardown: pi first (abort + close), then host.
+    const stopHost = async () => {
+      if (host && host.exitCode === null && !host.killed) {
+        host.kill("SIGTERM");
+        await waitProc(host, 5_000);
+        if (host.exitCode === null) host.kill("SIGKILL");
+      }
+    };
+    // The v15 controller owns resident extension state. Stop it while the
+    // extension socket is still alive so POSIX workers can disarm/detach
+    // cleanly; on Windows the child is terminated directly and pi follows
+    // immediately. Legacy hosts retain their established pi-first ordering.
+    const v15Host = hostEntryForAccordion(effConfig.accordionRepo) === "src/host/main-v15.ts";
+    if (v15Host) {
+      try {
+        await stopHost();
+      } catch (e) {
+        log(`[${label}] host teardown error: ${e.message}`);
+      }
+    }
     try {
       if (pi && !pi.exited) {
         await pi.abort();
@@ -243,14 +261,12 @@ export async function executeRun(args) {
     } catch (e) {
       log(`[${label}] pi teardown error: ${e.message}`);
     }
-    try {
-      if (host && host.exitCode === null && !host.killed) {
-        host.kill("SIGTERM");
-        await waitProc(host, 5_000);
-        if (host.exitCode === null) host.kill("SIGKILL");
+    if (!v15Host) {
+      try {
+        await stopHost();
+      } catch (e) {
+        log(`[${label}] host teardown error: ${e.message}`);
       }
-    } catch (e) {
-      log(`[${label}] host teardown error: ${e.message}`);
     }
     // The external conductor is killed AFTER the host so the host's WS close is a
     // clean session-end rather than racing a dropped conductor connection.
@@ -633,7 +649,7 @@ export function spawnHost({ config, arm, armDispatch, conductorUrl, spec, accord
     path.join(BELLOWS_ROOT, "node_modules", "vite-node", "vite-node.mjs"),
     "--config",
     "vite-node.config.ts",
-    "src/host/main.ts",
+    hostEntryForAccordion(config.accordionRepo),
     "--",
     "--accordion-home",
     accordionHome,
@@ -667,6 +683,13 @@ export function spawnHost({ config, arm, armDispatch, conductorUrl, spec, accord
   child.stderr.on("data", (d) => hostLog.write(d));
   child.on("error", (e) => log(`[host] spawn error: ${e.message}`));
   return child;
+}
+
+/** Select the protocol-v15 controller for truth-in-extension checkouts. */
+export function hostEntryForAccordion(accordionRepo) {
+  return typeof accordionRepo === "string" && fs.existsSync(path.join(accordionRepo, "core", "protocol.ts"))
+    ? "src/host/main-v15.ts"
+    : "src/host/main.ts";
 }
 
 /**
