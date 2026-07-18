@@ -5,8 +5,18 @@
  * non-empty reasoning_content value. Occasionally the provider itself emits a
  * direct tool call without one; the next request then rejects that history.
  * Keep the repair provider-specific and leave already-valid replay data intact.
+ *
+ * The sentinel is a single space, not a natural-language phrase. An earlier
+ * version used "[reasoning unavailable from provider]"; that string entered
+ * model-visible replay history and the model degenerated into echoing it back
+ * as its entire terminal response (thinking-only, no text, no tool call) —
+ * see reports/2026-07-18-devmain-xjq-premature-stop-investigation.md. A
+ * single space satisfies DeepSeek's non-empty presence validation without
+ * giving the model a semantic string to latch onto. (pi core injects `""` for
+ * this same compat case, but empty-string validation via the TokenRouter
+ * gateway is unverified, so stay non-empty.)
  */
-export const MISSING_REASONING_SENTINEL = "[reasoning unavailable from provider]";
+export const MISSING_REASONING_SENTINEL = " ";
 
 /**
  * @param {unknown} payload
