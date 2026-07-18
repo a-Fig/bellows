@@ -135,11 +135,12 @@ export function buildSettings({ model, thinkingLevel, accordionRepo }) {
  * @param {object} [args.meta]              optional join metadata (display_name/model/conductor/
  *   trial/seed) written to workspace/.slopcode_meta.json and surfaced on the leaderboard in
  *   place of the raw agent name — see writeJoinMeta.
+ * @param {(m:string)=>void} [args.log]
  * @returns {{ workspaceDir:string, agentDir:string, accordionHome:string,
- *             briefing:string, settings:object }}
+ *             briefing:string, settings:object, warnings:string[] }}
  */
 export function provisionRun(args) {
-  const { runDir, spec, config, roomId, agentName, runLabel, apiKey, meta } = args;
+  const { runDir, spec, config, roomId, agentName, runLabel, apiKey, meta, log = () => {} } = args;
   const workspaceDir = path.join(runDir, "workspace");
   const agentDir = path.join(runDir, "agent");
   const accordionHome = path.join(runDir, "accordion-home");
@@ -155,16 +156,56 @@ export function provisionRun(args) {
   copyWorkspaceTemplate(workspaceDir, { base: config.platformBase, apiKey, briefing, meta });
 
   // 2. agent dir: settings + copied credentials.
+  const thinkingLevel = spec.thinkingLevel || "medium";
   const settings = buildSettings({
     model: spec.model,
-    thinkingLevel: spec.thinkingLevel || "medium",
+    thinkingLevel,
     accordionRepo: config.accordionRepo,
   });
   fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify(settings, null, 2));
   copyCredential(config.piAgentDir, agentDir, "auth.json");
   copyCredential(config.piAgentDir, agentDir, "models.json");
 
-  return { workspaceDir, agentDir, accordionHome, briefing, settings };
+  const warnings = [];
+  const thinkingWarning = checkThinkingLevelWarning({ agentDir, model: spec.model, thinkingLevel, log });
+  if (thinkingWarning) warnings.push(thinkingWarning);
+
+  return { workspaceDir, agentDir, accordionHome, briefing, settings, warnings };
+}
+
+/**
+ * Best-effort diagnostic: does the just-copied models.json declare
+ * `reasoning:true` for this run's model when a non-"off" thinkingLevel was
+ * requested? If not, pi clamps thinking to off regardless of settings.json's
+ * defaultThinkingLevel, silently diverging from what the trial asked for
+ * (found alongside — not the cause of — the 2026-07-18 sentinel-echo false
+ * completions; see reports/2026-07-18-devmain-xjq-premature-stop-investigation.md).
+ *
+ * Diagnostics only: never throws, and a malformed/missing models.json or an
+ * unresolvable model just means no warning is produced.
+ * @param {object} args
+ * @param {string} args.agentDir    directory containing the just-copied models.json
+ * @param {string} args.model       "provider:modelId"
+ * @param {string} args.thinkingLevel
+ * @param {(m:string)=>void} [args.log]
+ * @returns {string|null} the warning text (already logged), or null
+ */
+export function checkThinkingLevelWarning({ agentDir, model, thinkingLevel, log = () => {} }) {
+  if (thinkingLevel === "off") return null;
+  try {
+    const { provider, modelId } = splitModel(model);
+    const parsed = JSON.parse(fs.readFileSync(path.join(agentDir, "models.json"), "utf8"));
+    const providerModels = parsed?.providers?.[provider]?.models;
+    const modelEntry = Array.isArray(providerModels) ? providerModels.find((m) => m && m.id === modelId) : undefined;
+    if (modelEntry && modelEntry.reasoning === true) return null;
+    const warning =
+      `thinkingLevel '${thinkingLevel}' requested but models.json entry for ${model} lacks reasoning:true — pi will clamp thinking to off`;
+    log(`[provision] WARNING: ${warning}`);
+    return warning;
+  } catch {
+    // Never fail provisioning over a diagnostics-only check.
+    return null;
+  }
 }
 
 /** Copy the committed workspace template into dest, rendering placeholders. */
