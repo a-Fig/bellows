@@ -81,10 +81,17 @@ describe.skipIf(!GIT_OK)("maybeSelfUpdate", () => {
     expect(fs.readFileSync(path.join(cloneRepo, "a.txt"), "utf8")).toBe("local edit, uncommitted");
   });
 
-  it("an untracked file also counts as dirty (git status --porcelain, not just modified-tracked)", async () => {
-    fs.writeFileSync(path.join(cloneRepo, "untracked.txt"), "new file");
+  it("an untracked file does NOT count as dirty — operator-local files (trial YAMLs, logs) must not pin a worker to old code", async () => {
+    fs.writeFileSync(path.join(cloneRepo, "untracked.txt"), "operator-local file");
+    fs.writeFileSync(path.join(originRepo, "a.txt"), "two");
+    run(originRepo, ["add", "-A"]);
+    run(originRepo, ["commit", "-q", "-m", "second"]);
+
     const result = await maybeSelfUpdate({ repoRoot: cloneRepo, log: () => {} });
-    expect(result).toEqual({ action: "skipped", reason: "dirty working tree" });
+
+    expect(result.action).toBe("updated");
+    // the untracked file survives the fast-forward untouched
+    expect(fs.readFileSync(path.join(cloneRepo, "untracked.txt"), "utf8")).toBe("operator-local file");
   });
 
   it("non-main branch -> skipped, never yanks a feature branch checkout", async () => {
