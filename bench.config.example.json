@@ -1,12 +1,12 @@
 {
-  "accordionRepo": "C:/Users/smash/Desktop/Claude Work Space/Accordion-Public",
-  "platformBase": "https://agent-trials-407493014719.us-west1.run.app",
+  "accordionRepo": "C:/Users/you/path/to/Accordion",
+  "platformBase": "https://your-agent-trials-instance.example.com",
   "platformApiKeyEnv": "AGENT_TRIALS_API_KEY",
-  "piAgentDir": "C:/Users/smash/.pi/agent",
+  "piAgentDir": "C:/Users/you/.pi/agent",
   "runsDir": "./runs",
   "worker": {
-    "platformUrl": "https://agent-trials-407493014719.us-west1.run.app",
-    "name": "homeserver-1",
+    "platformUrl": "https://your-agent-trials-instance.example.com",
+    "name": "worker-1",
     "caps": ["in-process", "external-conductors"],
     "pullBeforeClaim": false,
     "parallel": 1
