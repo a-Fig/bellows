@@ -283,7 +283,7 @@ Add a `worker` section to `bench.config.json`:
 ```json
 {
   "worker": {
-    "platformUrl": "https://agent-trials-407493014719.us-west1.run.app",
+    "platformUrl": "https://your-agent-trials-instance.example.com",
     "name": "homeserver-1",
     "caps": ["in-process", "external-conductors"],
     "pullBeforeClaim": false,

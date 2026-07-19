@@ -1,5 +1,7 @@
 node_modules/
 runs/
+reports/
+*.log
 bench.config.json
 *.local.json
 secrets*
