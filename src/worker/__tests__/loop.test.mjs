@@ -60,6 +60,13 @@ function baseConfig(runsDir, platformUrl) {
       caps: ["in-process"],
       pullBeforeClaim: false,
       parallel: 1,
+      // autoUpdate defaults to true; these tests aren't about self-update and
+      // don't inject a maybeSelfUpdateFn, so leaving it enabled would run the
+      // REAL maybeSelfUpdate against THIS repo's own checkout (REPO_ROOT) on
+      // every iteration of every test in this file. Disabled here; the
+      // dedicated "self-update wiring" describe block below re-enables it
+      // per-test alongside an injected fake.
+      autoUpdate: false,
     },
   };
 }
@@ -447,5 +454,241 @@ describe("runWorkerLoop", { timeout: 20_000 }, () => {
       expect(maybePullAccordion).not.toHaveBeenCalled();
       expect(clearConductorCache).not.toHaveBeenCalled();
     }, 20_000);
+  });
+
+  it("claim body carries a `version` field (this worker's own short HEAD sha) alongside caps/conductors", async () => {
+    // currentHeadShort runs for real here (read-only `git rev-parse`, no
+    // side effects either way) — assert it's either a well-formed short sha
+    // or omitted entirely (best-effort: git may be unavailable in some CI
+    // sandboxes), never anything else.
+    platform.onClaim = () => ({ status: 204 });
+    await runWorkerLoop({ config: baseConfig(runsDir, platform.url), apiKey: SECRET, log, once: true, executeRunFn: vi.fn() });
+    const claimReq = platform.requests.find((r) => r.url === "/api/bench/workers/claim");
+    expect(claimReq).toBeTruthy();
+    if ("version" in claimReq.body) {
+      expect(claimReq.body.version).toMatch(/^[0-9a-f]{12}$/);
+    }
+  });
+
+  describe("self-update wiring", () => {
+    function selfUpdateConfig({ autoUpdate = true } = {}) {
+      const cfg = baseConfig(runsDir, platform.url);
+      cfg.worker.autoUpdate = autoUpdate;
+      return cfg;
+    }
+
+    afterEach(() => {
+      delete process.env.BELLOWS_NO_SELF_UPDATE;
+    });
+
+    it("startup check: an 'updated' result exits BEFORE the very first claim ever happens", async () => {
+      let claims = 0;
+      platform.onClaim = () => {
+        claims++;
+        return { status: 204 };
+      };
+      const fakeSelfUpdate = vi.fn(async () => ({ action: "updated", from: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", to: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }));
+
+      const summary = await runWorkerLoop({
+        config: selfUpdateConfig(),
+        apiKey: SECRET,
+        log,
+        executeRunFn: vi.fn(),
+        maybeSelfUpdateFn: fakeSelfUpdate,
+      });
+
+      expect(claims).toBe(0); // never claimed — self-update exited first
+      expect(summary).toEqual({ claimed: 0, completed: 0, failed: 0 });
+      expect(fakeSelfUpdate).toHaveBeenCalledTimes(1);
+      expect(logs.join("\n")).toMatch(/self-update: aaaaaaaaaaaa→bbbbbbbbbbbb — exiting for supervisor relaunch/);
+    });
+
+    it("after-run checkpoint: an 'updated' result following a completed run exits before the NEXT claim", async () => {
+      _timing.selfUpdateThrottleMs = 0; // never throttled — deterministic re-fire at the after-run checkpoint
+      let claims = 0;
+      platform.onClaim = () => {
+        claims++;
+        if (claims === 1) return { status: 200, body: { run: claimedRunFixture() } };
+        return { status: 204 }; // must never be reached
+      };
+      platform.onComplete = () => ({ status: 200, body: { ok: true } });
+
+      let selfUpdateCalls = 0;
+      const fakeSelfUpdate = vi.fn(async () => {
+        selfUpdateCalls++;
+        if (selfUpdateCalls === 1) return { action: "current" }; // the startup check
+        return { action: "updated", from: "a".repeat(40), to: "b".repeat(40) }; // the after-run check
+      });
+
+      const fakeExecutor = vi.fn(async ({ runDir }) => {
+        fs.mkdirSync(runDir, { recursive: true });
+        return {
+          id: "run-1",
+          label: "t1/keel/1",
+          status: "completed",
+          fingerprint: { conductorId: "keel" },
+          timing: { startedAt: "2026-01-01T00:00:00.000Z", endedAt: "2026-01-01T00:01:00.000Z", wallClockS: 60 },
+          usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, costUsd: 0, assistantTurns: 1, toolCalls: 0 },
+          turns: [],
+          conductor: null,
+          platform: null,
+          artifacts: { piSessionFile: "", hostTelemetryFile: null, workspaceDir: runDir, agentDir: runDir },
+        };
+      });
+
+      const summary = await runWorkerLoop({
+        config: selfUpdateConfig(),
+        apiKey: SECRET,
+        log,
+        executeRunFn: fakeExecutor,
+        maybeSelfUpdateFn: fakeSelfUpdate,
+        maxIterations: 5,
+      });
+
+      expect(claims).toBe(1); // the second (204) claim never happened
+      expect(summary).toEqual({ claimed: 1, completed: 1, failed: 0 });
+      expect(fakeSelfUpdate).toHaveBeenCalledTimes(2);
+    });
+
+    it("a 'skipped' result never blocks the loop from claiming normally", async () => {
+      platform.onClaim = () => ({ status: 200, body: { run: claimedRunFixture() } });
+      platform.onComplete = () => ({ status: 200, body: { ok: true } });
+      const fakeSelfUpdate = vi.fn(async () => ({ action: "skipped", reason: "dirty working tree" }));
+      const fakeExecutor = vi.fn(async ({ runDir }) => {
+        fs.mkdirSync(runDir, { recursive: true });
+        return {
+          id: "run-1",
+          label: "t1/keel/1",
+          status: "completed",
+          fingerprint: { conductorId: "keel" },
+          timing: { startedAt: "2026-01-01T00:00:00.000Z", endedAt: "2026-01-01T00:01:00.000Z", wallClockS: 60 },
+          usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, costUsd: 0, assistantTurns: 1, toolCalls: 0 },
+          turns: [],
+          conductor: null,
+          platform: null,
+          artifacts: { piSessionFile: "", hostTelemetryFile: null, workspaceDir: runDir, agentDir: runDir },
+        };
+      });
+
+      const summary = await runWorkerLoop({ config: selfUpdateConfig(), apiKey: SECRET, log, once: true, executeRunFn: fakeExecutor, maybeSelfUpdateFn: fakeSelfUpdate });
+      expect(summary).toEqual({ claimed: 1, completed: 1, failed: 0 });
+      expect(fakeSelfUpdate).toHaveBeenCalledTimes(1); // the startup check only — `once` returns before the after-run checkpoint
+      // m2 (adversarial review): skips log at WARN level — a permanently-skipping
+      // worker is silently pinned to old code, exactly the drift this feature exists to stop.
+      expect(logs.join("\n")).toMatch(/WARN: self-update skipped \(dirty working tree\) — this worker will not auto-update/);
+    });
+
+    it("throttles repeat checks: back-to-back idle 204 polls only re-check once the throttle window has elapsed", async () => {
+      _timing.idleBaseMs = 5;
+      _timing.idleJitterMs = 0;
+      _timing.selfUpdateThrottleMs = 10_000; // long — should NOT re-fire across a handful of fast idle polls
+      platform.onClaim = () => ({ status: 204 });
+      const fakeSelfUpdate = vi.fn(async () => ({ action: "current" }));
+
+      const summary = await runWorkerLoop({
+        config: selfUpdateConfig(),
+        apiKey: SECRET,
+        log,
+        executeRunFn: vi.fn(),
+        maybeSelfUpdateFn: fakeSelfUpdate,
+        maxIterations: 5,
+      });
+
+      expect(summary).toEqual({ claimed: 0, completed: 0, failed: 0 });
+      expect(fakeSelfUpdate).toHaveBeenCalledTimes(1); // startup only — the throttle held for every idle-poll checkpoint after it
+    });
+
+    it("config autoUpdate:false disables the check entirely (never even called)", async () => {
+      platform.onClaim = () => ({ status: 204 });
+      const fakeSelfUpdate = vi.fn(async () => ({ action: "updated", from: "a".repeat(40), to: "b".repeat(40) }));
+      const summary = await runWorkerLoop({ config: selfUpdateConfig({ autoUpdate: false }), apiKey: SECRET, log, once: true, executeRunFn: vi.fn(), maybeSelfUpdateFn: fakeSelfUpdate });
+      expect(fakeSelfUpdate).not.toHaveBeenCalled();
+      expect(summary).toEqual({ claimed: 0, completed: 0, failed: 0 }); // proves it actually reached (and 204'd) the claim, not an early self-update exit
+    });
+
+    it("BELLOWS_NO_SELF_UPDATE=1 force-disables even when config.worker.autoUpdate is true (kill switch)", async () => {
+      process.env.BELLOWS_NO_SELF_UPDATE = "1";
+      platform.onClaim = () => ({ status: 204 });
+      const fakeSelfUpdate = vi.fn(async () => ({ action: "updated", from: "a".repeat(40), to: "b".repeat(40) }));
+      const summary = await runWorkerLoop({ config: selfUpdateConfig({ autoUpdate: true }), apiKey: SECRET, log, once: true, executeRunFn: vi.fn(), maybeSelfUpdateFn: fakeSelfUpdate });
+      expect(fakeSelfUpdate).not.toHaveBeenCalled();
+      expect(summary).toEqual({ claimed: 0, completed: 0, failed: 0 });
+    });
+
+    it("autoUpdate defaults to enabled when the config field is entirely absent (not just when explicitly true)", async () => {
+      const cfg = baseConfig(runsDir, platform.url);
+      delete cfg.worker.autoUpdate; // simulate a config object that never set the field at all
+      platform.onClaim = () => ({ status: 204 });
+      const fakeSelfUpdate = vi.fn(async () => ({ action: "current" }));
+      await runWorkerLoop({ config: cfg, apiKey: SECRET, log, once: true, executeRunFn: vi.fn(), maybeSelfUpdateFn: fakeSelfUpdate });
+      expect(fakeSelfUpdate).toHaveBeenCalledTimes(1);
+    });
+
+    it("a self-update check that throws is logged and does not crash or block the loop", async () => {
+      platform.onClaim = () => ({ status: 204 });
+      const throwingSelfUpdate = vi.fn(async () => {
+        throw new Error("git blew up");
+      });
+      const summary = await runWorkerLoop({ config: selfUpdateConfig(), apiKey: SECRET, log, once: true, executeRunFn: vi.fn(), maybeSelfUpdateFn: throwingSelfUpdate });
+      expect(summary).toEqual({ claimed: 0, completed: 0, failed: 0 });
+      expect(logs.join("\n")).toMatch(/self-update check threw: git blew up/);
+    });
+
+    it("a 'rolled-back' result is logged loudly (WARN) and the loop keeps polling normally", async () => {
+      platform.onClaim = () => ({ status: 204 });
+      const fakeSelfUpdate = vi.fn(async () => ({ action: "rolled-back", reason: "npm ci failed: boom" }));
+      const summary = await runWorkerLoop({ config: selfUpdateConfig(), apiKey: SECRET, log, once: true, executeRunFn: vi.fn(), maybeSelfUpdateFn: fakeSelfUpdate });
+      expect(summary).toEqual({ claimed: 0, completed: 0, failed: 0 });
+      expect(logs.join("\n")).toMatch(/WARN: self-update rolled back \(npm ci failed: boom\)/);
+    });
+
+    it("M1: no self-update check starts once shutdown has been requested (after-run checkpoint suppressed)", async () => {
+      // SIGTERM arrives mid-run: the loop's `stopped` flag is set while the run
+      // is in flight. Without the guard, the after-run checkpoint would still
+      // launch a fetch (and possibly minutes of npm ci) on a process that
+      // should be exiting within ~10s — assert it never even starts.
+      _timing.selfUpdateThrottleMs = 0; // unthrottled: the after-run check WOULD fire if not suppressed
+      platform.onClaim = () => ({ status: 200, body: { run: claimedRunFixture() } });
+      platform.onComplete = () => ({ status: 200, body: { ok: true } });
+
+      const controller = new AbortController();
+      let selfUpdateCalls = 0;
+      const fakeSelfUpdate = vi.fn(async () => {
+        selfUpdateCalls++;
+        return { action: "current" };
+      });
+
+      const fakeExecutor = vi.fn(async ({ runDir }) => {
+        fs.mkdirSync(runDir, { recursive: true });
+        controller.abort(); // shutdown requested while the run is in flight
+        return {
+          id: "run-1",
+          label: "t1/keel/1",
+          status: "completed",
+          fingerprint: { conductorId: "keel" },
+          timing: { startedAt: "2026-01-01T00:00:00.000Z", endedAt: "2026-01-01T00:01:00.000Z", wallClockS: 60 },
+          usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, costUsd: 0, assistantTurns: 1, toolCalls: 0 },
+          turns: [],
+          conductor: null,
+          platform: null,
+          artifacts: { piSessionFile: "", hostTelemetryFile: null, workspaceDir: runDir, agentDir: runDir },
+        };
+      });
+
+      const summary = await runWorkerLoop({
+        config: selfUpdateConfig(),
+        apiKey: SECRET,
+        log,
+        signal: controller.signal,
+        executeRunFn: fakeExecutor,
+        maybeSelfUpdateFn: fakeSelfUpdate,
+        maxIterations: 5,
+      });
+
+      expect(summary.claimed).toBe(1);
+      // Only the startup check ran; the after-run checkpoint was suppressed by
+      // the shutdown guard even though the throttle would have allowed it.
+      expect(selfUpdateCalls).toBe(1);
+    });
   });
 });

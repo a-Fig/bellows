@@ -51,6 +51,13 @@ const TEST_ACCORDION_REPO = process.env.BELLOWS_ACCORDION_REPO?.trim()
 // __tests__/main-v15.integration.test.mjs.
 const ACCORDION_IS_V15 = existsSync(path.join(TEST_ACCORDION_REPO, "core", "protocol.ts"));
 
+// N5: also skip when the resolved accordion checkout does not exist on disk —
+// a fresh public clone (no bench.config.json; placeholder accordionRepo in the
+// example config) would otherwise run every suite here against a nonexistent
+// path, each hanging its full timeout instead of skipping. See the fuller
+// rationale atop host.test.ts.
+const ACCORDION_MISSING = !existsSync(TEST_ACCORDION_REPO);
+
 const children: ChildProcess[] = [];
 const servers: WebSocketServer[] = [];
 
@@ -249,7 +256,7 @@ class FakeConductor {
 	}
 }
 
-describe.skipIf(ACCORDION_IS_V15)("B1 regression — a conductor that never becomes ready must not crash the host", () => {
+describe.skipIf(ACCORDION_MISSING || ACCORDION_IS_V15)("B1 regression — a conductor that never becomes ready must not crash the host", () => {
 	it("host/client stays alive when the conductor accepts the WS connection then closes WITHOUT sending conductor/hello", async () => {
 		const home = mkdtempSync(path.join(tmpdir(), "bellows-remote-b1-nohelo-"));
 		const telemetryOut = path.join(home, "telemetry.jsonl");
@@ -321,7 +328,7 @@ describe.skipIf(ACCORDION_IS_V15)("B1 regression — a conductor that never beco
 	}, 30_000);
 });
 
-describe.skipIf(ACCORDION_IS_V15)("RemoteConductorClient — protocol unit tests (fake conductor server)", () => {
+describe.skipIf(ACCORDION_MISSING || ACCORDION_IS_V15)("RemoteConductorClient — protocol unit tests (fake conductor server)", () => {
 	it("hello exchange: host/hello arrives, conductor greets, host attaches", async () => {
 		const home = mkdtempSync(path.join(tmpdir(), "bellows-remote-hello-"));
 		const telemetryOut = path.join(home, "telemetry.jsonl");
@@ -497,7 +504,7 @@ describe.skipIf(ACCORDION_IS_V15)("RemoteConductorClient — protocol unit tests
 	}, 30_000);
 });
 
-describe.skipIf(ACCORDION_IS_V15)("RemoteConductorClient — end to end through the REAL AccordionStore", () => {
+describe.skipIf(ACCORDION_MISSING || ACCORDION_IS_V15)("RemoteConductorClient — end to end through the REAL AccordionStore", () => {
 	it("folds the targeted block, clamps a protected one, and reports the clamp back over host/commandResult", async () => {
 		const home = mkdtempSync(path.join(tmpdir(), "bellows-remote-e2e-"));
 		const telemetryOut = path.join(home, "telemetry.jsonl");

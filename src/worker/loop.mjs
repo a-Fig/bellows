@@ -19,12 +19,13 @@ import { EventBatcher } from "./eventBatcher.mjs";
 import { TelemetryTail } from "./telemetryTail.mjs";
 import { advertisedConductors, clearConductorCache } from "./conductorAdvertise.mjs";
 import { maybePullAccordion, accordionSha } from "./gitPull.mjs";
+import { maybeSelfUpdate, currentHeadShort } from "./selfUpdate.mjs";
 import { packSessionForUpload } from "./sessionArchive.mjs";
 import { buildSharedContext, resolveRunsRoot, describeRoomConfig } from "../runner/schedule.mjs";
 import { executeRun as realExecuteRun } from "../runner/run.mjs";
 import { createRoom, probeRoomJoinable } from "../runner/platform.mjs";
 import { slopcodeRoomConfig } from "../runner/roomConfig.mjs";
-import { isProblemScoped } from "../runner/config.mjs";
+import { isProblemScoped, REPO_ROOT } from "../runner/config.mjs";
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const IDLE_POLL_BASE_MS = 5_000;
@@ -33,6 +34,12 @@ const IDLE_POLL_JITTER_MS = 2_000;
 // which is right for a normal run finishing but wrong on the shutdown path —
 // SIGINT should exit promptly rather than block on an unreachable platform.
 const SHUTDOWN_COMPLETE_DEADLINE_MS = 10_000;
+// Self-update is checked once (unthrottled) at worker startup, then at most
+// this often thereafter — after each completed run and on every idle 204
+// poll both share this one throttle clock, so a burst of short runs or a
+// tight idle-poll cadence can't turn "check for updates" into "fetch on
+// every tick".
+const SELF_UPDATE_THROTTLE_MS = 10 * 60_000;
 
 /**
  * M2 (adversarial review): sanitize an arm name before it becomes a path segment.
@@ -56,12 +63,14 @@ export const _timing = {
   idleBaseMs: IDLE_POLL_BASE_MS,
   idleJitterMs: IDLE_POLL_JITTER_MS,
   shutdownCompleteDeadlineMs: SHUTDOWN_COMPLETE_DEADLINE_MS,
+  selfUpdateThrottleMs: SELF_UPDATE_THROTTLE_MS,
 };
 export function _resetTiming() {
   _timing.heartbeatMs = HEARTBEAT_INTERVAL_MS;
   _timing.idleBaseMs = IDLE_POLL_BASE_MS;
   _timing.idleJitterMs = IDLE_POLL_JITTER_MS;
   _timing.shutdownCompleteDeadlineMs = SHUTDOWN_COMPLETE_DEADLINE_MS;
+  _timing.selfUpdateThrottleMs = SELF_UPDATE_THROTTLE_MS;
 }
 
 /**
@@ -197,6 +206,7 @@ export async function defaultExecutor({ claimed, config, apiKey, runDir, abortSi
  * @param {AbortSignal} [opts.signal]  external shutdown signal (SIGINT et al.)
  * @param {(args)=>Promise<import("../types.ts").RunRecord>} [opts.executeRunFn]  injectable executor (tests)
  * @param {number} [opts.maxIterations]  test seam: stop after N claim polls (idle or not)
+ * @param {typeof maybeSelfUpdate} [opts.maybeSelfUpdateFn]  injectable self-update check (tests) — see selfUpdate.mjs
  * @returns {Promise<{claimed:number, completed:number, failed:number}>}
  */
 export async function runWorkerLoop(opts) {
@@ -208,6 +218,7 @@ export async function runWorkerLoop(opts) {
     signal,
     executeRunFn = defaultExecutor,
     maxIterations = Infinity,
+    maybeSelfUpdateFn = maybeSelfUpdate,
   } = opts;
 
   const wc = config.worker;
@@ -219,11 +230,72 @@ export async function runWorkerLoop(opts) {
   const client = new PlatformClient({ base: wc.platformUrl, apiKey, log });
   const runsRoot = resolveRunsRoot(config);
 
+  // Fleet-visibility: log this worker's own code version once at startup and
+  // carry it on every claim (platformClient.claim's body — the platform
+  // ignores unknown fields today, so this is harmless future-proofing).
+  // `wc.autoUpdate !== false`: absent means enabled (opt-out, not opt-in);
+  // BELLOWS_NO_SELF_UPDATE=1 is an unconditional kill switch regardless of
+  // config, for a fleet-wide "stop touching checkouts" emergency lever.
+  const workerVersion = currentHeadShort(REPO_ROOT, log);
+  log(`[worker] running at HEAD ${workerVersion || "unknown"}`);
+  const autoUpdateEnabled = wc.autoUpdate !== false && process.env.BELLOWS_NO_SELF_UPDATE !== "1";
+
   let claimedCount = 0;
   let completedCount = 0;
   let failedCount = 0;
   let iterations = 0;
   let stopped = false;
+  let lastSelfUpdateCheckAt = 0;
+  let loggedSelfUpdateCurrent = false;
+
+  /**
+   * Run (or throttle-skip) a self-update check. Returns true iff the caller
+   * should stop the loop and return immediately (an update landed and this
+   * process should exit for the supervisor to relaunch it). `force` bypasses
+   * the throttle — used once, for the startup check.
+   */
+  async function checkSelfUpdate({ force = false } = {}) {
+    if (!autoUpdateEnabled) return false;
+    // M1 (adversarial review): never start a self-update once shutdown has been
+    // requested — the process should be exiting within ~10s (see
+    // shutdownCompleteDeadlineMs), not opening a 60s fetch + minutes of npm ci
+    // that a follow-up SIGKILL could interrupt mid-install (HEAD advanced,
+    // node_modules half-written, and no self-heal on relaunch).
+    if (stopped || signal?.aborted) return false;
+    const now = Date.now();
+    if (!force && now - lastSelfUpdateCheckAt < _timing.selfUpdateThrottleMs) return false;
+    lastSelfUpdateCheckAt = now;
+
+    let result;
+    try {
+      result = await maybeSelfUpdateFn({ repoRoot: REPO_ROOT, log });
+    } catch (e) {
+      log(`[worker] WARN: self-update check threw: ${e.message}`);
+      return false;
+    }
+
+    if (result.action === "updated") {
+      log(`[worker] self-update: ${shortSha(result.from)}→${shortSha(result.to)} — exiting for supervisor relaunch`);
+      return true;
+    }
+    if (result.action === "current") {
+      // Logged once (at startup) so idle polling every ~10min doesn't spam "current".
+      if (!loggedSelfUpdateCurrent) {
+        log(`[worker] self-update: already current`);
+        loggedSelfUpdateCurrent = true;
+      }
+      return false;
+    }
+    if (result.action === "rolled-back") {
+      log(`[worker] WARN: self-update rolled back (${result.reason}) — continuing on the current code`);
+      return false;
+    }
+    // "skipped" — WARN-level (m2, adversarial review): a permanently-skipping
+    // worker (dirty/diverged/non-main checkout) is silently pinned to old code,
+    // which is exactly the fleet-drift failure self-update exists to prevent.
+    log(`[worker] WARN: self-update skipped (${result.reason}) — this worker will not auto-update`);
+    return false;
+  }
 
   const onStop = () => {
     stopped = true;
@@ -231,6 +303,11 @@ export async function runWorkerLoop(opts) {
   signal?.addEventListener("abort", onStop, { once: true });
 
   try {
+    // (a) Once at startup, unthrottled — before ever claiming.
+    if (await checkSelfUpdate({ force: true })) {
+      return { claimed: claimedCount, completed: completedCount, failed: failedCount };
+    }
+
     while (!stopped && iterations < maxIterations) {
       iterations++;
 
@@ -253,7 +330,7 @@ export async function runWorkerLoop(opts) {
 
       let claimed;
       try {
-        claimed = await client.claim({ worker: wc.name, caps: wc.caps, conductors });
+        claimed = await client.claim({ worker: wc.name, caps: wc.caps, conductors, version: workerVersion || undefined });
       } catch (e) {
         log(`[worker] claim failed: ${e.message}`);
         claimed = null;
@@ -261,6 +338,8 @@ export async function runWorkerLoop(opts) {
 
       if (!claimed) {
         if (once) return { claimed: claimedCount, completed: completedCount, failed: failedCount };
+        // (c) Idle-poll checkpoint — throttled, never every ~5-7s tick.
+        if (await checkSelfUpdate()) return { claimed: claimedCount, completed: completedCount, failed: failedCount };
         await waitIdle(signal);
         continue;
       }
@@ -272,12 +351,21 @@ export async function runWorkerLoop(opts) {
       else failedCount++;
 
       if (once) return { claimed: claimedCount, completed: completedCount, failed: failedCount };
+
+      // (b) After-run checkpoint, before the next claim poll — throttled
+      // (shares the same clock as the idle-poll checkpoint above).
+      if (await checkSelfUpdate()) return { claimed: claimedCount, completed: completedCount, failed: failedCount };
     }
   } finally {
     signal?.removeEventListener("abort", onStop);
   }
 
   return { claimed: claimedCount, completed: completedCount, failed: failedCount };
+}
+
+/** First 12 chars of a sha, tolerating a short/placeholder value in tests. */
+function shortSha(sha) {
+  return typeof sha === "string" ? sha.slice(0, 12) : String(sha);
 }
 
 /** Sleep the idle poll interval (with jitter), or return early if the shutdown signal fires. */

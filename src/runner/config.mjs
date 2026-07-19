@@ -101,6 +101,8 @@ function normalizeWorkerConfig(raw) {
     caps,
     pullBeforeClaim: raw?.pullBeforeClaim === true,
     parallel: raw?.parallel || 1,
+    // Default true when absent (opt-out, not opt-in) — see selfUpdate.mjs.
+    autoUpdate: raw?.autoUpdate !== false,
   };
 }
 

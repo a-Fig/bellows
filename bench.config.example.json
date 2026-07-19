@@ -9,6 +9,7 @@
     "name": "worker-1",
     "caps": ["in-process", "external-conductors"],
     "pullBeforeClaim": false,
-    "parallel": 1
+    "parallel": 1,
+    "autoUpdate": true
   }
 }

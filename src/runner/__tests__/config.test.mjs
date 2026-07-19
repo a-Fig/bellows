@@ -194,6 +194,7 @@ describe("normalizeBenchConfig", () => {
       caps: [],
       pullBeforeClaim: false,
       parallel: 1,
+      autoUpdate: true,
     });
   });
 
@@ -205,6 +206,21 @@ describe("normalizeBenchConfig", () => {
     expect(cfg.worker.caps).toEqual(["in-process", "gpu-probe"]);
     expect(cfg.worker.pullBeforeClaim).toBe(true);
     expect(cfg.worker.parallel).toBe(1);
+  });
+
+  it("autoUpdate defaults to true when absent", () => {
+    const cfg = normalizeBenchConfig({ ...rawBenchConfigBase, worker: { platformUrl: "https://p", name: "w1" } });
+    expect(cfg.worker.autoUpdate).toBe(true);
+  });
+
+  it("autoUpdate: false is honored (opt-out)", () => {
+    const cfg = normalizeBenchConfig({ ...rawBenchConfigBase, worker: { platformUrl: "https://p", name: "w1", autoUpdate: false } });
+    expect(cfg.worker.autoUpdate).toBe(false);
+  });
+
+  it("autoUpdate: true is honored explicitly", () => {
+    const cfg = normalizeBenchConfig({ ...rawBenchConfigBase, worker: { platformUrl: "https://p", name: "w1", autoUpdate: true } });
+    expect(cfg.worker.autoUpdate).toBe(true);
   });
 
   it("rejects a worker section missing platformUrl", () => {

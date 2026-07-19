@@ -287,7 +287,8 @@ Add a `worker` section to `bench.config.json`:
     "name": "homeserver-1",
     "caps": ["in-process", "external-conductors"],
     "pullBeforeClaim": false,
-    "parallel": 1
+    "parallel": 1,
+    "autoUpdate": true
   }
 }
 ```
@@ -316,6 +317,10 @@ Add a `worker` section to `bench.config.json`:
   turn it on for a homeserver that should always track the latest `devmain`.
 - **`parallel`** — reserved for running multiple claimed runs concurrently. Only `1` is
   supported today; any other value is rejected at startup with a clear error.
+- **`autoUpdate`** — self-update THIS bellows checkout (not `accordionRepo`) from `origin/main`
+  when idle, then exit for a supervisor to relaunch on the new code. Default `true` when absent.
+  See the [Self-update](#self-update-workerautoupdate) section below for the full mechanism,
+  the `BELLOWS_NO_SELF_UPDATE=1` kill switch, and required supervisor setup.
 
 The API key **value** is never read from `bench.config.json` — only from the
 environment variable named by the top-level `platformApiKeyEnv` field
@@ -373,10 +378,112 @@ makes a best-effort `complete(failed, "worker shutdown")` call before the proces
 so a homeserver reboot or a deliberate restart doesn't leave an orphaned "running" row on the
 platform.
 
-### Running it as a background service (launchd sketch)
+### Self-update (`worker.autoUpdate`)
 
-A minimal launchd plist to keep `bellows worker` running on a Mac homeserver
-(`~/Library/LaunchAgents/dev.bellows.worker.plist`):
+A worker fleet drifts: leave a machine running long enough and its checkout falls behind
+`origin/main` — one worker has been observed sitting 4 PRs stale, and another burned a whole
+run on ancient code. Self-update closes that gap without a human SSHing in: **when idle**
+(never mid-run), the worker checks whether its own checkout (this bellows repo, not
+`accordionRepo`) is behind `origin/main`, fast-forwards it, and exits cleanly so its supervisor
+relaunches it on the new code.
+
+This only works because the worker already runs under something that relaunches it on exit —
+a Windows while-loop supervisor script, or a macOS LaunchAgent with `KeepAlive`. Self-update
+itself never restarts the process in place; it just fast-forwards the checkout and calls
+`process.exit(0)`, logging `[worker] self-update: <from>→<to> — exiting for supervisor
+relaunch` first. See the background-service section below for both supervisor setups —
+**self-update is a no-op improvement without one** (an unsupervised `node bin/bellows.mjs
+worker --poll` that self-updates just exits and stays dead).
+
+Checked (see `src/worker/selfUpdate.mjs`), in order:
+
+1. **Dirty working tree** (`git status --porcelain` non-empty) → skipped. The same machine may
+   also be a dev box with in-progress work — self-update never clobbers it.
+2. **HEAD not on `main`** → skipped. A feature branch checked out for dev/debugging is never
+   yanked out from under whoever's using it.
+3. **No `origin` remote** → skipped.
+4. **Fetch fails** (network, auth) → skipped, logged.
+5. **Already up to date** → no-op, logged once (not every idle poll).
+6. **Behind, but fast-forwardable** → fast-forwards (`merge --ff-only`), then exits for relaunch.
+   If `package-lock.json` changed in the fast-forward, `npm ci` runs first (with
+   `--include=dev` — bellows needs vite-node/vite/svelte, all devDependencies, at *runtime*,
+   and the flag also defends against a fleet box exporting `NODE_ENV=production`). If npm ci
+   fails, the *code* is rolled back (`git reset --hard` to the pre-update sha) so the worker
+   keeps running the old code without relaunching — but note `node_modules` itself may be left
+   partially installed by the failed npm ci (a WARN is logged saying so); if the worker
+   misbehaves afterwards, run `npm install` in the checkout manually.
+7. **Behind, but diverged** (ff-only refuses — e.g. a force-push, or local commits on `main`) →
+   skipped, logged loudly. Never rewrites history unattended.
+
+**Config** — `worker.autoUpdate` in `bench.config.json`, default `true` when absent (opt-out,
+not opt-in):
+
+```json
+{ "worker": { "autoUpdate": false } }
+```
+
+**Kill switch** — `BELLOWS_NO_SELF_UPDATE=1` in the environment force-disables self-update
+regardless of config, for a fleet-wide "stop touching checkouts right now" lever that doesn't
+require editing every machine's `bench.config.json`.
+
+**Check timing** — once (unthrottled) at worker startup, then at most once every ~10 minutes
+thereafter, checked both after each completed run and during idle claim-polling (both share one
+throttle clock, so a burst of short runs can't turn this into "check on every tick"). Every
+worker also logs its own HEAD sha once at startup and includes it as `version` on every claim
+request, purely for fleet visibility (the platform ignores the field today).
+
+**Auth for the fetch.** `bellows` (a-Fig/bellows) is public, so the default case needs no
+credential at all: a checkout whose `origin` is the anonymous HTTPS URL fetches and
+fast-forwards with zero setup. Only a **private fork** needs a credential — for that, generate
+an SSH keypair on the worker, add it as a read-only GitHub deploy key on the fork, and point
+the checkout's `origin` remote at the SSH URL (scoped to one repo, no write access, easy to
+revoke per-machine). Either way, self-update never needs a token with WRITE access — it only
+ever fetches and fast-forwards.
+
+**Known rollout risk: CRLF phantom-dirty checkouts.** A checkout with `core.autocrlf` drift
+(common after copying/zipping a repo across OSes, or a stale `.gitattributes`) can show every
+text file as modified in `git status --porcelain` even though the content is byte-for-byte the
+same aside from line endings. Self-update's dirty check treats that exactly like real
+uncommitted work and skips forever — permanently disabling self-update on that machine (watch
+the logs for repeated `WARN: self-update skipped (dirty working tree)` lines).
+This has actually been observed on this project's homeserver checkout. Before relying on
+self-update on a given machine, confirm `git status --porcelain` is empty on a fresh idle
+worker; if it isn't, normalize line endings once (`git config core.autocrlf false` — or `true`,
+whichever matches the rest of the fleet — then `git add --renormalize . && git commit`) rather
+than assuming self-update is broken.
+
+### Running it as a background service
+
+Self-update (above) only relaunches the worker on new code if something relaunches the process
+after it exits — pick one of these per platform:
+
+**Windows: PowerShell supervisor + Task Scheduler.** `scripts/bellows-worker-supervisor.ps1` is
+the supervisor: a `while ($true)` loop that starts `node bin/bellows.mjs worker --poll`,
+`Wait-Process`es on it, and relaunches after any exit (crash, `--once` exhaustion, or a
+self-update relaunch) after a 10s pause. Run it directly, or point a Task Scheduler action at
+it:
+
+```powershell
+powershell -File "C:\path\to\bellows\scripts\bellows-worker-supervisor.ps1" -BellowsDir "C:\path\to\bellows"
+```
+
+`-BellowsDir` defaults to a generic space-free placeholder (`C:\bellows`); always pass your
+machine's real checkout path explicitly. Notes carried over from the original ad hoc version
+of this script:
+- **Space-free path matters for Task Scheduler.** A `-BellowsDir` (or the script's own path)
+  containing spaces can break a bare `-File` argument in a Scheduled Task's action string —
+  quote the whole action command, and prefer a space-free path for the *script* itself if
+  Task Scheduler ever mangles the quoting.
+- **The task must NOT use action-level "restart on failure".** This script's own `while(true)`
+  loop is the supervisor; a Scheduled Task `RestartCount` on top of it can spawn a *second*
+  supervisor competing for the same worker identity. The task's only jobs are: start this script
+  at logon, and set `MultipleInstances = IgnoreNew` so a second logon (or manual re-run) doesn't
+  stack duplicate supervisors.
+- Every launch path in the script is wrapped in `try`/`catch` so a transient `Start-Process`
+  failure logs and retries rather than silently killing the supervisor loop itself.
+
+**macOS: LaunchAgent with `KeepAlive`.** A minimal launchd plist to keep `bellows worker`
+running on a Mac homeserver (`~/Library/LaunchAgents/dev.bellows.worker.plist`):
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -405,7 +512,9 @@ A minimal launchd plist to keep `bellows worker` running on a Mac homeserver
 
 `launchctl load ~/Library/LaunchAgents/dev.bellows.worker.plist` starts it; `KeepAlive`
 restarts it if it ever exits (a `SIGINT`/`SIGTERM` still exits cleanly per the crash-safety
-note above — this is just the belt-and-suspenders "come back up after a crash or reboot").
+note above — this is just the belt-and-suspenders "come back up after a crash or reboot"),
+and it's also what makes self-update's clean `process.exit(0)` relaunch onto new code rather
+than just leaving the worker dead.
 
 ### Debugging: `--once`
 
