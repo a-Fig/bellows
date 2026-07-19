@@ -68,7 +68,9 @@ export class PlatformClient {
 
   /**
    * Claim the next run for this worker. Returns null on 204 (nothing to do).
-   * @param {{worker:string, caps:string[], conductors:string[]}} body
+   * @param {{worker:string, caps:string[], conductors:string[], version?:string}} body
+   *   `version` is this worker's own short HEAD sha (fleet-visibility; see
+   *   selfUpdate.mjs) — informational only, the platform ignores unknown fields.
    * @returns {Promise<import("../types.ts").ClaimedRun|null>}
    */
   async claim(body) {

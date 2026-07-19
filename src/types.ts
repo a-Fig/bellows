@@ -347,6 +347,14 @@ export interface WorkerConfig {
   pullBeforeClaim: boolean;
   /** Runs to execute concurrently. Only `1` is currently supported. */
   parallel: number;
+  /**
+   * Self-update: when idle, fast-forward THIS bellows checkout to
+   * origin/main and exit(0) so the supervisor relaunches on new code. See
+   * src/worker/selfUpdate.mjs. Default true when absent; the
+   * `BELLOWS_NO_SELF_UPDATE=1` env var force-disables regardless of this
+   * field (kill switch).
+   */
+  autoUpdate: boolean;
 }
 
 // ---------------------------------------------------------------------------

@@ -59,7 +59,16 @@ function writeConfig(worker) {
         platformBase: "http://127.0.0.1:1", // unroutable; irrelevant, we assert before any network call
         platformApiKeyEnv: "BELLOWS_TEST_CUSTOM_KEY_VAR",
         runsDir: "./runs",
-        worker,
+        // autoUpdate: false — this spawns the REAL CLI as a subprocess against
+        // THIS repo's own checkout (REPO_ROOT), with no DI seam to inject a fake
+        // maybeSelfUpdate the way in-process loop.test.mjs tests can. autoUpdate
+        // defaults to true, and self-update's own dirty/branch checks only
+        // happen to be a no-op on the dev machine this was written on (untracked
+        // files / a non-main branch checked out) — a clean `main` checkout
+        // running this test suite would otherwise attempt a REAL git
+        // fetch/ff-merge against origin as a test side effect. These tests only
+        // cover API-key resolution, not self-update, so it's disabled here.
+        worker: { ...worker, autoUpdate: false },
       },
       null,
       2,
