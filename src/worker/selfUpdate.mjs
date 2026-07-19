@@ -147,13 +147,19 @@ export async function maybeSelfUpdate({
   runNpmCi = defaultRunNpmCi,
 }) {
   // 1. Dirty tree — this machine may also be a dev box with work in progress;
-  // never clobber it. (A checkout with core.autocrlf drift can show phantom
-  // modified-but-identical files here forever — that's a rollout/config
-  // problem on that machine, not something to paper over in this check; see
-  // docs/TUTORIAL.md's self-update section.)
+  // never clobber it. Scoped to TRACKED modifications only
+  // (--untracked-files=no): operator-local files (trial YAMLs, stray logs)
+  // are routine on fleet boxes, a fast-forward never touches untracked paths
+  // (git aborts a colliding merge itself, which lands in the "diverged" skip
+  // below), and gating on them would silently pin a worker to old code — the
+  // exact fleet-drift failure self-update exists to prevent. (A checkout with
+  // core.autocrlf drift can still show phantom modified-but-identical TRACKED
+  // files here forever — that's a rollout/config problem on that machine, not
+  // something to paper over in this check; see TUTORIAL.md's self-update
+  // section.)
   let statusOut;
   try {
-    statusOut = git(repoRoot, ["status", "--porcelain"], timeoutMs);
+    statusOut = git(repoRoot, ["status", "--porcelain", "--untracked-files=no"], timeoutMs);
   } catch (e) {
     log(`[worker] self-update WARN: git status --porcelain failed: ${firstErrLine(e)}`);
     return { action: "skipped", reason: "git status failed" };
