@@ -45,6 +45,8 @@ import { Telemetry } from "./telemetry";
 import {
 	loadAccordion,
 	maybeSlowWrap,
+	accordionRepo,
+	isExternalLaunchConductor,
 	type AccordionStore,
 	type WireBlock,
 	type FoldOp,
@@ -296,9 +298,16 @@ async function main(): Promise<number> {
 		const found = acc.IN_PROCESS_CONDUCTORS.find((c) => c.id === args.conductor);
 		if (!found) {
 			const ids = acc.IN_PROCESS_CONDUCTORS.map((c) => c.id).join(", ");
-			tel.emit({ t: "error", at: Date.now(), message: `unknown conductor "${args.conductor}" (available: ${ids})` });
+			// Same-name launch.json = the id itself isn't wrong, just dispatched the wrong
+			// way (bellows normally auto-upgrades this before ever spawning the host — see
+			// src/runner/run.mjs's autoUpgradeArmDispatch — so reaching here at all means an
+			// older bellows build). Point the operator at the fix instead of just "unknown".
+			const hint = isExternalLaunchConductor(accordionRepo(), args.conductor)
+				? ` — this conductor is external-launch; use "external:${args.conductor}" (or update bellows: newer versions auto-dispatch it)`
+				: "";
+			tel.emit({ t: "error", at: Date.now(), message: `unknown conductor "${args.conductor}" (available: ${ids})${hint}` });
 			await tel.close();
-			throw new Error(`bellows host: unknown conductor "${args.conductor}" — available: ${ids}`);
+			throw new Error(`bellows host: unknown conductor "${args.conductor}" — available: ${ids}${hint}`);
 		}
 		entry = found;
 	}

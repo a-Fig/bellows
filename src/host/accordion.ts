@@ -51,6 +51,20 @@ export function accordionRepo(): string {
 	throw new Error("bellows: could not resolve accordionRepo from bench.config.json / bench.config.example.json");
 }
 
+/**
+ * Extra guidance for the host's "unknown conductor" error: true when
+ * `conductorId` isn't a typo/genuinely-unregistered id but a valid
+ * EXTERNAL-launch conductor on this checkout — i.e. it has
+ * `conductors/<id>/launch.json` even though it's absent from
+ * IN_PROCESS_CONDUCTORS. Mirrors the auto-upgrade predicate the runner
+ * applies before even spawning this host (src/runner/run.mjs's
+ * autoUpgradeArmDispatch) — a bellows version too old to auto-upgrade should
+ * still tell the operator the fix ("external:<id>") rather than just "unknown".
+ */
+export function isExternalLaunchConductor(repo: string, conductorId: string): boolean {
+	return existsSync(path.join(repo, "conductors", conductorId, "launch.json"));
+}
+
 const REPO = accordionRepo();
 // Use POSIX-slash ABSOLUTE paths (not file:// URLs) as import specifiers: vite-node's
 // resolver handles absolute FS paths directly, whereas a file:// URL percent-encodes the

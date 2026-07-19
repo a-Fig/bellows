@@ -11,6 +11,8 @@ import {
   spawnExternalConductor,
   spawnHost,
   hostEntryForAccordion,
+  isLegacyAccordionCheckout,
+  autoUpgradeArmDispatch,
   hostEnv,
   modelShortName,
   buildJoinMeta,
@@ -19,6 +21,7 @@ import {
   isDegenerateAssistantMessage,
   looksLikeAgentFinalizeCall,
   appendAgentFinalizeNote,
+  resolvePlatformBase,
 } from "../run.mjs";
 
 class FakePi extends EventEmitter {
@@ -301,8 +304,114 @@ describe("hostEntryForAccordion", () => {
   });
 });
 
+describe("isLegacyAccordionCheckout — shared predicate behind hostEntryForAccordion + autoUpgradeArmDispatch", () => {
+  it("false for a truth-in-extension (v15) checkout", () => {
+    const repo = fs.mkdtempSync(path.join(tmpdir(), "accordion-v15-"));
+    fs.mkdirSync(path.join(repo, "core"));
+    fs.writeFileSync(path.join(repo, "core", "protocol.ts"), "export const PROTOCOL_VERSION = 15;\n");
+    expect(isLegacyAccordionCheckout(repo)).toBe(false);
+    fs.rmSync(repo, { recursive: true, force: true });
+  });
+
+  it("true for a checkout with no core/protocol.ts", () => {
+    expect(isLegacyAccordionCheckout("C:/missing/legacy-accordion")).toBe(true);
+  });
+});
+
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE_DIR = path.resolve(HERE, "..", "..", "..", "test", "fixtures");
+
+describe("autoUpgradeArmDispatch — bare-id auto-external-dispatch on legacy checkouts", () => {
+  it("upgrades a bare in-process id to external on a LEGACY checkout with a matching launch.json", () => {
+    // FIXTURE_DIR (test/fixtures) has no core/protocol.ts (legacy-shaped) and
+    // carries conductors/echo-conductor/launch.json (see the loadConductorLaunchSpec
+    // tests above) — exactly the "thermocline on Accordion main" scenario.
+    const logs = [];
+    const result = autoUpgradeArmDispatch({
+      armDispatch: { type: "in-process", id: "echo-conductor" },
+      accordionRepo: FIXTURE_DIR,
+      log: (m) => logs.push(m),
+      label: "t/echo/0",
+    });
+    expect(result).toEqual({ type: "external", id: "echo-conductor" });
+    expect(logs.some((m) => m.includes('conductor "echo-conductor" is external-launch'))).toBe(true);
+  });
+
+  it("does NOT upgrade on a v15-shaped checkout, even with a matching launch.json", () => {
+    const repo = fs.mkdtempSync(path.join(tmpdir(), "accordion-v15-upgrade-"));
+    fs.mkdirSync(path.join(repo, "core"));
+    fs.writeFileSync(path.join(repo, "core", "protocol.ts"), "export const PROTOCOL_VERSION = 15;\n");
+    const conductorsDir = path.join(repo, "conductors", "thermocline");
+    fs.mkdirSync(conductorsDir, { recursive: true });
+    fs.writeFileSync(path.join(conductorsDir, "launch.json"), JSON.stringify({ command: "node", args: ["x.mjs"] }));
+
+    const result = autoUpgradeArmDispatch({
+      armDispatch: { type: "in-process", id: "thermocline" },
+      accordionRepo: repo,
+      log: () => {},
+      label: "t/thermocline/0",
+    });
+    expect(result).toEqual({ type: "in-process", id: "thermocline" });
+    fs.rmSync(repo, { recursive: true, force: true });
+  });
+
+  it("leaves an explicit external:<id> dispatch unchanged", () => {
+    const result = autoUpgradeArmDispatch({
+      armDispatch: { type: "external", id: "echo-conductor" },
+      accordionRepo: FIXTURE_DIR,
+      log: () => {},
+      label: "t/echo/0",
+    });
+    expect(result).toEqual({ type: "external", id: "echo-conductor" });
+  });
+
+  it("leaves a bare in-process id unchanged when no launch.json exists for it (legacy checkout)", () => {
+    const result = autoUpgradeArmDispatch({
+      armDispatch: { type: "in-process", id: "builtin" },
+      accordionRepo: FIXTURE_DIR,
+      log: () => {},
+      label: "t/builtin/0",
+    });
+    expect(result).toEqual({ type: "in-process", id: "builtin" });
+  });
+
+  it("never upgrades the raw-baseline arm ('none'), even if a same-named launch.json existed", () => {
+    const repo = fs.mkdtempSync(path.join(tmpdir(), "accordion-none-upgrade-"));
+    const conductorsDir = path.join(repo, "conductors", "none");
+    fs.mkdirSync(conductorsDir, { recursive: true });
+    fs.writeFileSync(path.join(conductorsDir, "launch.json"), JSON.stringify({ command: "node", args: ["x.mjs"] }));
+
+    const result = autoUpgradeArmDispatch({
+      armDispatch: { type: "in-process", id: "none" },
+      accordionRepo: repo,
+      log: () => {},
+      label: "t/none/0",
+    });
+    expect(result).toEqual({ type: "in-process", id: "none" });
+    fs.rmSync(repo, { recursive: true, force: true });
+  });
+});
+
+describe("resolvePlatformBase — guards spec.room being undefined (malformed platform claim)", () => {
+  it("prefers spec.room.base when set", () => {
+    expect(resolvePlatformBase({ room: { base: "https://room-base" } }, { platformBase: "https://cfg-base" })).toBe(
+      "https://room-base",
+    );
+  });
+
+  it("falls back to config.platformBase when spec.room.base is unset", () => {
+    expect(resolvePlatformBase({ room: {} }, { platformBase: "https://cfg-base" })).toBe("https://cfg-base");
+  });
+
+  it("returns null (not a throw) when spec.room is missing", () => {
+    expect(resolvePlatformBase({}, { platformBase: "https://cfg-base" })).toBeNull();
+  });
+
+  it("returns null when spec itself is missing", () => {
+    expect(resolvePlatformBase(null, { platformBase: "https://cfg-base" })).toBeNull();
+    expect(resolvePlatformBase(undefined, { platformBase: "https://cfg-base" })).toBeNull();
+  });
+});
 
 describe("hostEnv — the effective-accordion-repo env seam", () => {
   it("carries BELLOWS_ACCORDION_REPO = the effective repo (a pinned accordionRef worktree)", () => {

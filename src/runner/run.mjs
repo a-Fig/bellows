@@ -85,7 +85,10 @@ export async function executeRun(args) {
   // Resolve up front so a bad "external:<id>" fails before anything is spawned.
   // config.mjs's trial validation already calls parseConductorArm on load, but a
   // caller may construct/execute a run without going through that path (e.g. tests).
-  const armDispatch = arm === "none" ? { type: "in-process", id: "none" } : parseConductorArm(arm);
+  // Reassigned below (after accordionRepo resolution) by autoUpgradeArmDispatch —
+  // dispatch mechanics only; `arm` itself (fingerprint/label/record identity)
+  // is never touched.
+  let armDispatch = arm === "none" ? { type: "in-process", id: "none" } : parseConductorArm(arm);
 
   const fingerprint = { ...sharedFp, conductorId: arm };
   // Per-trial accordionRef: resolve to a pinned worktree (the effective accordion
@@ -145,6 +148,13 @@ export async function executeRun(args) {
   // Effective-repo-bound config for downstream consumers (provision, host spawn,
   // external-conductor launch). Only accordionRepo differs from `config`.
   const effConfig = accordionRepo === config.accordionRepo ? config : { ...config, accordionRepo };
+
+  // Auto-upgrade a bare in-process arm to external dispatch when the resolved
+  // checkout can only run it that way (see autoUpgradeArmDispatch's jsdoc).
+  // Must run AFTER accordionRepo/effConfig are resolved above (accordionRef
+  // worktree pinning) — the checkout shape is only known at this point.
+  armDispatch = autoUpgradeArmDispatch({ armDispatch, accordionRepo: effConfig.accordionRepo, log, label });
+
   let workspaceDir = path.join(runDir, "workspace");
   let agentDir = path.join(runDir, "agent");
   let accordionHome = path.join(runDir, "accordion-home");
@@ -382,12 +392,24 @@ export async function executeRun(args) {
   // THIS sweep — not the agent — is what closed the platform game.
   let sweepFinalize = null;
   try {
-    sweepFinalize = await finalizeStaleAgent({
-      base: spec.room.base || config.platformBase,
-      apiKey,
-      workspaceDir,
-      log: (m) => log(`[${label}] ${m}`),
-    });
+    // spec.room is guaranteed non-null for every LOCAL spec (validateTrialSpec,
+    // config.mjs), but a platform-claimed spec (src/worker/loop.mjs's
+    // defaultExecutor reads `claimed.config` straight off the platform's raw
+    // JSON claim response, unvalidated) could in principle arrive without
+    // one — resolvePlatformBase guards that so this degrades to a skipped
+    // no-op with a clear log line instead of `spec.room.base` throwing
+    // "Cannot read properties of undefined (reading 'base')" out of this block.
+    const platformBase = resolvePlatformBase(spec, config);
+    if (!platformBase) {
+      log(`[${label}] finalize sweep skipped: spec has no room (malformed claim?)`);
+    } else {
+      sweepFinalize = await finalizeStaleAgent({
+        base: platformBase,
+        apiKey,
+        workspaceDir,
+        log: (m) => log(`[${label}] ${m}`),
+      });
+    }
   } catch (e) {
     log(`[${label}] finalize sweep error: ${e.message}`);
   }
@@ -401,15 +423,20 @@ export async function executeRun(args) {
 
   let platform = null;
   try {
-    // Always harvest — even a capped/aborted run leaves a non-final leaderboard
-    // snapshot for each graded submission. Grading is platform-throttled, so the
-    // window is generous (~5 min).
-    platform = await harvestLeaderboard({
-      base: spec.room.base || config.platformBase,
-      label,
-      roomId: harvestRoomId,
-      log,
-    });
+    const platformBase = resolvePlatformBase(spec, config);
+    if (!platformBase) {
+      log(`[${label}] leaderboard harvest skipped: spec has no room (malformed claim?)`);
+    } else {
+      // Always harvest — even a capped/aborted run leaves a non-final leaderboard
+      // snapshot for each graded submission. Grading is platform-throttled, so the
+      // window is generous (~5 min).
+      platform = await harvestLeaderboard({
+        base: platformBase,
+        label,
+        roomId: harvestRoomId,
+        log,
+      });
+    }
   } catch (e) {
     log(`[${label}] leaderboard harvest error: ${e.message}`);
   }
@@ -744,6 +771,26 @@ export function appendAgentFinalizeNote(status, statusDetail, sawAgentFinalize, 
 }
 
 /**
+ * Resolve the platform base URL for the two post-run platform calls
+ * (finalize sweep, leaderboard harvest), tolerating a spec whose `room` is
+ * missing. spec.room is guaranteed present for every LOCAL spec
+ * (validateTrialSpec, config.mjs), but a platform-claimed spec
+ * (src/worker/loop.mjs's defaultExecutor reads `claimed.config` straight off
+ * the platform's raw JSON claim response, unvalidated) could in principle
+ * arrive without one. Returns null in that case so callers can skip the
+ * platform call as a guarded no-op (with their own log line) instead of
+ * dereferencing `spec.room.base` and throwing "Cannot read properties of
+ * undefined (reading 'base')".
+ * @param {{room?: {base?: string}}} spec
+ * @param {{platformBase: string}} config
+ * @returns {string|null}
+ */
+export function resolvePlatformBase(spec, config) {
+  if (!spec || !spec.room) return null;
+  return spec.room.base || config.platformBase;
+}
+
+/**
  * Env overrides for every child process that must see the run's EFFECTIVE
  * accordion repo — spread into `{ ...process.env, ...hostEnv(config) }` at both
  * spawn sites (host, external conductor). When a run pins an accordionRef,
@@ -839,11 +886,66 @@ export function spawnHost({ config, arm, armDispatch, conductorUrl, spec, accord
   return child;
 }
 
+/**
+ * True when `accordionRepo` is a LEGACY-shaped checkout — i.e. it predates the
+ * protocol-v15 ("truth-in-extension") rework and has no `core/protocol.ts`.
+ * Factored out of hostEntryForAccordion so autoUpgradeArmDispatch shares the
+ * exact same shape predicate rather than re-deriving it.
+ * @param {string} accordionRepo
+ * @returns {boolean}
+ */
+export function isLegacyAccordionCheckout(accordionRepo) {
+  return !(typeof accordionRepo === "string" && fs.existsSync(path.join(accordionRepo, "core", "protocol.ts")));
+}
+
 /** Select the protocol-v15 controller for truth-in-extension checkouts. */
 export function hostEntryForAccordion(accordionRepo) {
-  return typeof accordionRepo === "string" && fs.existsSync(path.join(accordionRepo, "core", "protocol.ts"))
-    ? "src/host/main-v15.ts"
-    : "src/host/main.ts";
+  return isLegacyAccordionCheckout(accordionRepo) ? "src/host/main.ts" : "src/host/main-v15.ts";
+}
+
+/**
+ * Auto-upgrade a bare in-process conductor arm to EXTERNAL dispatch when the
+ * resolved Accordion checkout can only run it that way.
+ *
+ * Background: a bare conductor id (e.g. "thermocline") is ambiguous across
+ * checkout shapes. On a v15-shaped checkout the resident host (main-v15.ts)
+ * resolves bare ids itself, including spawn-kind residents — so v15 checkouts
+ * are NEVER auto-upgraded here; doing so would bypass the v15 host's own
+ * resolution. On a LEGACY checkout, a conductor that only has
+ * `conductors/<id>/launch.json` (no IN_PROCESS_CONDUCTORS registration) is
+ * external-launch only — the legacy host (main.ts) exits 1 with
+ * `unknown conductor "<id>"` before pi ever gets a conductor attached (a ~3s
+ * dead run). This rule makes the bare id "just work" on both checkout shapes
+ * by upgrading DISPATCH MECHANICS ONLY: the caller's `armDispatch.id` (and,
+ * critically, the separate `arm` string executeRun threads into the
+ * fingerprint/label/record.json) are never touched — only `.type` flips from
+ * "in-process" to "external".
+ *
+ * Precedence: on a legacy checkout, launch.json presence wins over a
+ * hypothetical same-name in-process registration. Today no conductor has
+ * both, and a launch.json under conductors/<id>/ is the stronger signal of
+ * intent for that directory.
+ *
+ * Explicit `external:<id>` arms and bare ids with no launch.json pass through
+ * unchanged (the `armDispatch.type !== "in-process"` / missing-file checks
+ * below are no-ops for them).
+ * @param {object} args
+ * @param {{type:"in-process"|"external", id:string}} args.armDispatch
+ * @param {string} args.accordionRepo  resolved (possibly pinned-worktree) checkout path
+ * @param {(m:string)=>void} args.log
+ * @param {string} args.label
+ * @returns {{type:"in-process"|"external", id:string}}
+ */
+export function autoUpgradeArmDispatch({ armDispatch, accordionRepo, log, label }) {
+  if (armDispatch.type !== "in-process" || armDispatch.id === "none") return armDispatch;
+  if (!isLegacyAccordionCheckout(accordionRepo)) return armDispatch;
+  const launchPath = path.join(accordionRepo, "conductors", armDispatch.id, "launch.json");
+  if (!fs.existsSync(launchPath)) return armDispatch;
+  log(
+    `[${label}] conductor "${armDispatch.id}" is external-launch on this checkout — ` +
+      `auto-dispatching via conductors/${armDispatch.id}/launch.json`,
+  );
+  return { type: "external", id: armDispatch.id };
 }
 
 /**
