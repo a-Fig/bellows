@@ -21,6 +21,9 @@ export const DEEPSEEK_REPLAY_EXTENSION = path.join(
   "deepseekReplayCompat.mjs",
 );
 
+/** Set to "1" to skip patchDeepSeekCompat entirely (provisionRun then copies models.json byte-for-byte, today's behavior). */
+export const DEEPSEEK_COMPAT_KILL_SWITCH_ENV = "BELLOWS_NO_DEEPSEEK_COMPAT";
+
 /** The kickoff prompt sent over RPC to start the agent. Stable string. */
 export const KICKOFF_PROMPT =
   "Read AGENT_BRIEFING.md and complete the benchmark run it describes, then finalize.";
@@ -135,11 +138,13 @@ export function buildSettings({ model, thinkingLevel, accordionRepo }) {
  * @param {object} [args.meta]              optional join metadata (display_name/model/conductor/
  *   trial/seed) written to workspace/.slopcode_meta.json and surfaced on the leaderboard in
  *   place of the raw agent name — see writeJoinMeta.
+ * @param {(m:string)=>void} [args.log]     diagnostics only (e.g. deepseek compat patch summary);
+ *   never receives key material.
  * @returns {{ workspaceDir:string, agentDir:string, accordionHome:string,
- *             briefing:string, settings:object }}
+ *             briefing:string, settings:object, deepseekCompat:boolean }}
  */
 export function provisionRun(args) {
-  const { runDir, spec, config, roomId, agentName, runLabel, apiKey, meta } = args;
+  const { runDir, spec, config, roomId, agentName, runLabel, apiKey, meta, log = () => {} } = args;
   const workspaceDir = path.join(runDir, "workspace");
   const agentDir = path.join(runDir, "agent");
   const accordionHome = path.join(runDir, "accordion-home");
@@ -164,7 +169,115 @@ export function provisionRun(args) {
   copyCredential(config.piAgentDir, agentDir, "auth.json");
   copyCredential(config.piAgentDir, agentDir, "models.json");
 
-  return { workspaceDir, agentDir, accordionHome, briefing, settings };
+  // 3. Bench-scoped DeepSeek reasoning-compat patch — mutates only the COPY
+  //    just written above, never config.piAgentDir's live source file. See
+  //    applyDeepSeekCompat's jsdoc for why this is needed.
+  const deepseekCompat = applyDeepSeekCompat({ agentDir, log });
+
+  return { workspaceDir, agentDir, accordionHome, briefing, settings, deepseekCompat };
+}
+
+/**
+ * Patch every DeepSeek model entry that pi's own baseUrl-based compat
+ * auto-detect can't see, in place, on an already-parsed models.json.
+ *
+ * pi (`@earendil-works/pi-ai`'s `detectCompat` in `dist/api/openai-completions.js`)
+ * only infers DeepSeek compat — `reasoning: true`-gated `thinkingFormat:
+ * "deepseek"` request shaping, and injecting `reasoning_content` on replayed
+ * assistant messages — when `provider === "deepseek"` or the provider's
+ * `baseUrl` contains `"deepseek.com"`. Routed through TokenRouter
+ * (`baseUrl: "https://api.tokenrouter.com/v1"`), a `deepseek/deepseek-v4-flash`
+ * entry matches neither, so pi silently (a) clamps any requested
+ * thinkingLevel to "off" (`getSupportedThinkingLevels` returns `["off"]` when
+ * `!model.reasoning`) and (b) never replays real `reasoning_content`, forcing
+ * bellows' `deepseekReplayCompat.mjs` extension to backfill a sentinel on
+ * every tool-call turn.
+ *
+ * The fix is declarative: a model entry that explicitly carries
+ * `reasoning: true` plus
+ * `compat: { requiresReasoningContentOnAssistantMessages: true, thinkingFormat: "deepseek" }`
+ * gets the identical request shaping and replay behavior pi would give a
+ * native deepseek.com entry (`getCompat` prefers `model.compat.*` over the
+ * auto-detected value via `??`) — real reasoning_content is captured and
+ * replayed, thinkingLevel medium becomes real, and the single-space filler
+ * extension only has to cover genuine gaps.
+ *
+ * Only touches entries that need it: a provider block whose `baseUrl`
+ * already contains "deepseek.com" is left alone (auto-detect already fires
+ * there), and a model id not matching `/deepseek/i` is never touched. An
+ * entry that already declares `reasoning` and/or either compat field
+ * explicitly is left exactly as written — this only fills gaps, never
+ * overrides an operator's explicit choice.
+ * @param {any} modelsJson  parsed models.json (mutated in place)
+ * @returns {string[]} "provider:modelId" ids that were changed (ids only — never key material)
+ */
+export function patchDeepSeekCompat(modelsJson) {
+  const patchedIds = [];
+  const providers = modelsJson && typeof modelsJson === "object" ? modelsJson.providers : undefined;
+  if (!providers || typeof providers !== "object") return patchedIds;
+  for (const [providerId, block] of Object.entries(providers)) {
+    if (!block || typeof block !== "object" || !Array.isArray(block.models)) continue;
+    const baseUrl = typeof block.baseUrl === "string" ? block.baseUrl.toLowerCase() : "";
+    if (baseUrl.includes("deepseek.com")) continue; // pi's own auto-detect already fires here
+    for (const entry of block.models) {
+      if (!entry || typeof entry !== "object" || typeof entry.id !== "string") continue;
+      if (!/deepseek/i.test(entry.id)) continue;
+      let changed = false;
+      if (entry.reasoning === undefined) {
+        entry.reasoning = true;
+        changed = true;
+      }
+      const existingCompat = entry.compat && typeof entry.compat === "object" ? entry.compat : {};
+      const nextCompat = { ...existingCompat };
+      if (nextCompat.requiresReasoningContentOnAssistantMessages === undefined) {
+        nextCompat.requiresReasoningContentOnAssistantMessages = true;
+        changed = true;
+      }
+      if (nextCompat.thinkingFormat === undefined) {
+        nextCompat.thinkingFormat = "deepseek";
+        changed = true;
+      }
+      if (changed) {
+        entry.compat = nextCompat;
+        patchedIds.push(`${providerId}:${entry.id}`);
+      }
+    }
+  }
+  return patchedIds;
+}
+
+/**
+ * Apply patchDeepSeekCompat to the models.json already copied into a run's
+ * agent dir, rewriting the file only when something changed. Honors the
+ * BELLOWS_NO_DEEPSEEK_COMPAT=1 kill switch (skip entirely, copy stays
+ * byte-for-byte identical to config.piAgentDir's source). Never touches the
+ * source file — only the per-run copy at `<agentDir>/models.json`. Logs at
+ * most one summary line, model ids only, never key material.
+ * @param {object} args
+ * @param {string} args.agentDir  the run's agent dir (models.json already copied here)
+ * @param {(m:string)=>void} [args.log]
+ * @returns {boolean} true when at least one model entry was patched
+ */
+export function applyDeepSeekCompat({ agentDir, log = () => {} }) {
+  if (process.env[DEEPSEEK_COMPAT_KILL_SWITCH_ENV] === "1") return false;
+  const modelsPath = path.join(agentDir, "models.json");
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(modelsPath, "utf8"));
+  } catch (e) {
+    // Diagnostics only — never fail provisioning over an unreadable/malformed
+    // copy (copyCredential above already guarantees the file was written; a
+    // parse failure here means the operator's own models.json is malformed).
+    log(`[provision] deepseek compat: skipped (could not read/parse models.json: ${e.message})`);
+    return false;
+  }
+  const patchedIds = patchDeepSeekCompat(parsed);
+  if (patchedIds.length === 0) return false;
+  fs.writeFileSync(modelsPath, JSON.stringify(parsed, null, 2));
+  log(
+    `[provision] deepseek compat: patched ${patchedIds.length} model entr${patchedIds.length === 1 ? "y" : "ies"} (${patchedIds.join(", ")})`,
+  );
+  return true;
 }
 
 /** Copy the committed workspace template into dest, rendering placeholders. */

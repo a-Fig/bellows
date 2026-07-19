@@ -105,5 +105,6 @@ export function sharedFingerprint({ spec, config, workspaceTemplateDir, kickoffP
     accordionCommit: accordionCommit(config.accordionRepo),
     conductorId: "", // filled per run
     bellowsVersion: bellowsVersion(),
+    deepseekCompat: false, // filled per run once provisionRun's patch outcome is known
   };
 }

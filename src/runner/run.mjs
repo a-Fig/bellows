@@ -178,10 +178,14 @@ export async function executeRun(args) {
       runLabel: label,
       apiKey,
       meta: joinMeta,
+      log: (m) => log(`[${label}] ${m}`),
     });
     workspaceDir = prov.workspaceDir;
     agentDir = prov.agentDir;
     accordionHome = prov.accordionHome;
+    // Provenance: distinguishes post-surgery runs from pre-surgery runs in
+    // analysis (see provision.mjs's applyDeepSeekCompat / patchDeepSeekCompat).
+    fingerprint.deepseekCompat = prov.deepseekCompat;
 
     // Spawn pi in RPC mode with an isolated agent dir + shared accordion home.
     // ACCORDION_PLAN_TIMEOUT_MS / ACCORDION_PLAN_DEADLINE_MS (Accordion issue #58)
