@@ -53,19 +53,29 @@ export function currentHeadShort(repoRoot, log = () => {}) {
 }
 
 /**
- * The real `npm ci --omit=dev` runner (default; tests inject a fake via
+ * The real `npm ci` runner (default; maybeSelfUpdate tests inject a fake via
  * `runNpmCi` instead of exercising this). Bounded by `timeoutMs` — on expiry
  * the child (and any descendants) is killed, mirroring
  * conductorAdvertise.mjs's enumerateInProcessConductors timeout pattern.
  * Uses spawnSafe (not execFileSync) because npm is a `.cmd` shim on Windows —
  * see proc.mjs's header for why that needs special handling.
+ *
+ * MUST install dev dependencies (B1, adversarial review): bellows needs
+ * vite-node/vite/svelte — all devDependencies — at RUNTIME (run.mjs spawns
+ * `node_modules/vite-node/vite-node.mjs` for every in-process run, and
+ * conductorAdvertise spawns it on the claim path), and fleet installs use
+ * plain `npm install`. An `--omit=dev` here would "succeed", skip the
+ * rollback, and relaunch a worker that fails every run. `--include=dev` also
+ * defends against a fleet box exporting NODE_ENV=production (which would
+ * otherwise make a bare `npm ci` omit dev deps).
  * @param {string} repoRoot
  * @param {number} timeoutMs
+ * @param {typeof spawnSafe} [spawnFn]  test seam: capture the spawned arg list
  * @returns {Promise<void>}
  */
-function defaultRunNpmCi(repoRoot, timeoutMs) {
+export function defaultRunNpmCi(repoRoot, timeoutMs, spawnFn = spawnSafe) {
   return new Promise((resolve, reject) => {
-    const child = spawnSafe("npm", ["ci", "--omit=dev"], {
+    const child = spawnFn("npm", ["ci", "--include=dev"], {
       cwd: repoRoot,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
@@ -112,6 +122,8 @@ function defaultRunNpmCi(repoRoot, timeoutMs) {
  *   - ff succeeds, no lockfile change                    -> {action:"updated", from, to}
  *   - ff succeeds, lockfile changed, npm ci succeeds      -> {action:"updated", from, to}
  *   - ff succeeds, lockfile changed, npm ci FAILS         -> git reset --hard back to `from`, {action:"rolled-back", reason}
+ *     (code rollback only — node_modules may be left partially installed by
+ *     the failed npm ci and may need a manual `npm install`; logged as WARN)
  *
  * @param {object} args
  * @param {string} args.repoRoot  the bellows checkout to update
@@ -214,16 +226,22 @@ export async function maybeSelfUpdate({
   }
 
   if (changedLockfile) {
-    log(`[worker] self-update: package-lock.json changed (${oldHead.slice(0, 12)}→${newHead.slice(0, 12)}) — running npm ci --omit=dev before relaunch`);
+    log(`[worker] self-update: package-lock.json changed (${oldHead.slice(0, 12)}→${newHead.slice(0, 12)}) — running npm ci before relaunch`);
     try {
       await runNpmCi(repoRoot, npmCiTimeoutMs);
     } catch (e) {
-      log(`[worker] self-update WARN: npm ci failed after fast-forward — rolling back to ${oldHead.slice(0, 12)}: ${e.message}`);
+      // m1 (adversarial review): this rollback guarantees the CODE is back at
+      // oldHead so the relaunch-triggering "updated" path never fires — but a
+      // failed `npm ci` may already have torn down / partially replaced
+      // node_modules, and nothing here can restore that. Say so loudly rather
+      // than implying the tree is fully healed.
+      log(`[worker] self-update WARN: npm ci failed after fast-forward — rolling back code to ${oldHead.slice(0, 12)}: ${e.message}`);
       try {
         git(repoRoot, ["reset", "--hard", oldHead], timeoutMs);
       } catch (resetErr) {
         log(`[worker] self-update WARN: rollback (git reset --hard ${oldHead.slice(0, 12)}) ALSO failed: ${firstErrLine(resetErr)} — checkout may be inconsistent, manual intervention required`);
       }
+      log(`[worker] self-update WARN: node_modules may be left partially installed by the failed npm ci — if this worker misbehaves, run npm install in ${repoRoot} manually`);
       return { action: "rolled-back", reason: `npm ci failed: ${e.message}` };
     }
   }

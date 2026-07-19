@@ -45,6 +45,16 @@ const TEST_ACCORDION_REPO = process.env.BELLOWS_ACCORDION_REPO?.trim()
  */
 const ACCORDION_IS_V15 = existsSync(path.join(TEST_ACCORDION_REPO, "core", "protocol.ts"));
 
+/*
+ * N5: also skip when the resolved accordion checkout does not exist on disk at
+ * all. A fresh public clone has no bench.config.json, and the example config's
+ * accordionRepo is a placeholder path — without this guard every test here
+ * RUNS, spawns a host child pointed at a nonexistent checkout, and hangs its
+ * full ~300s timeout waiting on a WS connect that can never happen, instead of
+ * skipping. Can't integration-test against a checkout that isn't there.
+ */
+const ACCORDION_MISSING = !existsSync(TEST_ACCORDION_REPO);
+
 interface Spawned {
 	child: ChildProcess;
 	telemetryOut: string;
@@ -124,7 +134,7 @@ afterEach(async () => {
 	}
 });
 
-describe.skipIf(ACCORDION_IS_V15)("headless conductor host", () => {
+describe.skipIf(ACCORDION_MISSING || ACCORDION_IS_V15)("headless conductor host", () => {
 	it("attaches, folds an over-budget context with the built-in conductor, and writes valid telemetry", async () => {
 		const home = mkdtempSync(path.join(tmpdir(), "bellows-host-"));
 		const telemetryOut = path.join(home, "telemetry.jsonl");

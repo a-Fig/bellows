@@ -573,7 +573,9 @@ describe("runWorkerLoop", { timeout: 20_000 }, () => {
       const summary = await runWorkerLoop({ config: selfUpdateConfig(), apiKey: SECRET, log, once: true, executeRunFn: fakeExecutor, maybeSelfUpdateFn: fakeSelfUpdate });
       expect(summary).toEqual({ claimed: 1, completed: 1, failed: 0 });
       expect(fakeSelfUpdate).toHaveBeenCalledTimes(1); // the startup check only — `once` returns before the after-run checkpoint
-      expect(logs.join("\n")).toMatch(/self-update: skipped \(dirty working tree\)/);
+      // m2 (adversarial review): skips log at WARN level — a permanently-skipping
+      // worker is silently pinned to old code, exactly the drift this feature exists to stop.
+      expect(logs.join("\n")).toMatch(/WARN: self-update skipped \(dirty working tree\) — this worker will not auto-update/);
     });
 
     it("throttles repeat checks: back-to-back idle 204 polls only re-check once the throttle window has elapsed", async () => {
@@ -638,6 +640,55 @@ describe("runWorkerLoop", { timeout: 20_000 }, () => {
       const summary = await runWorkerLoop({ config: selfUpdateConfig(), apiKey: SECRET, log, once: true, executeRunFn: vi.fn(), maybeSelfUpdateFn: fakeSelfUpdate });
       expect(summary).toEqual({ claimed: 0, completed: 0, failed: 0 });
       expect(logs.join("\n")).toMatch(/WARN: self-update rolled back \(npm ci failed: boom\)/);
+    });
+
+    it("M1: no self-update check starts once shutdown has been requested (after-run checkpoint suppressed)", async () => {
+      // SIGTERM arrives mid-run: the loop's `stopped` flag is set while the run
+      // is in flight. Without the guard, the after-run checkpoint would still
+      // launch a fetch (and possibly minutes of npm ci) on a process that
+      // should be exiting within ~10s — assert it never even starts.
+      _timing.selfUpdateThrottleMs = 0; // unthrottled: the after-run check WOULD fire if not suppressed
+      platform.onClaim = () => ({ status: 200, body: { run: claimedRunFixture() } });
+      platform.onComplete = () => ({ status: 200, body: { ok: true } });
+
+      const controller = new AbortController();
+      let selfUpdateCalls = 0;
+      const fakeSelfUpdate = vi.fn(async () => {
+        selfUpdateCalls++;
+        return { action: "current" };
+      });
+
+      const fakeExecutor = vi.fn(async ({ runDir }) => {
+        fs.mkdirSync(runDir, { recursive: true });
+        controller.abort(); // shutdown requested while the run is in flight
+        return {
+          id: "run-1",
+          label: "t1/keel/1",
+          status: "completed",
+          fingerprint: { conductorId: "keel" },
+          timing: { startedAt: "2026-01-01T00:00:00.000Z", endedAt: "2026-01-01T00:01:00.000Z", wallClockS: 60 },
+          usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, costUsd: 0, assistantTurns: 1, toolCalls: 0 },
+          turns: [],
+          conductor: null,
+          platform: null,
+          artifacts: { piSessionFile: "", hostTelemetryFile: null, workspaceDir: runDir, agentDir: runDir },
+        };
+      });
+
+      const summary = await runWorkerLoop({
+        config: selfUpdateConfig(),
+        apiKey: SECRET,
+        log,
+        signal: controller.signal,
+        executeRunFn: fakeExecutor,
+        maybeSelfUpdateFn: fakeSelfUpdate,
+        maxIterations: 5,
+      });
+
+      expect(summary.claimed).toBe(1);
+      // Only the startup check ran; the after-run checkpoint was suppressed by
+      // the shutdown guard even though the throttle would have allowed it.
+      expect(selfUpdateCalls).toBe(1);
     });
   });
 });

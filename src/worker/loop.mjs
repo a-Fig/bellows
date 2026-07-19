@@ -256,6 +256,12 @@ export async function runWorkerLoop(opts) {
    */
   async function checkSelfUpdate({ force = false } = {}) {
     if (!autoUpdateEnabled) return false;
+    // M1 (adversarial review): never start a self-update once shutdown has been
+    // requested — the process should be exiting within ~10s (see
+    // shutdownCompleteDeadlineMs), not opening a 60s fetch + minutes of npm ci
+    // that a follow-up SIGKILL could interrupt mid-install (HEAD advanced,
+    // node_modules half-written, and no self-heal on relaunch).
+    if (stopped || signal?.aborted) return false;
     const now = Date.now();
     if (!force && now - lastSelfUpdateCheckAt < _timing.selfUpdateThrottleMs) return false;
     lastSelfUpdateCheckAt = now;
@@ -284,8 +290,10 @@ export async function runWorkerLoop(opts) {
       log(`[worker] WARN: self-update rolled back (${result.reason}) — continuing on the current code`);
       return false;
     }
-    // "skipped"
-    log(`[worker] self-update: skipped (${result.reason})`);
+    // "skipped" — WARN-level (m2, adversarial review): a permanently-skipping
+    // worker (dirty/diverged/non-main checkout) is silently pinned to old code,
+    // which is exactly the fleet-drift failure self-update exists to prevent.
+    log(`[worker] WARN: self-update skipped (${result.reason}) — this worker will not auto-update`);
     return false;
   }
 

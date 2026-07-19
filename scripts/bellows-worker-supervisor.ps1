@@ -1,7 +1,8 @@
 # Supervisor for a bellows Windows worker.
 # Space-free path so Task Scheduler's `-File` parses cleanly (a bellows dir
-# under e.g. "...\Claude Work Space\...", which breaks a bare -File argument,
-# is a real hazard — see the -BellowsDir default below for one example).
+# under a path containing spaces — e.g. "...\My Projects\..." — breaks a bare
+# -File argument; keep this script, and ideally the checkout itself, on a
+# space-free path).
 #
 # Design: this script IS the supervisor. Its while($true) loop relaunches node
 # whenever the worker exits — including a clean self-update exit (see
@@ -13,12 +14,13 @@
 # this at logon, and keep exactly one instance (MultipleInstances=IgnoreNew).
 # Every launch path here is wrapped so nothing can terminate the loop.
 #
-# Usage: pass -BellowsDir if this worker's checkout lives somewhere other
-# than the default below, e.g.:
-#   powershell -File scripts\bellows-worker-supervisor.ps1 -BellowsDir 'C:\bellows'
+# Usage: operators pass -BellowsDir pointing at their machine's real bellows
+# checkout; the default below is only a generic (deliberately space-free)
+# placeholder, e.g.:
+#   powershell -File scripts\bellows-worker-supervisor.ps1 -BellowsDir 'D:\work\bellows'
 
 param(
-  [string]$BellowsDir = 'C:\Users\smash\Desktop\Claude Work Space\bellows'
+  [string]$BellowsDir = 'C:\bellows'
 )
 
 $ErrorActionPreference = 'Continue'

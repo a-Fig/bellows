@@ -405,9 +405,13 @@ Checked (see `src/worker/selfUpdate.mjs`), in order:
 4. **Fetch fails** (network, auth) → skipped, logged.
 5. **Already up to date** → no-op, logged once (not every idle poll).
 6. **Behind, but fast-forwardable** → fast-forwards (`merge --ff-only`), then exits for relaunch.
-   If `package-lock.json` changed in the fast-forward, `npm ci --omit=dev` runs first; if that
-   fails, the checkout is rolled back (`git reset --hard` to the pre-update sha) and the worker
-   keeps running the OLD code rather than relaunching into a broken `node_modules`.
+   If `package-lock.json` changed in the fast-forward, `npm ci` runs first (with
+   `--include=dev` — bellows needs vite-node/vite/svelte, all devDependencies, at *runtime*,
+   and the flag also defends against a fleet box exporting `NODE_ENV=production`). If npm ci
+   fails, the *code* is rolled back (`git reset --hard` to the pre-update sha) so the worker
+   keeps running the old code without relaunching — but note `node_modules` itself may be left
+   partially installed by the failed npm ci (a WARN is logged saying so); if the worker
+   misbehaves afterwards, run `npm install` in the checkout manually.
 7. **Behind, but diverged** (ff-only refuses — e.g. a force-push, or local commits on `main`) →
    skipped, logged loudly. Never rewrites history unattended.
 
@@ -428,23 +432,20 @@ throttle clock, so a burst of short runs can't turn this into "check on every ti
 worker also logs its own HEAD sha once at startup and includes it as `version` on every claim
 request, purely for fleet visibility (the platform ignores the field today).
 
-**Auth for a private repo fetch.** `bellows` (a-Fig/bellows) is private, so `git fetch origin
-main` on a worker machine needs *some* credential. Two supported approaches:
-- **Read-only deploy key per machine** — generate an SSH keypair on the worker, add it as a
-  GitHub deploy key (read-only) on the repo, and point the checkout's `origin` remote at the
-  SSH URL. Scoped to one repo, no write access, easy to revoke per-machine.
-- **Public repo** — if/when this repo (or the worker's fork of it) is public, an anonymous
-  HTTPS `origin` fetches with no credential at all. Simplest option if it's ever on the table.
-
-Either way, self-update never needs a token with WRITE access — it only ever fetches and
-fast-forwards.
+**Auth for the fetch.** `bellows` (a-Fig/bellows) is public, so the default case needs no
+credential at all: a checkout whose `origin` is the anonymous HTTPS URL fetches and
+fast-forwards with zero setup. Only a **private fork** needs a credential — for that, generate
+an SSH keypair on the worker, add it as a read-only GitHub deploy key on the fork, and point
+the checkout's `origin` remote at the SSH URL (scoped to one repo, no write access, easy to
+revoke per-machine). Either way, self-update never needs a token with WRITE access — it only
+ever fetches and fast-forwards.
 
 **Known rollout risk: CRLF phantom-dirty checkouts.** A checkout with `core.autocrlf` drift
 (common after copying/zipping a repo across OSes, or a stale `.gitattributes`) can show every
 text file as modified in `git status --porcelain` even though the content is byte-for-byte the
 same aside from line endings. Self-update's dirty check treats that exactly like real
-uncommitted work and skips forever — silently disabling self-update on that machine without
-ever logging an error (just a steady stream of `self-update: skipped (dirty working tree)`).
+uncommitted work and skips forever — permanently disabling self-update on that machine (watch
+the logs for repeated `WARN: self-update skipped (dirty working tree)` lines).
 This has actually been observed on this project's homeserver checkout. Before relying on
 self-update on a given machine, confirm `git status --porcelain` is empty on a fresh idle
 worker; if it isn't, normalize line endings once (`git config core.autocrlf false` — or `true`,
@@ -466,8 +467,9 @@ it:
 powershell -File "C:\path\to\bellows\scripts\bellows-worker-supervisor.ps1" -BellowsDir "C:\path\to\bellows"
 ```
 
-`-BellowsDir` defaults to the machine this script was written on; always pass it explicitly on
-a different box. Notes carried over from the original ad hoc version of this script:
+`-BellowsDir` defaults to a generic space-free placeholder (`C:\bellows`); always pass your
+machine's real checkout path explicitly. Notes carried over from the original ad hoc version
+of this script:
 - **Space-free path matters for Task Scheduler.** A `-BellowsDir` (or the script's own path)
   containing spaces can break a bare `-File` argument in a Scheduled Task's action string —
   quote the whole action command, and prefer a space-free path for the *script* itself if

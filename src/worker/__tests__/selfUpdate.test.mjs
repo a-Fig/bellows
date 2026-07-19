@@ -2,8 +2,9 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { EventEmitter } from "node:events";
 import { execFileSync } from "node:child_process";
-import { maybeSelfUpdate, currentHeadShort } from "../selfUpdate.mjs";
+import { maybeSelfUpdate, currentHeadShort, defaultRunNpmCi } from "../selfUpdate.mjs";
 
 const GIT_OK = (() => {
   try {
@@ -169,6 +170,40 @@ describe.skipIf(!GIT_OK)("maybeSelfUpdate", () => {
     const result = await maybeSelfUpdate({ repoRoot: notARepo, log: () => {} });
     expect(result.action).toBe("skipped");
     expect(result.reason).toMatch(/git status failed/);
+  });
+});
+
+describe("defaultRunNpmCi (B1, adversarial review)", () => {
+  /** A fake spawnFn returning an inert child that exits with the given code. */
+  function makeSpawnFn(exitCode, calls) {
+    return (cmd, args, opts) => {
+      calls.push({ cmd, args, opts });
+      const child = new EventEmitter();
+      child.stderr = new EventEmitter();
+      setImmediate(() => child.emit("exit", exitCode));
+      return child;
+    };
+  }
+
+  it("must NOT pass --omit=dev: bellows needs devDependencies (vite-node/vite/svelte) at runtime", async () => {
+    // An `--omit=dev` npm ci would "succeed", skip the rollback, and relaunch a
+    // worker whose every in-process run fails (run.mjs spawns
+    // node_modules/vite-node/vite-node.mjs) — a silently bricked worker.
+    const calls = [];
+    await defaultRunNpmCi("C:/some/repo", 5_000, makeSpawnFn(0, calls));
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].cmd).toBe("npm");
+    expect(calls[0].args).toContain("ci");
+    expect(calls[0].args).not.toContain("--omit=dev");
+    // --include=dev defends against a fleet box exporting NODE_ENV=production.
+    expect(calls[0].args).toContain("--include=dev");
+    expect(calls[0].opts.cwd).toBe("C:/some/repo");
+  });
+
+  it("rejects on a nonzero exit code", async () => {
+    const calls = [];
+    await expect(defaultRunNpmCi("C:/some/repo", 5_000, makeSpawnFn(1, calls))).rejects.toThrow(/npm ci exited 1/);
   });
 });
 
