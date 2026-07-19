@@ -158,6 +158,10 @@ export interface Fingerprint {
   accordionCommit: string;       // git HEAD of the accordion checkout used
   conductorId: string;
   bellowsVersion: string;
+  /** True when provisionRun's DeepSeek reasoning-compat patch (provision.mjs's
+   *  patchDeepSeekCompat) changed >=1 model entry in this run's models.json
+   *  copy — distinguishes post-surgery rows from pre-surgery rows in analysis. */
+  deepseekCompat: boolean;
 }
 
 export interface UsageTotals {
