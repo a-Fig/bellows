@@ -1,0 +1,60 @@
+# Accordion devmain conductor lineup on xjq at a 100k budget.
+# Pinned to devmain SHA 368498a63fef5985dcb850ef5a492b076c29221b (protocol v22)
+# via accordionRef — NOT the branch name, since accordionRef.mjs's
+# resolveRefToSha re-resolves a branch ref at run time and would silently
+# make two runs a week apart non-comparable under the same trial name.
+#
+# NOT COMPARABLE to the older main-branch trials (builtin-vs-naive-xjq-100k-v3,
+# keel-vs-sliding-xjq-100k, etc.) even though the budget/protectTokens/minutes
+# shape matches: devmain's protocol v22 counts the system prompt as a real
+# block in liveTokens, so liveTokens/budgetSeries readings are not on the same
+# scale as pre-v22 runs. Compare devmain trials only against other devmain
+# trials pinned to the same accordionRef.
+#
+# Arms are every devmain conductor id in core/conductor/registry.ts ENTRIES
+# except one:
+#   - none             raw baseline, no host attached (detached sentinel)
+#   - compaction-naive  in-process, shared with legacy main
+#   - handoff           in-process, devmain-only
+#   - doorman           in-process, devmain-only (new on devmain, no main equivalent)
+#   - thermocline       spawn/out-of-process, devmain-only
+# triptych is DELIBERATELY EXCLUDED: it declares requiredModules
+# ["web-tree-sitter", "tree-sitter-wasms/package.json"] and reports readiness
+# "unavailable" in a bellows worktree, because bellows worktree provisioning
+# deliberately never runs `npm install`. Including it would just be a
+# guaranteed-unavailable arm burning a room slot for no data.
+#
+# Bare conductor ids (not "external:<id>") throughout: this is a devmain
+# (non-legacy, protocol.ts-shaped) checkout, so run.mjs's
+# autoUpgradeArmDispatch returns dispatch unchanged for every in-process id —
+# the resident v22 host resolves spawn-kind conductors like thermocline
+# itself. "external:thermocline" is legacy-only dispatch syntax and would
+# throw before pi even starts.
+#
+# ONLY cap: 90-minute wall clock (turns/costUsd absurdly high so they can
+# never bind; totalTokens omitted entirely) — matches the v3/keel-vs-sliding
+# shape so a healthy run ends only on agent-finish or the clock.
+trial: devmain-conductors-xjq-100k
+problems: xjq
+model: token-router:deepseek/deepseek-v4-flash
+thinkingLevel: medium
+accordionRef: 368498a63fef5985dcb850ef5a492b076c29221b
+budget: 100000
+protectTokens: 10000
+arms:
+  - conductor: none
+  - conductor: compaction-naive
+  - conductor: handoff
+  - conductor: doorman
+  - conductor: thermocline
+seeds: 1
+caps:
+  costUsd: 1000000     # inert ($0 pricing) + absurdly high — can never fire
+  turns: 100000000     # effectively no turn cap
+  minutes: 90          # THE ONLY REAL CAP
+  # totalTokens: intentionally omitted — no token cap
+parallel: 2            # matches existing 2-arm trials' practical concurrency;
+                        # 5 arms just means more sequential batches, not more
+                        # in-flight runs than the machine has handled before
+room:
+  create: true
