@@ -267,7 +267,7 @@ export async function executeRun(args) {
     // extension socket is still alive so POSIX workers can disarm/detach
     // cleanly; on Windows the child is terminated directly and pi follows
     // immediately. Legacy hosts retain their established pi-first ordering.
-    const v15Host = hostEntryForAccordion(effConfig.accordionRepo) === "src/host/main-v15.ts";
+    const v15Host = isResidentHostCheckout(effConfig.accordionRepo);
     if (v15Host) {
       try {
         await stopHost();
@@ -902,9 +902,19 @@ export function isLegacyAccordionCheckout(accordionRepo) {
   return !(typeof accordionRepo === "string" && fs.existsSync(path.join(accordionRepo, "core", "protocol.ts")));
 }
 
+// Entry point for the resident (truth-in-extension) controller. The filename keeps
+// the "main-v15" name for path stability — see main-v15.ts's header comment — even
+// though it now bridges protocol v15 through v22.
+export const RESIDENT_HOST_ENTRY = "src/host/main-v15.ts";
+
+/** True for any checkout the resident host (RESIDENT_HOST_ENTRY) can drive. */
+export function isResidentHostCheckout(accordionRepo) {
+  return !isLegacyAccordionCheckout(accordionRepo);
+}
+
 /** Select the protocol-v15 controller for truth-in-extension checkouts. */
 export function hostEntryForAccordion(accordionRepo) {
-  return isLegacyAccordionCheckout(accordionRepo) ? "src/host/main.ts" : "src/host/main-v15.ts";
+  return isLegacyAccordionCheckout(accordionRepo) ? "src/host/main.ts" : RESIDENT_HOST_ENTRY;
 }
 
 /**

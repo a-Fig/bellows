@@ -1,19 +1,35 @@
 /*
- * Bellows control client for Accordion's truth-in-extension protocol (v15).
+ * Bellows control client for Accordion's truth-in-extension protocol (v15-v22).
  *
  * Unlike the legacy sync/plan host, this process does not execute a conductor.
  * It connects as a native GUI-role client, sets the run's dials, asks the
  * extension to attach the selected resident conductor, enables folding, and
  * mirrors Truth events only to produce benchmark telemetry.
+ *
+ * The filename is retained as "main-v15" despite supporting through v22 — a
+ * live worker (see bellows-worker-update-procedure) references this path, and
+ * renaming it would require a coordinated deploy. The supported range lives in
+ * accordionV15.ts's MIN/MAX_SUPPORTED_PROTOCOL constants, not the filename.
  */
 import WebSocket from "ws";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { Telemetry } from "./telemetry";
-import { loadAccordionV15, type TruthReplica } from "./accordionV15";
+import { loadAccordionV15, MIN_SUPPORTED_PROTOCOL, MAX_SUPPORTED_PROTOCOL, type TruthReplica } from "./accordionV15";
 
 const STALE_AFTER_MS = 15_000;
 const ATTACH_TIMEOUT_MS = 30_000;
+// v16 introduced the single-controller lease: a GUI socket must claim it or every
+// mutating command is silently refused (see the claimController handling below).
+const CONTROLLER_PROTOCOL_MIN = 16;
+// v21 introduced per-conductor readiness on the hello message.
+const READINESS_PROTOCOL_MIN = 21;
+// One retry: enough to recover from a lease we lost to a stale reconnect race,
+// not so many that a genuinely-foreign holder drags us out to the 30s
+// attach-timeout instead of failing fast.
+const CLAIM_RETRY_LIMIT = 1;
+const SURFACE_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
 
 interface Args {
 	accordionHome: string;
@@ -23,6 +39,8 @@ interface Args {
 	telemetryOut: string;
 	timeoutMin: number;
 	attachTimeoutMs: number;
+	surfaceId: string;
+	surfaceLabel: string;
 }
 
 interface SessionEntry {
@@ -58,6 +76,15 @@ function parseArgs(argv: string[]): Args {
 	if (map.has("conductor-url") || map.has("conductor-id")) {
 		throw new Error("bellows v15 host: external conductor launch flags are obsolete; select the resident conductor by id");
 	}
+	// --surface-id/--surface-label exist for test determinism; production runs rely
+	// on the generated default. The default is built from pid+random bytes rather
+	// than the run label because labels are "<trial>/<arm>/<seed>" — the "/" would
+	// fail SURFACE_ID_RE below and a caller-supplied bad surface must throw, so a
+	// silently-invalid label-derived surface is exactly the failure mode we avoid.
+	const surfaceId = map.has("surface-id") ? map.get("surface-id")! : `bellows-${process.pid}-${randomBytes(6).toString("hex")}`;
+	if (!SURFACE_ID_RE.test(surfaceId)) {
+		throw new Error(`bellows v15 host: --surface-id "${surfaceId}" is invalid — must match ${SURFACE_ID_RE} (max 64 chars); a socket with an invalid surface can never hold the controller lease`);
+	}
 	return {
 		accordionHome: need("accordion-home"),
 		conductor: need("conductor"),
@@ -68,6 +95,8 @@ function parseArgs(argv: string[]): Args {
 		attachTimeoutMs: map.has("attach-timeout-ms")
 			? number("attach-timeout-ms", map.get("attach-timeout-ms")!)
 			: ATTACH_TIMEOUT_MS,
+		surfaceId,
+		surfaceLabel: map.has("surface-label") ? map.get("surface-label")! : "Bellows bench",
 	};
 }
 
@@ -108,10 +137,11 @@ async function main(): Promise<number> {
 	const accordion = await loadAccordionV15();
 	const deadline = Date.now() + args.timeoutMin * 60_000;
 
-	if (accordion.PROTOCOL_VERSION !== 15) {
-		tel.emit({ t: "error", at: Date.now(), message: `v15 controller loaded Accordion protocol v${accordion.PROTOCOL_VERSION}` });
+	if (accordion.PROTOCOL_VERSION < MIN_SUPPORTED_PROTOCOL || accordion.PROTOCOL_VERSION > MAX_SUPPORTED_PROTOCOL) {
+		const message = `bellows host: Accordion protocol v${accordion.PROTOCOL_VERSION} is outside the supported range v${MIN_SUPPORTED_PROTOCOL}-v${MAX_SUPPORTED_PROTOCOL} (see core/protocol.ts History block)`;
+		tel.emit({ t: "error", at: Date.now(), message });
 		await tel.close();
-		throw new Error(`bellows v15 host: expected Accordion protocol v15, got v${accordion.PROTOCOL_VERSION}`);
+		throw new Error(message);
 	}
 	const registryEntry = accordion.ENTRIES.find((entry) => entry.id === args.conductor && entry.kind !== "none");
 	if (!registryEntry) {
@@ -149,10 +179,25 @@ async function main(): Promise<number> {
 	let lastHookCount = 0;
 	let lastHoldTimeouts = 0;
 	let configured = false;
+	let claimRetries = 0;
 
 	const sendCommand = (cmd: Record<string, unknown>) => {
 		if (!ws || ws.readyState !== WebSocket.OPEN) return;
 		ws.send(JSON.stringify({ type: "command", seq: ++commandSeq, cmd }));
+	};
+	// Ordered commands: establish dials first, attach the conductor against those
+	// dials, then opt this benchmark session into folding. Shared by the initial
+	// snapshot-triggered configure and by the read-only-refusal retry, which must
+	// resend the exact same sequence after re-claiming the lease.
+	const sendConfigureCommands = () => {
+		sendCommand({ kind: "setBudget", value: args.budget });
+		sendCommand({ kind: "setProtect", value: args.protect });
+		sendCommand({ kind: "selectConductor", id: args.conductor });
+		sendCommand({ kind: "setFolding", value: true });
+	};
+	const sendClaimController = () => {
+		if (!ws || ws.readyState !== WebSocket.OPEN) return;
+		ws.send(JSON.stringify({ type: "claimController" }));
 	};
 	const emitSnapshot = () => {
 		if (!replica) return;
@@ -187,8 +232,17 @@ async function main(): Promise<number> {
 	process.once("SIGTERM", sigterm);
 	process.once("SIGINT", sigint);
 
+	// v15 gets a byte-identical URL to before (proves no v15 regression); v16+
+	// must carry `surface` or the extension can never grant us the controller
+	// lease and every mutating command below is silently refused.
+	const connectUrl =
+		accordion.PROTOCOL_VERSION >= CONTROLLER_PROTOCOL_MIN
+			? `ws://127.0.0.1:${session.port}/?role=gui&surface=${encodeURIComponent(args.surfaceId)}&label=${encodeURIComponent(args.surfaceLabel)}`
+			: `ws://127.0.0.1:${session.port}/?role=gui`;
+	tel.emit({ t: "info", at: Date.now(), message: `connecting with surfaceId "${args.surfaceId}"` });
+
 	const done = await new Promise<"closed" | "fatal">((resolve) => {
-		const socket = new WebSocket(`ws://127.0.0.1:${session!.port}/?role=gui`);
+		const socket = new WebSocket(connectUrl);
 		ws = socket;
 		socket.on("message", (data: WebSocket.RawData) => {
 			let raw: unknown;
@@ -199,13 +253,45 @@ async function main(): Promise<number> {
 				switch (msg.type) {
 				case "hello": {
 					if (msg.protocolVersion !== accordion.PROTOCOL_VERSION || msg.role !== "gui") {
-						beginFatal(new Error(`protocol/role mismatch — expected v15 gui, got v${msg.protocolVersion} ${msg.role}`));
+						beginFatal(new Error(`protocol/role mismatch — expected v${accordion.PROTOCOL_VERSION} gui, got v${msg.protocolVersion} ${msg.role}`));
 						return;
 					}
 					const available = Array.isArray(msg.conductors) ? msg.conductors.map((c: any) => c?.id) : [];
 					if (!available.includes(args.conductor)) {
 						beginFatal(new Error(`extension did not advertise conductor "${args.conductor}" (available: ${available.join(", ")})`));
 						return;
+					}
+					// v21: a conductor can be advertised (present in `conductors[]`) yet still
+					// unable to run (e.g. a spawn-kind conductor whose binary is missing). Preflight
+					// this here and fail fast — selectConductor for an unavailable conductor is
+					// silently ignored by the extension, which would otherwise hang to the 30s
+					// attach-timeout with a misleading "did not become active" error.
+					if (accordion.PROTOCOL_VERSION >= READINESS_PROTOCOL_MIN) {
+						const entry = Array.isArray(msg.conductors) ? msg.conductors.find((c: any) => c?.id === args.conductor) : undefined;
+						const readiness = entry?.readiness;
+						if (!readiness || readiness.state === "unavailable") {
+							const reason = readiness?.reason ?? "extension reported no readiness for this conductor";
+							const remediation = readiness?.remediation ? ` (${readiness.remediation})` : "";
+							beginFatal(new Error(`conductor "${args.conductor}" is unavailable — ${reason}${remediation}`));
+							return;
+						}
+					}
+					// v16: mutating commands are silently refused unless this socket holds the
+					// controller lease. A foreign *fresh* holder here should be impossible — each
+					// run gets its own ACCORDION_HOME — so it's logged as a signal that isolation
+					// broke, not treated as fatal (the claim below still wins if the other holder
+					// is stale). We do NOT wait for a `{type:"controller"}` ack: the extension
+					// dedupes that broadcast on holder, so re-claiming a lease we already hold may
+					// emit nothing, and waiting would deadlock. The extension applies the lease
+					// synchronously on receipt and frames are processed in order, so by the time
+					// the `snapshot` handler below sends the four configure commands, this claim
+					// has already taken effect.
+					if (accordion.PROTOCOL_VERSION >= CONTROLLER_PROTOCOL_MIN) {
+						const controller = msg.controller;
+						if (controller?.fresh && controller.surfaceId !== args.surfaceId) {
+							tel.emit({ t: "info", at: Date.now(), message: `foreign fresh controller lease held by surfaceId "${controller.surfaceId}" at hello — per-run ACCORDION_HOME isolation should make this impossible` });
+						}
+						sendClaimController();
 					}
 					helloSeen = true;
 					meta = { format: "pi", title: msg.meta?.title || "", cwd: msg.meta?.cwd || "", model: msg.meta?.model || "" };
@@ -217,12 +303,7 @@ async function main(): Promise<number> {
 					emitSnapshot();
 					if (!configured) {
 						configured = true;
-						// Ordered commands: establish dials first, attach the conductor against those
-						// dials, then opt this benchmark session into folding.
-						sendCommand({ kind: "setBudget", value: args.budget });
-						sendCommand({ kind: "setProtect", value: args.protect });
-						sendCommand({ kind: "selectConductor", id: args.conductor });
-						sendCommand({ kind: "setFolding", value: true });
+						sendConfigureCommands();
 						attachTimer = setTimeout(() => {
 							if (attached) return;
 							beginFatal(new Error(`conductor "${args.conductor}" did not become active within ${args.attachTimeoutMs}ms`));
@@ -252,12 +333,41 @@ async function main(): Promise<number> {
 						if (attachTimer) clearTimeout(attachTimer);
 						tel.emit({ t: "attach", at: Date.now(), sessionId: session!.sessionId, conductor: args.conductor, budget: args.budget, protectTokens: args.protect });
 						tel.emit({ t: "info", at: Date.now(), message: `Accordion v15 resident conductor active: ${args.conductor}` });
+					} else if (attached && (msg.active === null || msg.active?.id !== args.conductor)) {
+						// The extension broadcasts conductorState OPTIMISTICALLY at spawn time for
+						// spawn-kind conductors (thermocline/triptych) — up to 10s before the runner
+						// actually dials in. If it never dials, the extension auto-detaches. Without
+						// this check bellows would silently keep recording a "conducted" arm that was
+						// really a raw baseline for the rest of the run, poisoning the comparison.
+						beginFatal(new Error(`conductor "${args.conductor}" detached mid-run`));
+						return;
 					}
 					break;
 				}
 				case "conductorStatus":
 					if (typeof msg.text === "string" && msg.text) tel.emit({ t: "info", at: Date.now(), message: `status: ${msg.text}` });
 					break;
+				case "commandResult": {
+					if (msg.refused !== "read-only") break;
+					if (claimRetries < CLAIM_RETRY_LIMIT) {
+						claimRetries++;
+						tel.emit({ t: "error", at: Date.now(), message: `command seq ${msg.seq} refused as read-only — re-claiming controller lease and reconfiguring (attempt ${claimRetries}/${CLAIM_RETRY_LIMIT})` });
+						sendClaimController();
+						sendConfigureCommands();
+					} else {
+						beginFatal(new Error(`bellows v15 host: controller lease for surfaceId "${args.surfaceId}" could not be claimed after ${CLAIM_RETRY_LIMIT} retry attempt(s) — another GUI socket holds it`));
+						return;
+					}
+					break;
+				}
+				case "notice":
+					if (typeof msg.text === "string" && msg.text) tel.emit({ t: "info", at: Date.now(), message: `notice: ${msg.text}` });
+					break;
+				case "controller": {
+					const holder = msg.controller ?? msg;
+					tel.emit({ t: "info", at: Date.now(), message: `controller lease broadcast: surfaceId=${holder?.surfaceId ?? "?"} fresh=${holder?.fresh ?? "?"}` });
+					break;
+				}
 				case "telemetry": {
 					if (typeof msg.hookCount === "number" && msg.hookCount > lastHookCount) {
 						const holdTimeouts = Number(msg.holdTimeouts) || 0;
