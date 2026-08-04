@@ -366,7 +366,7 @@ async function main(): Promise<number> {
 						attached = true;
 						if (attachTimer) clearTimeout(attachTimer);
 						tel.emit({ t: "attach", at: Date.now(), sessionId: session!.sessionId, conductor: args.conductor, budget: args.budget, protectTokens: args.protect, protocolVersion: accordion.PROTOCOL_VERSION });
-						tel.emit({ t: "info", at: Date.now(), message: `Accordion v15 resident conductor active: ${args.conductor}` });
+						tel.emit({ t: "info", at: Date.now(), message: `Accordion v${accordion.PROTOCOL_VERSION} resident conductor active: ${args.conductor}` });
 					} else if (isGenuineMidRunDetach(terminating, attached, msg.active, args.conductor)) {
 						// The extension broadcasts conductorState OPTIMISTICALLY at spawn time for
 						// spawn-kind conductors (thermocline/triptych) — up to 10s before the runner
@@ -390,18 +390,39 @@ async function main(): Promise<number> {
 					break;
 				case "commandResult": {
 					if (msg.refused !== "read-only") break;
-					// sendConfigureCommands() sends FOUR separate `command` frames. An unclaimed
-					// socket can draw FOUR separate refusals for the very same batch — not one. Once
-					// the first refusal has triggered a retry, sendConfigureCommands() bumps
-					// batchStartSeq past every seq in the batch that just failed, so the remaining
-					// refusals from that same now-superseded batch are recognized as stale and
-					// ignored here, rather than being mistaken for a refusal of the retry itself.
-					if (typeof msg.seq === "number" && msg.seq < batchStartSeq) break;
+					// detach() sends its two teardown commands (setFolding:false,
+					// selectConductor:null) at batchStartSeq+4/+5 — deliberately OUTSIDE the
+					// retryable configure batch (see sendConfigureCommands()'s doc comment). Once
+					// onSignal() has set terminating, ANY commandResult we see from here on can
+					// only belong to that teardown pair (or to a stale reply superseded by it), and
+					// must never be treated as a configure-batch refusal: doing so would emit a
+					// spurious "t":"error" into an otherwise-clean run's telemetry AND resend
+					// sendConfigureCommands() — including `selectConductor: <benchmark conductor>` —
+					// re-arming the extension that onSignal() was in the middle of disarming. Bail
+					// out before the seq check below even runs.
+					if (terminating) break;
+					// sendConfigureCommands() sends FOUR separate `command` frames spanning
+					// [batchStartSeq, batchStartSeq+3]. Bound BOTH sides of that window: a refusal
+					// for a seq outside it (notably detach()'s teardown pair immediately following
+					// the batch) belongs to a different command entirely and must not be mistaken
+					// for a configure-batch refusal. The `terminating` guard above states the
+					// intent; this bound is the mechanical backstop in case teardown commands are
+					// ever in flight for a reason other than terminating.
+					if (typeof msg.seq !== "number" || msg.seq < batchStartSeq || msg.seq > batchStartSeq + 3) break;
 					if (claimRetries < CLAIM_RETRY_LIMIT) {
 						claimRetries++;
 						tel.emit({ t: "error", at: Date.now(), message: `command seq ${msg.seq} refused as read-only — re-claiming controller lease and reconfiguring (attempt ${claimRetries}/${CLAIM_RETRY_LIMIT})` });
 						sendClaimController();
-						sendConfigureCommands();
+						// Belt-and-braces: only resend the configure batch — including the destructive
+						// `selectConductor` — while we are not yet attached. The read-only gate is
+						// evaluated per inbound `command` frame before applyCommand and cannot change
+						// mid-burst, so today a refused batch is refused in full and nothing in it was
+						// ever applied, which is what makes resending `selectConductor` safe. But if a
+						// partial batch ever did apply with `selectConductor` accepted, this resend
+						// would hit detachActive() a second time — a real Truth mutation (freeze as
+						// actor "you" + clearLocks) that would silently corrupt the measurement.
+						// Guarding on `!attached` closes that off for free.
+						if (!attached) sendConfigureCommands();
 					} else {
 						beginFatal(new Error(`bellows v15 host: controller lease refused as read-only for surfaceId "${args.surfaceId}" after ${CLAIM_RETRY_LIMIT} re-claim retry attempt(s) — the extension is not granting this surface the controller lease`));
 						return;

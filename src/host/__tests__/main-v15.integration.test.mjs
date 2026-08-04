@@ -748,6 +748,115 @@ describe("Accordion v22 resident host — defect 1 regression (shutdown-echo fal
 	);
 });
 
+/*
+ * FIXED DEFECT (v22 adversarial review, bug #2): the "commandResult" handler's
+ * `refused:"read-only"` branch bounded only the LOWER edge of the retryable
+ * configure-batch window (`msg.seq < batchStartSeq`). detach()'s two teardown
+ * commands (setFolding:false, selectConductor:null) are sent — via onSignal() — at
+ * batchStartSeq+4 and +5, immediately after a successful attach: outside the
+ * configure batch, but ABOVE the old lower-only bound, so a read-only refusal of
+ * either teardown command during the ~50ms pre-close window (lease gone stale/
+ * stolen) was misread as a configure-batch refusal. That both emitted a spurious
+ * "t":"error" into an otherwise-clean run's telemetry AND (claimRetries still 0)
+ * re-sent sendConfigureCommands() — re-arming `selectConductor:<benchmark
+ * conductor>` and `setFolding:true` during the very teardown meant to disarm them
+ * — or (claimRetries already 1 from an earlier retry) fatal'd a clean shutdown.
+ *
+ * Fix: the handler now bails out immediately `if (terminating) break;` (teardown
+ * commands are only ever sent once terminating is true) AND bounds the seq window
+ * on both sides (`seq < batchStartSeq || seq > batchStartSeq + 3`), so the guard
+ * holds even if a teardown-like command were ever sent for a reason other than
+ * terminating. The resend itself also gained a `!attached` guard as belt-and-
+ * braces against a hypothetical future partial-batch-applied scenario.
+ *
+ * The scenario is real, JS-catchable-SIGTERM-only (same as the defect-1 regression
+ * above) — child_process.kill() on Windows cannot deliver one (TerminateProcess,
+ * not a signal), so main-v15.ts's onSignal()/detach() path is simply never reached
+ * there. Unlike defect-1's isGenuineMidRunDetach, this guard is inline in
+ * main-v15.ts's message handler rather than an exported pure predicate — extracting
+ * one would mean importing main-v15.ts as a module, which unconditionally runs
+ * `main()` (and eventually `process.exit()`) at import time, so it isn't a safe
+ * target for a direct unit test the way accordionV15.ts's predicate is. This test
+ * is therefore skipped on win32 with no unit-level fallback; the win32 CI gap is
+ * identical in kind to defect-1's integration test, just without that test's
+ * separate always-runs unit-test half.
+ */
+describe("Accordion v22 resident host — v22 regression: teardown read-only refusal must not re-arm or misreport", () => {
+	const maybeIt = process.platform === "win32" ? it.skip : it;
+	maybeIt(
+		"SIGTERM on a clean run: the extension refusing detach()'s teardown commands as read-only does not resend the configure batch and does not emit a spurious error",
+		async () => {
+			const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bellows-host-v22-teardown-refuse-"));
+			const accordionRepo = path.join(tmp, "accordion");
+			const accordionHome = path.join(tmp, "home");
+			const telemetryOut = path.join(tmp, "host.jsonl");
+			const commands = [];
+			const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+			let child;
+			try {
+				makeAccordionFixture(accordionRepo, 22);
+				await listen(server);
+				const port = server.address().port;
+				writeSession({ accordionHome, port, protocolVersion: 22 });
+
+				server.on("connection", (socket) => {
+					sendHello(socket, { version: 22, conductorId: "compaction-naive", cwd: tmp });
+					sendSnapshot(socket);
+					socket.on("message", (data) => {
+						let msg;
+						try { msg = JSON.parse(data.toString()); } catch { return; }
+						if (msg.type !== "command") return;
+						commands.push(msg.cmd);
+						if (commands.length === 4) {
+							socket.send(JSON.stringify({ type: "conductorState", active: { id: "compaction-naive" } }));
+							return;
+						}
+						if (commands.length > 4) {
+							// Commands 5 and 6 are detach()'s teardown pair, sent from onSignal() once
+							// SIGTERM lands. Refuse them as read-only — simulating the controller
+							// lease going stale/stolen inside the ~50ms pre-close window — which is
+							// exactly the defect-2 trigger: the fix must not mistake this for a
+							// configure-batch refusal.
+							socket.send(JSON.stringify({ type: "commandResult", seq: msg.seq, results: [], rev: 0, refused: "read-only" }));
+						}
+					});
+				});
+
+				({ child } = spawnHost({ accordionRepo, accordionHome, telemetryOut, conductor: "compaction-naive" }));
+
+				await waitForFile(() => readTelemetry(telemetryOut).includes('"t":"attach"'), 18_000, "attach telemetry");
+
+				child.kill("SIGTERM");
+				const exit = await waitForExit(child, 10_000);
+
+				// Exactly six commands, ever: the configure batch once, then the teardown pair
+				// once. No re-sent configure batch — which would show up as a SECOND
+				// `selectConductor:"compaction-naive"`/`setFolding:true` pair appended after
+				// the teardown commands — in response to the refused teardown pair.
+				expect(commands).toEqual([
+					{ kind: "setBudget", value: 100000 },
+					{ kind: "setProtect", value: 20000 },
+					{ kind: "selectConductor", id: "compaction-naive" },
+					{ kind: "setFolding", value: true },
+					{ kind: "setFolding", value: false },
+					{ kind: "selectConductor", id: null },
+				]);
+				// Belt-and-braces on the assertion itself: no re-armed selectConductor at all
+				// after teardown began (i.e. among commands sent after the first 4).
+				expect(commands.slice(4).some((c) => c.kind === "selectConductor" && c.id === "compaction-naive")).toBe(false);
+
+				const telemetry = readTelemetry(telemetryOut);
+				expect(telemetry).not.toContain('"t":"error"');
+				expect(exit.code).toBe(0);
+			} finally {
+				await new Promise((resolve) => server.close(resolve));
+				fs.rmSync(tmp, { recursive: true, force: true });
+			}
+		},
+		SUITE_TIMEOUT_MS,
+	);
+});
+
 describe("Accordion resident host — protocol range validation", () => {
 	it(
 		"rejects a fixture whose PROTOCOL_VERSION is outside the supported range",

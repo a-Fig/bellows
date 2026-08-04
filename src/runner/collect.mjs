@@ -183,6 +183,7 @@ export function foldHostTelemetry(text, fallbackConductorId = "") {
   for (const rec of parseJsonl(text)) if (rec && typeof rec.t === "string") events.push(rec);
 
   let conductorId = fallbackConductorId;
+  let protocolVersion; // established by the attach event; undefined for pre-field telemetry
   let budget = 0; // established by the attach event; sync events don't carry it
   let syncs = 0;
   let attachCount = 0;
@@ -214,6 +215,10 @@ export function foldHostTelemetry(text, fallbackConductorId = "") {
         attachCount++;
         if (e.conductor) conductorId = e.conductor;
         if (Number.isFinite(e.budget)) budget = e.budget;
+        // v22: lets downstream analysis tell which metric scale this run's "t":"sync"
+        // series is on (v19 folded the system prompt into liveTokens; v22 made it a
+        // real block) — see ConductorTelemetry.protocolVersion in src/types.ts.
+        if (Number.isFinite(e.protocolVersion)) protocolVersion = e.protocolVersion;
         break;
       case "sync":
         syncs++;
@@ -282,6 +287,7 @@ export function foldHostTelemetry(text, fallbackConductorId = "") {
 
   return {
     conductorId,
+    ...(protocolVersion !== undefined ? { protocolVersion } : {}),
     syncs,
     attachCount,
     plansSent,

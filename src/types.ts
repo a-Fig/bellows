@@ -248,6 +248,13 @@ export type HostEvent =
 
 export interface ConductorTelemetry {
   conductorId: string;
+  /**
+   * Negotiated Accordion protocol version, from the "t":"attach" host event.
+   * Undefined for telemetry predating this field. Lets downstream analysis tell
+   * which metric scale a run's series is on (v19 folded the system prompt's
+   * tokens into liveTokens; v22 made the system prompt a real WireBlock).
+   */
+  protocolVersion?: number;
   syncs: number;
   /** Number of attach events seen; 0 means the conductor never attached. */
   attachCount: number;
