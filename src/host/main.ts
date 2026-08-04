@@ -658,6 +658,11 @@ async function main(): Promise<number> {
 						conductor: args.conductor ?? args.conductorId ?? "",
 						budget: args.budget,
 						protectTokens: args.protect,
+						// The version actually negotiated on `hello`, already validated against
+						// COMPATIBLE_PROTOCOL_VERSIONS above — NOT a hardcoded constant, since v9
+						// dropped the `recalls` wire field and rows must record which version
+						// produced them (see the passthrough handler's v5-v8/v9 comment below).
+						protocolVersion: msg.protocolVersion,
 					});
 					// Fire the "start" meta snapshot once, fire-and-forget — never delays hello
 					// handling or the first sync reply (see fetchMetaPlanOutcomes: bounded, never
