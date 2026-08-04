@@ -12,6 +12,8 @@ import {
   spawnHost,
   hostEntryForAccordion,
   isLegacyAccordionCheckout,
+  isResidentHostCheckout,
+  RESIDENT_HOST_ENTRY,
   autoUpgradeArmDispatch,
   hostEnv,
   modelShortName,
@@ -291,10 +293,11 @@ describe("appendAgentFinalizeNote", () => {
 });
 
 describe("hostEntryForAccordion", () => {
-  it("selects the v15 controller for a truth-in-extension checkout", () => {
+  it("selects the resident (v15-v22) controller for a truth-in-extension checkout", () => {
     const repo = fs.mkdtempSync(path.join(tmpdir(), "accordion-v15-"));
     fs.mkdirSync(path.join(repo, "core"));
     fs.writeFileSync(path.join(repo, "core", "protocol.ts"), "export const PROTOCOL_VERSION = 15;\n");
+    expect(hostEntryForAccordion(repo)).toBe(RESIDENT_HOST_ENTRY);
     expect(hostEntryForAccordion(repo)).toBe("src/host/main-v15.ts");
     fs.rmSync(repo, { recursive: true, force: true });
   });
@@ -315,6 +318,22 @@ describe("isLegacyAccordionCheckout — shared predicate behind hostEntryForAcco
 
   it("true for a checkout with no core/protocol.ts", () => {
     expect(isLegacyAccordionCheckout("C:/missing/legacy-accordion")).toBe(true);
+  });
+});
+
+describe("isResidentHostCheckout — gates whether run.mjs treats the checkout as the resident (main-v15.ts) host", () => {
+  it("true for a core/protocol.ts-shaped (truth-in-extension) checkout", () => {
+    const repo = fs.mkdtempSync(path.join(tmpdir(), "accordion-resident-"));
+    fs.mkdirSync(path.join(repo, "core"));
+    fs.writeFileSync(path.join(repo, "core", "protocol.ts"), "export const PROTOCOL_VERSION = 22;\n");
+    expect(isResidentHostCheckout(repo)).toBe(true);
+    fs.rmSync(repo, { recursive: true, force: true });
+  });
+
+  it("false for a legacy-shaped checkout with no core/protocol.ts", () => {
+    const repo = fs.mkdtempSync(path.join(tmpdir(), "accordion-legacy-"));
+    expect(isResidentHostCheckout(repo)).toBe(false);
+    fs.rmSync(repo, { recursive: true, force: true });
   });
 });
 

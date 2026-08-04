@@ -7,7 +7,7 @@ import path from "node:path";
 import { REPO_ROOT } from "./config.mjs";
 import { sharedFingerprint } from "./fingerprint.mjs";
 import { TEMPLATE_DIR, KICKOFF_PROMPT, renderBriefing } from "./provision.mjs";
-import { executeRun, platformAgentName } from "./run.mjs";
+import { executeRun, platformAgentName, hostEntryForAccordion } from "./run.mjs";
 import { createRoom, probeRoomJoinable, sleep } from "./platform.mjs";
 import { slopcodeRoomConfig } from "./roomConfig.mjs";
 
@@ -324,7 +324,7 @@ export function planDryRun(spec, config) {
   lines.push(`kickoff prompt (RPC): ${JSON.stringify(KICKOFF_PROMPT)}`);
   lines.push(`host CLI (per non-"none" arm):`);
   lines.push(
-    `  npx vite-node --config vite-node.config.ts src/host/main.ts -- ` +
+    `  npx vite-node --config vite-node.config.ts ${hostEntryForAccordion(config.accordionRepo)} -- ` +
       `--accordion-home <runDir>/accordion-home --conductor <arm> ` +
       `--budget ${spec.budget} --protect ${spec.protectTokens} --telemetry-out <runDir>/host.jsonl`,
   );
