@@ -16,7 +16,7 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { Telemetry } from "./telemetry";
-import { loadAccordionV15, MIN_SUPPORTED_PROTOCOL, MAX_SUPPORTED_PROTOCOL, type TruthReplica } from "./accordionV15";
+import { loadAccordionV15, isGenuineMidRunDetach, MIN_SUPPORTED_PROTOCOL, MAX_SUPPORTED_PROTOCOL, type TruthReplica, type HelloConductorEntry } from "./accordionV15";
 
 const STALE_AFTER_MS = 15_000;
 const ATTACH_TIMEOUT_MS = 30_000;
@@ -180,6 +180,10 @@ async function main(): Promise<number> {
 	let lastHoldTimeouts = 0;
 	let configured = false;
 	let claimRetries = 0;
+	// The `seq` of the first command in the currently-outstanding configure batch. Set by
+	// sendConfigureCommands() so a `commandResult{refused:"read-only"}` can be correlated to
+	// the batch that produced it — see the commandResult handler below for why this matters.
+	let batchStartSeq = 0;
 
 	const sendCommand = (cmd: Record<string, unknown>) => {
 		if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -189,7 +193,17 @@ async function main(): Promise<number> {
 	// dials, then opt this benchmark session into folding. Shared by the initial
 	// snapshot-triggered configure and by the read-only-refusal retry, which must
 	// resend the exact same sequence after re-claiming the lease.
+	//
+	// Re-sending all four — including the destructive `selectConductor` (which
+	// unconditionally calls `detachActive()`, freezing Truth as actor "you" and
+	// inheriting the conductor's tail into human protectTokens) — is CORRECT here.
+	// The read-only gate is per-socket lease state: it cannot change mid-batch, so if
+	// any one command in a batch was refused as read-only, ALL FOUR were refused
+	// (nothing in the batch was applied). There is therefore nothing destructive
+	// about resending the whole batch after re-claiming — the first attempt never
+	// touched Truth. Do not "optimize" this to resend only the refused command.
 	const sendConfigureCommands = () => {
+		batchStartSeq = commandSeq + 1;
 		sendCommand({ kind: "setBudget", value: args.budget });
 		sendCommand({ kind: "setProtect", value: args.protect });
 		sendCommand({ kind: "selectConductor", id: args.conductor });
@@ -239,7 +253,11 @@ async function main(): Promise<number> {
 		accordion.PROTOCOL_VERSION >= CONTROLLER_PROTOCOL_MIN
 			? `ws://127.0.0.1:${session.port}/?role=gui&surface=${encodeURIComponent(args.surfaceId)}&label=${encodeURIComponent(args.surfaceLabel)}`
 			: `ws://127.0.0.1:${session.port}/?role=gui`;
-	tel.emit({ t: "info", at: Date.now(), message: `connecting with surfaceId "${args.surfaceId}"` });
+	// No surface is ever sent to a v15 peer (see connectUrl above) — a "connecting with
+	// surfaceId" line there would describe a value the wire never carries. Gate to v16+.
+	if (accordion.PROTOCOL_VERSION >= CONTROLLER_PROTOCOL_MIN) {
+		tel.emit({ t: "info", at: Date.now(), message: `connecting with surfaceId "${args.surfaceId}"` });
+	}
 
 	const done = await new Promise<"closed" | "fatal">((resolve) => {
 		const socket = new WebSocket(connectUrl);
@@ -249,6 +267,14 @@ async function main(): Promise<number> {
 			try { raw = JSON.parse(data.toString()); } catch { return; }
 			if (!accordion.isServerMessage(raw)) return;
 			const msg = raw as any;
+			// Once fatal is set, beginFatal() has already emitted the error and scheduled
+			// the socket close — we're tearing down. Any later frame (including one of our
+			// own detach() commands echoing back before the socket is actually closed, or a
+			// duplicate refusal from an already-superseded batch) must not be processed: e.g.
+			// a late conductorState here could re-set `attached = true` and emit a fresh
+			// "t":"attach" telemetry line after the run already tore itself down and exited,
+			// producing a self-contradicting stream.
+			if (fatal) return;
 			try {
 				switch (msg.type) {
 				case "hello": {
@@ -267,9 +293,17 @@ async function main(): Promise<number> {
 					// silently ignored by the extension, which would otherwise hang to the 30s
 					// attach-timeout with a misleading "did not become active" error.
 					if (accordion.PROTOCOL_VERSION >= READINESS_PROTOCOL_MIN) {
-						const entry = Array.isArray(msg.conductors) ? msg.conductors.find((c: any) => c?.id === args.conductor) : undefined;
+						// Typed against HelloConductorEntry (accordionV15.ts) — readiness is carried
+						// on THIS message's conductors[], not on the registry's ENTRIES (see that
+						// type's doc comment for why the two must not be conflated).
+						const conductors: HelloConductorEntry[] = Array.isArray(msg.conductors) ? msg.conductors : [];
+						const entry = conductors.find((c) => c?.id === args.conductor);
 						const readiness = entry?.readiness;
-						if (!readiness || readiness.state === "unavailable") {
+						// Invert to a deny-list of exactly "ready": readiness is a closed union
+						// (`{state:"ready"}` or `{state:"unavailable", reason, ...}`), and anything
+						// malformed or unrecognized (e.g. `{}`, or a future state this bellows
+						// version doesn't know about) must be treated as unavailable, not as ready.
+						if (readiness?.state !== "ready") {
 							const reason = readiness?.reason ?? "extension reported no readiness for this conductor";
 							const remediation = readiness?.remediation ? ` (${readiness.remediation})` : "";
 							beginFatal(new Error(`conductor "${args.conductor}" is unavailable — ${reason}${remediation}`));
@@ -331,14 +365,21 @@ async function main(): Promise<number> {
 					if (msg.active?.id === args.conductor && !attached) {
 						attached = true;
 						if (attachTimer) clearTimeout(attachTimer);
-						tel.emit({ t: "attach", at: Date.now(), sessionId: session!.sessionId, conductor: args.conductor, budget: args.budget, protectTokens: args.protect });
+						tel.emit({ t: "attach", at: Date.now(), sessionId: session!.sessionId, conductor: args.conductor, budget: args.budget, protectTokens: args.protect, protocolVersion: accordion.PROTOCOL_VERSION });
 						tel.emit({ t: "info", at: Date.now(), message: `Accordion v15 resident conductor active: ${args.conductor}` });
-					} else if (attached && (msg.active === null || msg.active?.id !== args.conductor)) {
+					} else if (isGenuineMidRunDetach(terminating, attached, msg.active, args.conductor)) {
 						// The extension broadcasts conductorState OPTIMISTICALLY at spawn time for
 						// spawn-kind conductors (thermocline/triptych) — up to 10s before the runner
 						// actually dials in. If it never dials, the extension auto-detaches. Without
 						// this check bellows would silently keep recording a "conducted" arm that was
 						// really a raw baseline for the rest of the run, poisoning the comparison.
+						//
+						// isGenuineMidRunDetach (accordionV15.ts) is what excludes our own shutdown
+						// echo: onSignal()'s detach() sends `{kind:"selectConductor", id:null}` on a
+						// normal exit, which the extension broadcasts back to every client — including
+						// us — inside the ~50ms teardown window. See that function's doc comment for
+						// the full shutdown-echo rationale. (The `if (fatal) return` above the switch
+						// already keeps an already-fatal run from re-entering this branch at all.)
 						beginFatal(new Error(`conductor "${args.conductor}" detached mid-run`));
 						return;
 					}
@@ -349,13 +390,20 @@ async function main(): Promise<number> {
 					break;
 				case "commandResult": {
 					if (msg.refused !== "read-only") break;
+					// sendConfigureCommands() sends FOUR separate `command` frames. An unclaimed
+					// socket can draw FOUR separate refusals for the very same batch — not one. Once
+					// the first refusal has triggered a retry, sendConfigureCommands() bumps
+					// batchStartSeq past every seq in the batch that just failed, so the remaining
+					// refusals from that same now-superseded batch are recognized as stale and
+					// ignored here, rather than being mistaken for a refusal of the retry itself.
+					if (typeof msg.seq === "number" && msg.seq < batchStartSeq) break;
 					if (claimRetries < CLAIM_RETRY_LIMIT) {
 						claimRetries++;
 						tel.emit({ t: "error", at: Date.now(), message: `command seq ${msg.seq} refused as read-only — re-claiming controller lease and reconfiguring (attempt ${claimRetries}/${CLAIM_RETRY_LIMIT})` });
 						sendClaimController();
 						sendConfigureCommands();
 					} else {
-						beginFatal(new Error(`bellows v15 host: controller lease for surfaceId "${args.surfaceId}" could not be claimed after ${CLAIM_RETRY_LIMIT} retry attempt(s) — another GUI socket holds it`));
+						beginFatal(new Error(`bellows v15 host: controller lease refused as read-only for surfaceId "${args.surfaceId}" after ${CLAIM_RETRY_LIMIT} re-claim retry attempt(s) — the extension is not granting this surface the controller lease`));
 						return;
 					}
 					break;
@@ -364,8 +412,13 @@ async function main(): Promise<number> {
 					if (typeof msg.text === "string" && msg.text) tel.emit({ t: "info", at: Date.now(), message: `notice: ${msg.text}` });
 					break;
 				case "controller": {
-					const holder = msg.controller ?? msg;
-					tel.emit({ t: "info", at: Date.now(), message: `controller lease broadcast: surfaceId=${holder?.surfaceId ?? "?"} fresh=${holder?.fresh ?? "?"}` });
+					// ControllerMessage (protocol.ts) is flat: `{type, surfaceId, label}` — there is
+					// no nested `controller` object and no `fresh` field on this message at all
+					// (that flag lives on HelloMessage's `controller: ControllerInfo | null`, a
+					// different message). The old `msg.controller ?? msg` fallback always fell
+					// through to `msg`, and `msg.fresh` was always undefined, so this line always
+					// logged "fresh=?" regardless of what was broadcast.
+					tel.emit({ t: "info", at: Date.now(), message: `controller lease broadcast: surfaceId=${msg.surfaceId ?? "?"} label=${msg.label ?? "?"}` });
 					break;
 				}
 				case "telemetry": {

@@ -5,6 +5,10 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer } from "ws";
+// Real production code, not a reimplementation — see its doc comment in accordionV15.ts
+// for why a direct unit test of this predicate exists alongside the SIGTERM integration
+// test below.
+import { isGenuineMidRunDetach } from "../accordionV15";
 
 const BELLOWS_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 
@@ -297,7 +301,18 @@ describe.each([15, 22])("Accordion v%i resident host — happy path", (version) 
 					{ kind: "selectConductor", id: "compaction-naive" },
 					{ kind: "setFolding", value: true },
 				]);
-				expect(readTelemetry(telemetryOut)).toContain('"t":"attach"');
+				const telemetryText = readTelemetry(telemetryOut);
+				expect(telemetryText).toContain('"t":"attach"');
+				// Defect 3 regression: v19 folded the system prompt's tokens into liveTokens/
+				// fullTokens, and v22 made the system prompt a real WireBlock (blocks.length
+				// +1) — so a v15 run's and a v22 run's "t":"sync" series are on different
+				// scales. protocolVersion on "t":"attach" is what lets downstream analysis tell
+				// which scale a given run's series is on; assert it matches this matrix row's
+				// own version, not a hardcoded constant, so both the v15 and v22 parameterized
+				// runs are checked against themselves.
+				const attachLine = telemetryText.split("\n").find((line) => line.includes('"t":"attach"'));
+				expect(attachLine).toBeTruthy();
+				expect(JSON.parse(attachLine).protocolVersion).toBe(version);
 
 				child.kill("SIGTERM");
 				const exit = await waitForExit(child);
@@ -397,28 +412,28 @@ describe("Accordion v15 resident host — pre-existing regression coverage", () 
 });
 
 /*
- * KNOWN DEFECT (found while writing this suite, reported rather than fixed — see the
- * task's file-ownership boundary): src/host/main-v15.ts's "commandResult" handler
- * (around lines 350-362) does not correlate an incoming `refused:"read-only"` reply to
- * the batch/attempt it belongs to. It just checks a single global `claimRetries`
- * counter. sendConfigureCommands() always fires four separate `command` frames, and
- * per this file's mock server (built to the task's own spec: refuse EVERY command
+ * FIXED DEFECT (was reported as a deliberately-failing test, now fixed in main-v15.ts):
+ * the "commandResult" handler (around lines 393-412) used to check only a single global
+ * `claimRetries` counter, with no correlation between an incoming `refused:"read-only"`
+ * reply and the batch/attempt it belonged to. sendConfigureCommands() always fires four
+ * separate `command` frames, and per this file's mock server (refuse EVERY command
  * individually while unclaimed), an unclaimed burst of four draws FOUR separate
- * `commandResult{refused:"read-only"}` replies — not one. The FIRST correctly triggers
- * the one allowed retry (re-claim + resend). The SECOND, still in flight from the
- * *original, now-superseded* batch, arrives shortly after; `claimRetries` is already at
- * `CLAIM_RETRY_LIMIT`, so the handler immediately calls `beginFatal(...)` — even though
- * the retry itself is independently in flight and (in the "recovers" test below)
- * actually succeeds. A second, compounding bug: none of the message-handling `case`s
- * are guarded by `if (fatal) return`, so the legitimately-arriving `conductorState`
- * that acknowledges the successful retry is still processed after the fatal fired,
- * setting `attached = true` and emitting a `"t":"attach"` telemetry line AFTER the run
- * already tore itself down and exited 1 — a telemetry stream that contradicts itself.
- * Net effect: the entire "recover from a read-only refusal" feature described in this
- * branch's own commit message is broken for the normal case (not an edge case) of the
- * extension refusing each queued command individually. The test below is written to
- * the spec's required behavior and currently FAILS against main-v15.ts as a result —
- * left unweakened intentionally.
+ * `commandResult{refused:"read-only"}` replies — not one. The FIRST used to correctly
+ * trigger the one allowed retry (re-claim + resend), but the SECOND — still in flight
+ * from the *original, now-superseded* batch — arrived shortly after and, with
+ * `claimRetries` already at `CLAIM_RETRY_LIMIT`, immediately fataled, even though the
+ * retry itself was independently in flight and succeeding. A second, compounding bug:
+ * no message-handling `case` was guarded by `if (fatal) return`, so a legitimately-
+ * arriving `conductorState` acknowledging the successful retry was still processed
+ * after the fatal fired, setting `attached = true` and emitting a `"t":"attach"`
+ * telemetry line AFTER the run had already torn itself down and exited 1 — a
+ * self-contradicting telemetry stream.
+ *
+ * Fix: sendConfigureCommands() now records `batchStartSeq = commandSeq + 1` before
+ * sending, and the commandResult handler ignores any refusal whose `seq < batchStartSeq`
+ * as a stale reply from a superseded batch. Separately, an early `if (fatal) return` at
+ * the top of the message handler stops any case from running once fatal is set. The
+ * test below asserts the spec's required behavior and now passes.
  */
 describe("Accordion v22 resident host — v16-v22 behaviors", () => {
 	it(
@@ -451,11 +466,6 @@ describe("Accordion v22 resident host — v16-v22 behaviors", () => {
 
 				({ child } = spawnHost({ accordionRepo, accordionHome, telemetryOut, conductor: "compaction-naive", extraArgs: ["--surface-id", "test-surface-retry"] }));
 
-				// NOTE (bellows PR feat/accordion-protocol-v22): as of this writing this
-				// assertion FAILS against src/host/main-v15.ts — see the "known defect" note
-				// in this describe block's header comment for the root cause. Left intact
-				// (not weakened) per instructions: a real implementation bug should fail the
-				// test, not be masked by it.
 				await waitForFile(() => readTelemetry(telemetryOut).includes('"t":"attach"'), 18_000, "attach telemetry");
 
 				expect(lease.getClaimCount()).toBe(2);
@@ -466,11 +476,20 @@ describe("Accordion v22 resident host — v16-v22 behaviors", () => {
 					{ kind: "setFolding", value: true },
 				];
 				expect(lease.commands).toEqual([...fourCommands, ...fourCommands]);
-				expect(readTelemetry(telemetryOut)).toContain('"t":"attach"');
+				const telemetry = readTelemetry(telemetryOut);
+				expect(telemetry).toContain('"t":"attach"');
+				// The retry must actually RECOVER, not merely avoid fataling early: no fatal
+				// telemetry line should exist at all (the pre-fix bug reached beginFatal() from
+				// the second, stale refusal even while the retry was independently succeeding).
+				expect(telemetry).not.toMatch(/"t":"error".*could not be claimed/);
+				expect(telemetry).not.toMatch(/"t":"error".*controller lease refused/);
 
 				child.kill("SIGTERM");
 				const exit = await waitForExit(child);
 				expectGracefulExit(exit);
+				// Recovery, not just "didn't fatal yet": the process must actually reach a
+				// successful attach and (on platforms where the signal is real) exit 0.
+				if (process.platform !== "win32") expect(exit.code).toBe(0);
 			} finally {
 				await new Promise((resolve) => lease.server.close(resolve));
 				fs.rmSync(tmp, { recursive: true, force: true });
@@ -617,6 +636,109 @@ describe("Accordion v22 resident host — v16-v22 behaviors", () => {
 					{ kind: "setFolding", value: false },
 					{ kind: "selectConductor", id: null },
 				]);
+			} finally {
+				await new Promise((resolve) => lease.server.close(resolve));
+				fs.rmSync(tmp, { recursive: true, force: true });
+			}
+		},
+		SUITE_TIMEOUT_MS,
+	);
+});
+
+describe("Accordion v22 resident host — defect 1 regression (shutdown-echo false-fatal)", () => {
+	// Unit-level "equivalent via the code path" coverage — see the doc comment on
+	// isGenuineMidRunDetach in accordionV15.ts for why this exists alongside (not instead
+	// of) the SIGTERM integration test below: the scenario this guards against can only be
+	// driven end-to-end by a REAL, JS-catchable SIGTERM, and on Windows `child_process.kill()`
+	// cannot deliver one (libuv maps it to a bare TerminateProcess — verified empirically,
+	// see the integration test's platform guard below). This test exercises the real,
+	// exported production predicate directly, on every platform including Windows, so the
+	// fix is never covered on only some CI workers.
+	it("isGenuineMidRunDetach treats a conductorState:null arriving while terminating as our own shutdown echo, not a fatal", () => {
+		// The exact defect 1 scenario: attached, then onSignal() has set terminating=true
+		// and called detach() — the extension echoes {active:null} back to the sender
+		// inside the teardown window. Must NOT read as a genuine mid-run detach.
+		expect(isGenuineMidRunDetach(/* terminating */ true, /* attached */ true, null, "compaction-naive")).toBe(false);
+		// Same shape, but NOT terminating: a genuine mid-run detach must still fatal.
+		expect(isGenuineMidRunDetach(false, true, null, "compaction-naive")).toBe(true);
+		// A conductor switch mid-run (active becomes a DIFFERENT id) while terminating is
+		// still ours to ignore — we're already tearing down, nothing else matters.
+		expect(isGenuineMidRunDetach(true, true, { id: "handoff" }, "compaction-naive")).toBe(false);
+		// Not attached yet: neither branch of the caller's switch applies regardless of
+		// terminating (the other arm of the caller's if/else handles the attach case).
+		expect(isGenuineMidRunDetach(false, false, null, "compaction-naive")).toBe(false);
+	});
+
+	// child_process.kill("SIGTERM")/("SIGINT") on Windows cannot deliver a JS-catchable
+	// signal to a spawned child — libuv's uv_kill maps every signal Node exposes here
+	// (SIGTERM, SIGINT, SIGKILL) to a bare TerminateProcess on win32, which kills the
+	// target before its `process.on("SIGTERM", …)` handler ever runs. Verified empirically
+	// for this repo's exact spawn shape: a minimal child that logs on catching SIGTERM and
+	// installs the handler before signaling readiness never logs it when the parent calls
+	// child.kill("SIGTERM") — the child just exits with signal:"SIGTERM" attached by Node's
+	// own bookkeeping, having never executed the handler. This is also why the existing
+	// happy-path tests' `expectGracefulExit()` already tolerates a hard-kill outcome on
+	// win32 instead of asserting exit code 0. Since main-v15.ts's entire graceful-shutdown
+	// path (onSignal → terminating=true → detach() → clean exit 0) is reachable ONLY
+	// through a caught signal, this specific end-to-end integration test cannot run on
+	// Windows at all — there is no code path left to "assert the equivalent" through at the
+	// integration level; that equivalent is the unit test above, which runs unconditionally.
+	const maybeIt = process.platform === "win32" ? it.skip : it;
+	maybeIt(
+		"SIGTERM on a clean, successful run: the extension's own conductorState:null echo does not fatal, and the host exits 0",
+		async () => {
+			const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bellows-host-v22-shutdown-echo-"));
+			const accordionRepo = path.join(tmp, "accordion");
+			const accordionHome = path.join(tmp, "home");
+			const telemetryOut = path.join(tmp, "host.jsonl");
+			const lease = makeLeaseServer();
+			let child;
+			let getStderr = () => "";
+			try {
+				makeAccordionFixture(accordionRepo, 22);
+				await listen(lease.server);
+				const port = lease.server.address().port;
+				writeSession({ accordionHome, port, protocolVersion: 22 });
+
+				lease.server.on("connection", (socket) => {
+					sendHello(socket, { version: 22, conductorId: "compaction-naive", cwd: tmp });
+					sendSnapshot(socket);
+				});
+				lease.server.on("acceptedCommand", ({ socket, commands }) => {
+					if (commands.length === 4) {
+						socket.send(JSON.stringify({ type: "conductorState", active: { id: "compaction-naive" } }));
+					}
+					// Mirror the real extension's liveHost.select(null) (extension/accordion.ts):
+					// on the teardown pair landing, broadcast the resulting conductorState back to
+					// EVERY client, including the sender — this is the shutdown echo defect 1 is
+					// about. Sent synchronously off the same message handler that received the
+					// teardown, so it reliably lands within onSignal()'s 50ms close window.
+					if (commands.length === 6) {
+						socket.send(JSON.stringify({ type: "conductorState", active: null }));
+					}
+				});
+
+				({ child, getStderr } = spawnHost({ accordionRepo, accordionHome, telemetryOut, conductor: "compaction-naive" }));
+
+				await waitForFile(() => readTelemetry(telemetryOut).includes('"t":"attach"'), 18_000, "attach telemetry");
+
+				// Drives the REAL signal path: main-v15.ts's own process.once("SIGTERM", …).
+				child.kill("SIGTERM");
+				const exit = await waitForExit(child, 10_000);
+
+				expect(lease.commands).toEqual([
+					{ kind: "setBudget", value: 100000 },
+					{ kind: "setProtect", value: 20000 },
+					{ kind: "selectConductor", id: "compaction-naive" },
+					{ kind: "setFolding", value: true },
+					{ kind: "setFolding", value: false },
+					{ kind: "selectConductor", id: null },
+				]);
+				const telemetry = readTelemetry(telemetryOut);
+				expect(telemetry).not.toContain("detached mid-run");
+				expect(telemetry).not.toContain('"t":"error"');
+				expect(getStderr()).not.toContain("detached mid-run");
+				expect(exit.code).toBe(0);
 			} finally {
 				await new Promise((resolve) => lease.server.close(resolve));
 				fs.rmSync(tmp, { recursive: true, force: true });

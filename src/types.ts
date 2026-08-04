@@ -211,7 +211,7 @@ export interface PlanRttSummary {
 // ---------------------------------------------------------------------------
 
 export type HostEvent =
-  | { t: "attach"; at: number; sessionId: string; conductor: string; budget: number; protectTokens: number }
+  | { t: "attach"; at: number; sessionId: string; conductor: string; budget: number; protectTokens: number; protocolVersion: number }
   | { t: "sync"; at: number; rev: number; blocks: number; liveTokens: number; foldedBlocks: number }
   | { t: "conduct"; at: number; rev: number; latencyMs: number; commands: number; heldLastPlan: boolean }
   | { t: "plan"; at: number; rev: number; ops: number; groups: number }
