@@ -195,12 +195,33 @@ export function provisionRun(args) {
  *
  * The fix is declarative: a model entry that explicitly carries
  * `reasoning: true` plus
- * `compat: { requiresReasoningContentOnAssistantMessages: true, thinkingFormat: "deepseek" }`
+ * `compat: { requiresReasoningContentOnAssistantMessages: true, thinkingFormat: "deepseek",
+ * supportsDeveloperRole: false }`
  * gets the identical request shaping and replay behavior pi would give a
  * native deepseek.com entry (`getCompat` prefers `model.compat.*` over the
  * auto-detected value via `??`) — real reasoning_content is captured and
  * replayed, thinkingLevel medium becomes real, and the single-space filler
  * extension only has to cover genuine gaps.
+ *
+ * `supportsDeveloperRole` closes a second gap opened by the `reasoning: true`
+ * fix above. `@earendil-works/pi-ai`'s openai-completions.js only swaps the
+ * system-prompt message role to `"developer"` when
+ * `model.reasoning && compat.supportsDeveloperRole` (see the `useDeveloperRole`
+ * line right before the system-prompt push, and `getCompat`/`detectCompat`).
+ * `detectCompat` defaults `supportsDeveloperRole` to `true` for any
+ * "standard" OpenAI-completions provider — i.e. `!isNonStandard && !isOpenRouter`
+ * — and TokenRouter (`api.tokenrouter.com`) doesn't match any of the
+ * `isNonStandard` baseUrl/provider checks (unlike a real `deepseek.com`
+ * baseUrl, which does and so gets `supportsDeveloperRole: false` for free).
+ * So the moment this patch sets `reasoning: true` on a token-router deepseek
+ * entry, `useDeveloperRole` flips true and pi starts sending
+ * `{role: "developer", content: <system prompt>}` as the first message —
+ * which the provider behind token-router's deepseek-v4-flash rejects with
+ * `400: role must be one of ['system','assistant','user','tool','function']`.
+ * Declaring `supportsDeveloperRole: false` here reproduces exactly what
+ * `detectCompat` would already give a native `deepseek.com` entry, so the
+ * system prompt stays on `role: "system"` the way it did before this file's
+ * `reasoning: true` patch existed.
  *
  * Only touches entries that need it: a provider block whose `baseUrl`
  * already contains "deepseek.com" is left alone (auto-detect already fires
@@ -235,6 +256,10 @@ export function patchDeepSeekCompat(modelsJson) {
       }
       if (nextCompat.thinkingFormat === undefined) {
         nextCompat.thinkingFormat = "deepseek";
+        changed = true;
+      }
+      if (nextCompat.supportsDeveloperRole === undefined) {
+        nextCompat.supportsDeveloperRole = false;
         changed = true;
       }
       if (changed) {
