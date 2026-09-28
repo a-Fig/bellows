@@ -184,6 +184,12 @@ async function main(): Promise<number> {
 	// sendConfigureCommands() so a `commandResult{refused:"read-only"}` can be correlated to
 	// the batch that produced it — see the commandResult handler below for why this matters.
 	let batchStartSeq = 0;
+	// Dedup state for "t":"status" rows (see the "conductorStatus" case below): only a
+	// CHANGE in text is emitted, so a conductor re-affirming the same status on every hook
+	// doesn't flood host.jsonl. `undefined` (distinct from the wire's own `null`, which
+	// means "status cleared") so the very first conductorStatus message — even one that
+	// clears an unset status — is never swallowed as a false-duplicate of "nothing yet".
+	let lastStatusText: string | null | undefined = undefined;
 
 	const sendCommand = (cmd: Record<string, unknown>) => {
 		if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -362,6 +368,13 @@ async function main(): Promise<number> {
 					break;
 				}
 				case "conductorState": {
+					// Raw log of EVERY conductorState broadcast (attach/detach/swap), trimmed to
+					// the fields useful for diagnosing a stall (which conductor, if any, is active
+					// right now) — distinct from the "attach"/"info" lines just below, which only
+					// fire on the FIRST successful attach. A spawn-kind conductor that detaches and
+					// reattaches mid-run (or one that goes quiet without ever detaching) is
+					// otherwise invisible in host.jsonl.
+					tel.emit({ t: "conductorState", at: Date.now(), id: msg.active?.id ?? null, label: msg.active?.label });
 					if (msg.active?.id === args.conductor && !attached) {
 						attached = true;
 						if (attachTimer) clearTimeout(attachTimer);
@@ -385,9 +398,22 @@ async function main(): Promise<number> {
 					}
 					break;
 				}
-				case "conductorStatus":
-					if (typeof msg.text === "string" && msg.text) tel.emit({ t: "info", at: Date.now(), message: `status: ${msg.text}` });
+				case "conductorStatus": {
+					// A conductor calling host.setStatus(text, metrics) is the only first-class way
+					// it can narrate WHY it is doing (or not doing) something — e.g. "waiting on
+					// summarizer" or "skipping fold: below trigger". Without logging it, a stalled
+					// conductor leaves no trace anywhere in the run's artifacts. Dedup on the text
+					// only (not metrics) so a conductor that re-affirms the same status text on every
+					// hook — while metrics keep changing — doesn't flood host.jsonl with near-identical
+					// rows; `lastStatusText` starts `undefined` (never equal to the wire's own `null`,
+					// which means "status cleared") so the first message always emits.
+					const statusText = typeof msg.text === "string" ? msg.text : null;
+					if (statusText !== lastStatusText) {
+						lastStatusText = statusText;
+						tel.emit({ t: "status", at: Date.now(), rev: replica?.rev ?? 0, text: statusText, metrics: msg.metrics });
+					}
 					break;
+				}
 				case "commandResult": {
 					if (msg.refused !== "read-only") break;
 					// detach() sends its two teardown commands (setFolding:false,

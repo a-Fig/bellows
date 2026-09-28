@@ -24,6 +24,7 @@ import {
   looksLikeAgentFinalizeCall,
   appendAgentFinalizeNote,
   resolvePlatformBase,
+  buildPiEnv,
 } from "../run.mjs";
 
 class FakePi extends EventEmitter {
@@ -429,6 +430,70 @@ describe("resolvePlatformBase — guards spec.room being undefined (malformed pl
   it("returns null when spec itself is missing", () => {
     expect(resolvePlatformBase(null, { platformBase: "https://cfg-base" })).toBeNull();
     expect(resolvePlatformBase(undefined, { platformBase: "https://cfg-base" })).toBeNull();
+  });
+});
+
+describe("buildPiEnv — pi's spawn env: base + scrubPiEnv + arm env merge", () => {
+  const processEnv = { PATH: "/usr/bin", HOME: "/home/x", AGENT_TRIALS_API_KEY: "secret", NODE_ENV: "test" };
+
+  it("sets PI_CODING_AGENT_DIR/ACCORDION_HOME and drops PI_CODING_AGENT_SESSION_DIR", () => {
+    const env = buildPiEnv({
+      processEnv: { ...processEnv, PI_CODING_AGENT_SESSION_DIR: "/somewhere/else" },
+      agentDir: "/run/agent",
+      accordionHome: "/run/accordion-home",
+    });
+    expect(env.PI_CODING_AGENT_DIR).toBe("/run/agent");
+    expect(env.ACCORDION_HOME).toBe("/run/accordion-home");
+    expect("PI_CODING_AGENT_SESSION_DIR" in env).toBe(false);
+  });
+
+  it("without scrubPiEnv, inherits the full process env (backward compat)", () => {
+    const env = buildPiEnv({ processEnv, agentDir: "/a", accordionHome: "/h" });
+    expect(env.AGENT_TRIALS_API_KEY).toBe("secret");
+  });
+
+  it("with scrubPiEnv, drops secret-shaped vars and logs their names (never values)", () => {
+    const logs = [];
+    const env = buildPiEnv({
+      processEnv,
+      agentDir: "/a",
+      accordionHome: "/h",
+      scrubPiEnv: true,
+      log: (m) => logs.push(m),
+    });
+    expect("AGENT_TRIALS_API_KEY" in env).toBe(false);
+    expect(env.PATH).toBe("/usr/bin");
+    expect(env.NODE_ENV).toBe("test");
+    expect(logs.some((m) => m.includes("AGENT_TRIALS_API_KEY"))).toBe(true);
+    expect(logs.some((m) => m.includes("secret"))).toBe(false);
+  });
+
+  it("piEnvPassthrough exempts a named var from scrubPiEnv", () => {
+    const env = buildPiEnv({
+      processEnv,
+      agentDir: "/a",
+      accordionHome: "/h",
+      scrubPiEnv: true,
+      piEnvPassthrough: ["AGENT_TRIALS_API_KEY"],
+    });
+    expect(env.AGENT_TRIALS_API_KEY).toBe("secret");
+  });
+
+  it("merges armEnv LAST — after scrubPiEnv, never itself scrubbed", () => {
+    const env = buildPiEnv({
+      processEnv,
+      agentDir: "/a",
+      accordionHome: "/h",
+      scrubPiEnv: true,
+      armEnv: { ACCORDION_SUMMARY_TRIGGER: "0.75", MY_API_KEY: "explicit-not-scrubbed" },
+    });
+    expect(env.ACCORDION_SUMMARY_TRIGGER).toBe("0.75");
+    expect(env.MY_API_KEY).toBe("explicit-not-scrubbed");
+  });
+
+  it("armEnv overrides a base var of the same name", () => {
+    const env = buildPiEnv({ processEnv, agentDir: "/a", accordionHome: "/h", armEnv: { PATH: "/custom/path" } });
+    expect(env.PATH).toBe("/custom/path");
   });
 });
 

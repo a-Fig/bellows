@@ -196,6 +196,14 @@ export function foldHostTelemetry(text, fallbackConductorId = "") {
   const budgetSeries = [];
   const errors = [];
   const infos = [];
+  // t:"status" rows (Accordion protocol v22's conductorStatus, see
+  // src/host/main-v15.ts) are already deduped on consecutive-identical text at
+  // the source, so every row here is a genuine change — just track the last
+  // one seen + how many there were. null means the conductor never called
+  // host.setStatus() this run (distinct from a row whose text is itself null,
+  // i.e. the conductor explicitly cleared its status after having set one).
+  let lastStatusText = null;
+  let statusCount = 0;
 
   // Plan-outcome observability (Accordion issue #60/#22, ADR 0020). Two independent
   // sources, reconciled below: the WS `passthrough` ack tally (only the 5 "ackable"
@@ -250,6 +258,10 @@ export function foldHostTelemetry(text, fallbackConductorId = "") {
         // folded into errors[], so a healthy remote conductor doesn't read as error-laden.
         if (e.message) infos.push(String(e.message));
         break;
+      case "status":
+        statusCount++;
+        lastStatusText = typeof e.text === "string" ? e.text : null;
+        break;
       case "passthrough":
         // WS-tally semantics: `total` = number of acks seen, per-cause keys only for
         // causes actually seen (lazily created on the first VALID ack; a run with zero
@@ -298,6 +310,8 @@ export function foldHostTelemetry(text, fallbackConductorId = "") {
     completeCostUsd: round6(completeCostUsd),
     errors,
     infos,
+    lastStatusText,
+    statusCount,
     planOutcomes,
   };
 }

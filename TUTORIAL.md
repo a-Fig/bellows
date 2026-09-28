@@ -19,6 +19,24 @@ $env:AGENT_TRIALS_API_KEY = "at_..."
 That's it. pi credentials are copied automatically from `~/.pi/agent` into each run's
 isolated agent dir — you never touch them.
 
+### Keeping secrets out of the agent's env (`scrubPiEnv`)
+
+By default pi runs with the runner's **full** environment — including
+`AGENT_TRIALS_API_KEY` and any other provider keys — reachable from the
+benchmarked agent's own bash tool. Add to `bench.config.json`:
+
+```json
+{ "scrubPiEnv": true, "piEnvPassthrough": ["SOME_KEY_PI_ITSELF_NEEDS"] }
+```
+
+`scrubPiEnv: true` (default `false`, for backward compat) strips every env var
+whose **name** matches `/(API_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|
+PRIVATE_?KEY|AUTH)/i` before spawning pi, except names listed in
+`piEnvPassthrough`. Only variable *names* are ever logged (one line at run
+start listing what was scrubbed) — values never are. **Recommended for any
+bench run where the agent's tool output isn't fully trusted.** A per-arm
+`env` (above) is applied after the scrub and is never scrubbed itself.
+
 ## Write a trial
 
 A trial is one YAML file in `trials/`:
@@ -57,6 +75,34 @@ Conductor ids: `builtin`, `cold-score`, `cold-epoch`, `sliding-window`,
 `garbage-collector`, `compaction-naive`, `bear2-hybrid`, `code-skeleton`, `keel`,
 plus `none` for the raw baseline. These are all **in-process** — the headless host
 loads them straight out of Accordion's `IN_PROCESS_CONDUCTORS` registry.
+
+### Per-arm env (`arms[].env`)
+
+An arm can carry `env`, extra environment variables merged into pi's env for
+runs of that arm — e.g. to steer an in-process conductor's env-configurable
+options. Two arms with the **same conductor** must have distinct `name`s once
+either has `env` (or any two arms share a conductor at all) — bellows won't
+guess which one a report row belongs to:
+
+```yaml
+arms:
+  - conductor: compaction-naive
+  - conductor: compaction-naive
+    name: naive-t075
+    env: { ACCORDION_SUMMARY_TRIGGER: "0.75" }
+```
+
+Rules (enforced in `validateTrialSpec`/`validateArmEnv`, `src/runner/config.mjs`,
+for both `bellows run` and claimed worker runs):
+- keys match `/^[A-Z][A-Z0-9_]{0,63}$/`; values are strings, ≤500 chars; at most
+  32 entries per arm.
+- a key that would clobber a runner-controlled var (`PI_CODING_AGENT_DIR`,
+  `PI_CODING_AGENT_SESSION_DIR`, `ACCORDION_HOME`, `PATH`, `HOME`) is rejected.
+- `env` is applied to pi's spawn env **after** `scrubPiEnv` (below) — arm env is
+  explicit, authored config, and is never itself scrubbed.
+- `env` is part of the run's fingerprint, so two arms sharing a conductor but
+  differing only in `env` are never silently treated as the same condition in
+  the report/comparison.
 
 ### Bench a specific Accordion branch/PR (`accordionRef`)
 
@@ -204,13 +250,25 @@ leaderboard), but they have no cost/token data — the report can't include them
 `runs/<trial>/<arm>-<seed>/record.json`:
 - `usage` — input/output/cacheRead/cacheWrite tokens, cost, turns (from pi's session JSONL)
 - `turns[]` — per-assistant-message usage + wire size at each call
-- `conductor` — syncs, plans, fold ops, held-plan replies, conduct latency, budget series
+- `conductor` — syncs, plans, fold ops, held-plan replies, conduct latency, budget series,
+  plus `lastStatusText`/`statusCount` (below) so a stalled/misbehaving conductor's last
+  words are visible right in the record, not just buried in `host.jsonl`
 - `platform` — the leaderboard row harvested by label (partial `final:false` rows are
   kept for capped runs — aborted runs never vanish)
 - `fingerprint` — everything needed to know if two runs are comparable
 
 Also in the run dir: `host.jsonl` (raw telemetry), `pi-rpc.log`, the full workspace
 and agent dir for forensics.
+
+**Why a conductor stalled**: whenever a conductor calls `host.setStatus(text, metrics)`
+(Accordion protocol v22+), the host logs a `{"t":"status", ...}` row to `host.jsonl`
+(deduped — a repeated identical `text` doesn't re-emit), and every `conductorState`
+broadcast (attach/detach/swap of the active conductor) gets its own `{"t":"conductorState",
+...}` row. `record.json`'s `conductor.lastStatusText`/`conductor.statusCount` fold that
+stream, so "why did this run stall at 80k tokens against a 40k budget" has an actual trail
+instead of needing to re-run with logging added — see `foldHostTelemetry` in
+`src/runner/collect.mjs` and the `"conductorStatus"`/`"conductorState"` cases in
+`src/host/main-v15.ts`.
 
 ## Gotchas
 

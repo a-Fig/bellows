@@ -21,6 +21,7 @@ function runsRootFrom(config) {
 const BELLOWS_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 import { provisionRun, KICKOFF_PROMPT } from "./provision.mjs";
 import { agentSpawnEnv } from "./agentEnv.mjs";
+import { scrubEnv } from "./envScrub.mjs";
 import { PiRpc } from "./rpc.mjs";
 import {
   findNewestSessionFile,
@@ -45,11 +46,14 @@ const MAX_FAILED_STATS_POLLS = 6; // ~30s+ of cost blindness -> stop the run
  * @param {import("../types.ts").BenchConfig} args.config
  * @param {string} args.arm            conductor id for this arm
  * @param {string} args.armName
+ * @param {Record<string,string>} [args.armEnv]  ArmSpec.env for this arm (already
+ *   validated by validateTrialSpec / the worker path's own equivalent check) —
+ *   merged into pi's env LAST, after scrubPiEnv, and never itself scrubbed.
  * @param {number} args.seed
  * @param {string} args.roomId
  * @param {string} args.apiKey
  * @param {string} args.runDir
- * @param {Omit<import("../types.ts").Fingerprint,"conductorId">} args.sharedFp
+ * @param {Omit<import("../types.ts").Fingerprint,"conductorId"|"env">} args.sharedFp
  * @param {(m:string)=>void} args.log
  * @param {AbortSignal} [args.abortSignal]  when aborted, tears the run down early
  *   (status "error", statusDetail "cancelled"). Additive — omitted by `bellows run`;
@@ -57,7 +61,7 @@ const MAX_FAILED_STATS_POLLS = 6; // ~30s+ of cost blindness -> stop the run
  * @returns {Promise<import("../types.ts").RunRecord>}
  */
 export async function executeRun(args) {
-  const { spec, config, arm, armName, seed, roomId, apiKey, runDir, sharedFp, log, abortSignal } = args;
+  const { spec, config, arm, armName, armEnv, seed, roomId, apiKey, runDir, sharedFp, log, abortSignal } = args;
   // Label = "<trial>/<arm>/<seed>", trimmed + clamped to the platform's 64-char
   // limit. Used both as the run id and the leaderboard label (pull key).
   const label = normalizeLabel(`${spec.trial}/${armName}/${seed}`);
@@ -90,7 +94,7 @@ export async function executeRun(args) {
   // is never touched.
   let armDispatch = arm === "none" ? { type: "in-process", id: "none" } : parseConductorArm(arm);
 
-  const fingerprint = { ...sharedFp, conductorId: arm };
+  const fingerprint = { ...sharedFp, conductorId: arm, env: armEnv || {} };
   // Per-trial accordionRef: resolve to a pinned worktree (the effective accordion
   // repo) WITHOUT touching config.accordionRepo's working tree. Absent => use
   // config.accordionRepo as-is (today's behavior). The resolved SHA overrides the
@@ -193,14 +197,15 @@ export async function executeRun(args) {
     // remain real tuning knobs. The armed bit that used to ride a steering env
     // var no longer travels as env: the host (src/host/main.ts) now declares
     // it over the wire to the attached extension on every (re)connect.
-    const piEnv = {
-      ...process.env,
-      PI_CODING_AGENT_DIR: agentDir,
-      ACCORDION_HOME: accordionHome,
-    };
-    // A parent-shell PI_CODING_AGENT_SESSION_DIR would redirect the session
-    // JSONL outside agentDir and blind the collector — force the default layout.
-    delete piEnv.PI_CODING_AGENT_SESSION_DIR;
+    const piEnv = buildPiEnv({
+      processEnv: process.env,
+      agentDir,
+      accordionHome,
+      scrubPiEnv: config.scrubPiEnv,
+      piEnvPassthrough: config.piEnvPassthrough,
+      armEnv,
+      log: (m) => log(`[${label}] ${m}`),
+    });
     // Issue #16: heal macOS worker-provisioning defects before the agent's first
     // command — wire certifi into SSL_CERT_FILE (else every HTTPS call fails with
     // CERTIFICATE_VERIFY_FAILED) and shim `python` -> `python3` on PATH (the
@@ -809,6 +814,49 @@ export function resolvePlatformBase(spec, config) {
  */
 export function hostEnv(config) {
   return { BELLOWS_ACCORDION_REPO: config.accordionRepo };
+}
+
+/**
+ * Build pi's spawn env: base process env + PI_CODING_AGENT_DIR/ACCORDION_HOME,
+ * minus PI_CODING_AGENT_SESSION_DIR (a parent-shell value would redirect the
+ * session JSONL outside agentDir and blind the collector — force the default
+ * layout), optionally scrubbed of secret-shaped vars (config.scrubPiEnv — see
+ * envScrub.mjs), with the arm's env (ArmSpec.env, Feature 1) merged in LAST:
+ * explicit, arm-authored config always wins, and is never itself scrubbed (an
+ * arm author who puts a secret-shaped name in `env` gets exactly that name,
+ * unfiltered — scrubPiEnv only strips AMBIENT/inherited env). Pure aside from
+ * the injectable `log`; agentSpawnEnv's health-fix additions (SSL/python shim)
+ * are layered on by the caller separately, after this. Exported as the
+ * unit-testable seam for executeRun's env-shaping step.
+ * @param {object} args
+ * @param {NodeJS.ProcessEnv} args.processEnv        base env to spread (normally process.env)
+ * @param {string} args.agentDir
+ * @param {string} args.accordionHome
+ * @param {boolean} [args.scrubPiEnv]
+ * @param {string[]} [args.piEnvPassthrough]
+ * @param {Record<string,string>} [args.armEnv]
+ * @param {(m:string)=>void} [args.log]               logs scrubbed var NAMES only, never values
+ * @returns {NodeJS.ProcessEnv}
+ */
+export function buildPiEnv({ processEnv, agentDir, accordionHome, scrubPiEnv, piEnvPassthrough, armEnv, log = () => {} }) {
+  let piEnv = {
+    ...processEnv,
+    PI_CODING_AGENT_DIR: agentDir,
+    ACCORDION_HOME: accordionHome,
+  };
+  delete piEnv.PI_CODING_AGENT_SESSION_DIR;
+
+  if (scrubPiEnv) {
+    const { env: scrubbed, scrubbed: droppedNames } = scrubEnv(piEnv, piEnvPassthrough || []);
+    piEnv = scrubbed;
+    if (droppedNames.length) {
+      log(`[env] scrubPiEnv dropped ${droppedNames.length} var(s) from pi's env: ${droppedNames.join(", ")}`);
+    }
+  }
+
+  if (armEnv) Object.assign(piEnv, armEnv);
+
+  return piEnv;
 }
 
 /**

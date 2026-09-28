@@ -1,5 +1,14 @@
 import { describe, it, expect } from "vitest";
-import { validateTrialSpec, normalizeProblems, isProblemScoped, splitModel, parseConductorArm, normalizeBenchConfig } from "../config.mjs";
+import {
+  validateTrialSpec,
+  normalizeProblems,
+  isProblemScoped,
+  splitModel,
+  parseConductorArm,
+  normalizeBenchConfig,
+  validateArmEnv,
+  RUNNER_CONTROLLED_ENV_VARS,
+} from "../config.mjs";
 
 // Base spec is pooled + FULL BENCH (`problems: all`) so it stays valid under the
 // pooled-vs-scoped guard: a pooled room may run the full bench, but not a scoped
@@ -115,6 +124,101 @@ describe("validateTrialSpec", () => {
 
   it("rejects an external id with invalid characters", () => {
     expect(() => validateTrialSpec({ ...base, arms: [{ conductor: "external:bad id!" }] })).toThrow(/must match/);
+  });
+
+  // --- arms[].env (Feature 1) -------------------------------------------------
+
+  it("accepts a well-formed arms[].env and carries it through", () => {
+    const spec = validateTrialSpec({
+      ...base,
+      arms: [
+        { conductor: "compaction-naive" },
+        { conductor: "compaction-naive", name: "naive-t075", env: { ACCORDION_SUMMARY_TRIGGER: "0.75" } },
+      ],
+    });
+    expect(spec.arms[0].env).toBeUndefined();
+    expect(spec.arms[1].env).toEqual({ ACCORDION_SUMMARY_TRIGGER: "0.75" });
+  });
+
+  it("rejects an env key that doesn't match the uppercase-identifier shape", () => {
+    expect(() =>
+      validateTrialSpec({ ...base, arms: [{ conductor: "keel", env: { lowercase: "x" } }] }),
+    ).toThrow(/env\["lowercase"\].*must match/);
+    expect(() =>
+      validateTrialSpec({ ...base, arms: [{ conductor: "keel", env: { "1STARTS_WITH_DIGIT": "x" } }] }),
+    ).toThrow(/must match/);
+  });
+
+  it("rejects an env value that isn't a string", () => {
+    expect(() =>
+      validateTrialSpec({ ...base, arms: [{ conductor: "keel", env: { FOO: 123 } }] }),
+    ).toThrow(/env\["FOO"\].*must be a string/);
+  });
+
+  it("rejects an env value over 500 chars", () => {
+    expect(() =>
+      validateTrialSpec({ ...base, arms: [{ conductor: "keel", env: { FOO: "x".repeat(501) } }] }),
+    ).toThrow(/<=500 chars/);
+  });
+
+  it("rejects more than 32 env entries", () => {
+    const env = Object.fromEntries(Array.from({ length: 33 }, (_, i) => [`VAR_${i}`, "x"]));
+    expect(() => validateTrialSpec({ ...base, arms: [{ conductor: "keel", env }] })).toThrow(/at most 32 entries/);
+  });
+
+  it("rejects env keys that would clobber a runner-controlled var", () => {
+    for (const key of RUNNER_CONTROLLED_ENV_VARS) {
+      expect(() =>
+        validateTrialSpec({ ...base, arms: [{ conductor: "keel", env: { [key]: "x" } }] }),
+      ).toThrow(/reserved/);
+    }
+  });
+
+  it("rejects two arms sharing a conductor with no distinguishing name", () => {
+    expect(() =>
+      validateTrialSpec({
+        ...base,
+        arms: [{ conductor: "compaction-naive" }, { conductor: "compaction-naive" }],
+      }),
+    ).toThrow(/resolve to the same name "compaction-naive"/);
+  });
+
+  it("accepts two same-conductor arms once given distinct names", () => {
+    const spec = validateTrialSpec({
+      ...base,
+      arms: [
+        { conductor: "compaction-naive", name: "naive-a" },
+        { conductor: "compaction-naive", name: "naive-b", env: { ACCORDION_SUMMARY_TRIGGER: "0.9" } },
+      ],
+    });
+    expect(spec.arms.map((a) => a.name)).toEqual(["naive-a", "naive-b"]);
+  });
+
+  it("rejects two arms whose explicit names collide", () => {
+    expect(() =>
+      validateTrialSpec({
+        ...base,
+        arms: [
+          { conductor: "keel", name: "dup" },
+          { conductor: "builtin", name: "dup" },
+        ],
+      }),
+    ).toThrow(/resolve to the same name "dup"/);
+  });
+});
+
+describe("validateArmEnv", () => {
+  it("returns no errors for undefined env", () => {
+    expect(validateArmEnv(undefined)).toEqual([]);
+  });
+
+  it("rejects a non-object env", () => {
+    expect(validateArmEnv("nope")[0]).toMatch(/must be an object/);
+    expect(validateArmEnv(["a"])[0]).toMatch(/must be an object/);
+  });
+
+  it("accepts a well-formed env", () => {
+    expect(validateArmEnv({ ACCORDION_SUMMARY_TRIGGER: "0.75" })).toEqual([]);
   });
 });
 
@@ -244,5 +348,32 @@ describe("normalizeBenchConfig", () => {
     expect(() =>
       normalizeBenchConfig({ ...rawBenchConfigBase, worker: { platformUrl: "https://p", name: "w1", parallel: 2 } }),
     ).toThrow(/worker.parallel/);
+  });
+
+  // --- scrubPiEnv / piEnvPassthrough (Feature 2) ------------------------------
+
+  it("scrubPiEnv defaults to false and piEnvPassthrough to [] when absent", () => {
+    const cfg = normalizeBenchConfig({ ...rawBenchConfigBase });
+    expect(cfg.scrubPiEnv).toBe(false);
+    expect(cfg.piEnvPassthrough).toEqual([]);
+  });
+
+  it("honors scrubPiEnv: true and piEnvPassthrough", () => {
+    const cfg = normalizeBenchConfig({
+      ...rawBenchConfigBase,
+      scrubPiEnv: true,
+      piEnvPassthrough: ["MY_PROVIDER_API_KEY"],
+    });
+    expect(cfg.scrubPiEnv).toBe(true);
+    expect(cfg.piEnvPassthrough).toEqual(["MY_PROVIDER_API_KEY"]);
+  });
+
+  it("rejects a non-boolean scrubPiEnv", () => {
+    expect(() => normalizeBenchConfig({ ...rawBenchConfigBase, scrubPiEnv: "yes" })).toThrow(/scrubPiEnv/);
+  });
+
+  it("rejects a non-string[] piEnvPassthrough", () => {
+    expect(() => normalizeBenchConfig({ ...rawBenchConfigBase, piEnvPassthrough: "FOO" })).toThrow(/piEnvPassthrough/);
+    expect(() => normalizeBenchConfig({ ...rawBenchConfigBase, piEnvPassthrough: [1, 2] })).toThrow(/piEnvPassthrough/);
   });
 });

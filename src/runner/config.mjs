@@ -16,6 +16,66 @@ export const REPO_ROOT = path.resolve(__dirname, "..", "..");
 
 const VALID_THINKING = new Set(["off", "minimal", "low", "medium", "high"]);
 
+// Vars the runner itself sets/controls when spawning pi (see buildPiEnv in
+// run.mjs): PI_CODING_AGENT_DIR/ACCORDION_HOME are set explicitly,
+// PI_CODING_AGENT_SESSION_DIR is explicitly deleted to force the default
+// session layout, and PATH/HOME are load-bearing for the spawn to work at
+// all. An arm's `env` clobbering any of these would silently break the run
+// (or, for PI_CODING_AGENT_DIR/ACCORDION_HOME, silently point pi at the wrong
+// agent dir / accordion checkout) rather than doing what the arm author
+// intended, so validateTrialSpec/validateArmEnv reject them outright.
+export const RUNNER_CONTROLLED_ENV_VARS = new Set([
+  "PI_CODING_AGENT_DIR",
+  "ACCORDION_HOME",
+  "PI_CODING_AGENT_SESSION_DIR",
+  "PATH",
+  "HOME",
+]);
+
+const ARM_ENV_KEY_RE = /^[A-Z][A-Z0-9_]{0,63}$/;
+const ARM_ENV_MAX_ENTRIES = 32;
+const ARM_ENV_MAX_VALUE_LEN = 500;
+
+/**
+ * Validate a single arm's `env` map (ArmSpec.env). Returns a list of error
+ * strings (unprefixed — callers prepend their own "arms[i]." / location
+ * context). `undefined`/absent env is valid (no errors). Shared by
+ * validateTrialSpec (local YAML specs) and the worker path (src/worker/loop.mjs),
+ * which claims ArmSpec objects from the platform and therefore never passes
+ * through validateTrialSpec — see the COVERAGE note on the pooled-room guard
+ * above for the same local/worker-path duplication concern.
+ * @param {any} env
+ * @returns {string[]}
+ */
+export function validateArmEnv(env) {
+  if (env === undefined) return [];
+  const errs = [];
+  if (!env || typeof env !== "object" || Array.isArray(env)) {
+    return ["env: must be an object of string->string if present"];
+  }
+  const keys = Object.keys(env);
+  if (keys.length > ARM_ENV_MAX_ENTRIES) {
+    errs.push(`env: at most ${ARM_ENV_MAX_ENTRIES} entries allowed, got ${keys.length}`);
+  }
+  for (const key of keys) {
+    const value = env[key];
+    if (!ARM_ENV_KEY_RE.test(key)) {
+      errs.push(`env["${key}"]: key must match ${ARM_ENV_KEY_RE} (uppercase, starts with a letter)`);
+    } else if (RUNNER_CONTROLLED_ENV_VARS.has(key)) {
+      errs.push(
+        `env["${key}"]: reserved — the runner sets this itself when spawning pi and an arm ` +
+          `cannot override it (${[...RUNNER_CONTROLLED_ENV_VARS].join(", ")})`,
+      );
+    }
+    if (typeof value !== "string") {
+      errs.push(`env["${key}"]: value must be a string, got ${typeof value}`);
+    } else if (value.length > ARM_ENV_MAX_VALUE_LEN) {
+      errs.push(`env["${key}"]: value must be <=${ARM_ENV_MAX_VALUE_LEN} chars, got ${value.length}`);
+    }
+  }
+  return errs;
+}
+
 /**
  * Load bench config. Falls back to bench.config.example.json with a warning.
  * @param {(msg:string)=>void} [warn]
@@ -59,6 +119,14 @@ export function normalizeBenchConfig(raw) {
   if (!accordionRepo) errs.push("accordionRepo (string) is required");
   if (!platformBase) errs.push("platformBase (string) is required");
   if (!platformApiKeyEnv) errs.push("platformApiKeyEnv (string) is required");
+  if (raw && raw.scrubPiEnv !== undefined && typeof raw.scrubPiEnv !== "boolean")
+    errs.push("scrubPiEnv: must be a boolean if present");
+  if (
+    raw &&
+    raw.piEnvPassthrough !== undefined &&
+    (!Array.isArray(raw.piEnvPassthrough) || !raw.piEnvPassthrough.every((n) => typeof n === "string"))
+  )
+    errs.push("piEnvPassthrough: must be a string[] if present");
   if (errs.length) throw new Error(`Invalid bench config:\n  - ${errs.join("\n  - ")}`);
   return {
     accordionRepo,
@@ -68,6 +136,12 @@ export function normalizeBenchConfig(raw) {
     runsDir: s("runsDir") || "./runs",
     pricing: raw.pricing && typeof raw.pricing === "object" ? raw.pricing : undefined,
     worker: normalizeWorkerConfig(raw.worker),
+    // Default false for backward compat — existing setups may rely on pi
+    // inheriting the runner's full env (e.g. a provider key read from env).
+    // true is RECOMMENDED whenever the benchmarked agent's tool output isn't
+    // fully trusted; see src/runner/envScrub.mjs.
+    scrubPiEnv: raw.scrubPiEnv === true,
+    piEnvPassthrough: Array.isArray(raw.piEnvPassthrough) ? raw.piEnvPassthrough.slice() : [],
   };
 }
 
@@ -179,7 +253,31 @@ export function validateTrialSpec(raw) {
       }
       if (a && a.name !== undefined && typeof a.name !== "string")
         errs.push(`arms[${i}].name: must be a string if present`);
+      if (a) validateArmEnv(a.env).forEach((msg) => errs.push(`arms[${i}].${msg}`));
     });
+
+    // Two arms that resolve to the same effective name (a.name || a.conductor)
+    // are indistinguishable in run ids/labels/record paths — most commonly hit
+    // by two arms sharing a conductor with neither given a `name` (see the
+    // arms[].env example in README/TUTORIAL). Report every colliding group in
+    // one pass rather than failing on just the first duplicate.
+    const byName = new Map();
+    raw.arms.forEach((a, i) => {
+      if (!a || typeof a !== "object") return;
+      const name = typeof a.name === "string" && a.name.trim() ? a.name : a.conductor;
+      if (typeof name !== "string") return;
+      if (!byName.has(name)) byName.set(name, []);
+      byName.get(name).push(i);
+    });
+    for (const [name, indices] of byName) {
+      if (indices.length > 1) {
+        errs.push(
+          `arms: ${indices.length} arms resolve to the same name "${name}" (indices ${indices.join(", ")}) — ` +
+            `arms sharing a conductor (or an explicit name) must have distinct "name" fields so runs/records/` +
+            `fingerprints can tell them apart`,
+        );
+      }
+    }
   }
 
   if (raw.seeds !== undefined && (!Number.isInteger(raw.seeds) || raw.seeds < 1))
@@ -241,7 +339,11 @@ export function validateTrialSpec(raw) {
     ...(raw.accordionRef !== undefined ? { accordionRef: raw.accordionRef } : {}),
     budget: raw.budget,
     protectTokens: raw.protectTokens,
-    arms: raw.arms.map((a) => ({ conductor: a.conductor, name: a.name || a.conductor })),
+    arms: raw.arms.map((a) => ({
+      conductor: a.conductor,
+      name: a.name || a.conductor,
+      ...(a.env && typeof a.env === "object" ? { env: { ...a.env } } : {}),
+    })),
     seeds: raw.seeds || 1,
     caps: { costUsd: caps.costUsd, turns: caps.turns, minutes: caps.minutes, totalTokens: caps.totalTokens },
     parallel: raw.parallel || 1,

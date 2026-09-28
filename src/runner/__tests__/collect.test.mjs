@@ -292,6 +292,54 @@ describe("foldHostTelemetry", () => {
   it("planOutcomes is null when no passthrough/meta_snapshot events were ever recorded", () => {
     expect(tel.planOutcomes).toBeNull();
   });
+  it("lastStatusText is null and statusCount is 0 when no status event was ever recorded", () => {
+    expect(tel.lastStatusText).toBeNull();
+    expect(tel.statusCount).toBe(0);
+  });
+});
+
+// Mid-task addition: Accordion protocol v22's conductorStatus broadcast (a conductor
+// calling host.setStatus(text, metrics)) is the only first-class way a conductor can
+// narrate WHY it's doing something — folded here from t:"status" rows written by
+// src/host/main-v15.ts (already deduped there on consecutive-identical text).
+describe("foldHostTelemetry — t:status (Accordion protocol v22 conductorStatus)", () => {
+  it("tracks the last status text and a count of status rows", () => {
+    const fixture = [
+      { t: "attach", at: 100, sessionId: "s", conductor: "triptych", budget: 40000, protectTokens: 10000 },
+      { t: "status", at: 150, rev: 1, text: "waiting on summarizer" },
+      { t: "status", at: 900, rev: 3, text: "skipping fold: below trigger", metrics: { liveTokens: 42000 } },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join("\n");
+    const tel = foldHostTelemetry(fixture, "triptych");
+    expect(tel.statusCount).toBe(2);
+    expect(tel.lastStatusText).toBe("skipping fold: below trigger");
+  });
+
+  it("a status row with text:null (explicit clear) becomes the last status text", () => {
+    const fixture = [
+      { t: "attach", at: 100, sessionId: "s", conductor: "triptych", budget: 40000, protectTokens: 10000 },
+      { t: "status", at: 150, rev: 1, text: "busy" },
+      { t: "status", at: 200, rev: 2, text: null },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join("\n");
+    const tel = foldHostTelemetry(fixture, "triptych");
+    expect(tel.statusCount).toBe(2);
+    expect(tel.lastStatusText).toBeNull();
+  });
+
+  it("does not fold status rows into errors/infos", () => {
+    const fixture = [
+      { t: "attach", at: 100, sessionId: "s", conductor: "triptych", budget: 40000, protectTokens: 10000 },
+      { t: "status", at: 150, rev: 1, text: "narrating" },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join("\n");
+    const tel = foldHostTelemetry(fixture, "triptych");
+    expect(tel.errors).toEqual([]);
+    expect(tel.infos).toEqual([]);
+  });
 });
 
 // Accordion issue #60/#22 (ADR 0020): plan-outcome observability. foldHostTelemetry folds

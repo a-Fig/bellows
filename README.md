@@ -31,6 +31,10 @@ set AGENT_TRIALS_API_KEY=at_...                   # your platform account key
 
 Requires: a local Accordion checkout, pi on PATH, provider keys in `~/.pi/agent/auth.json`.
 
+Set `"scrubPiEnv": true` in `bench.config.json` (recommended) to keep secrets like the
+platform API key out of the benchmarked agent's own bash tool — see TUTORIAL.md →
+*Keeping secrets out of the agent's env*.
+
 ## Usage
 
 ```bash
