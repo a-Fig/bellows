@@ -35,6 +35,11 @@ Set `"scrubPiEnv": true` in `bench.config.json` (recommended) to keep secrets li
 platform API key out of the benchmarked agent's own bash tool — see TUTORIAL.md →
 *Keeping secrets out of the agent's env*.
 
+On Linux, `"sandbox": "landlock"` additionally confines pi and everything it spawns to
+its own run dir (no reading other arms' solutions, harness logs or `$HOME`) — see
+TUTORIAL.md → *Keeping the agent inside its run dir*; `node bin/bellows.mjs sandbox-check`
+verifies a machine.
+
 ## Usage
 
 ```bash

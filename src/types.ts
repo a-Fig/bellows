@@ -38,6 +38,13 @@ export interface TrialSpec {
    * "claude/happy-fermat-8b7485".
    */
   accordionRef?: string;
+  /**
+   * Filesystem sandbox for this trial's agents. "landlock" turns it on even
+   * when bench.config.json leaves it off; "off" is only accepted when the
+   * config doesn't enforce "landlock" (a trial can add the sandbox, never
+   * remove it). Absent => config.sandbox. See src/runner/sandbox.mjs.
+   */
+  sandbox?: "off" | "landlock";
   /** Accordion token budget the conductor folds down to. */
   budget: number;
   /** Protected working-tail tokens (accordion protectTokens). */
@@ -180,6 +187,9 @@ export interface Fingerprint {
    * see src/runner/run.mjs where this is filled in alongside conductorId.
    */
   env: Record<string, string>;
+  /** Whether pi ran under the Landlock filesystem sandbox. Absent on records
+   *  written before the sandbox existed (reports treat that as "off"). */
+  sandbox?: "off" | "landlock";
 }
 
 export interface UsageTotals {
@@ -421,6 +431,20 @@ export interface BenchConfig {
    * scrubPiEnv is false/absent.
    */
   piEnvPassthrough?: string[];
+  /**
+   * "landlock": run pi (and everything it spawns: bash tool, python, the
+   * Accordion extension, WS conductor runners) under a Landlock filesystem
+   * sandbox that only reaches the run's workspace/agent/accordion-home/tmp
+   * dirs plus system and runtime code — not other runs, the trial dir, this
+   * run's harness logs, the bellows checkout or the rest of $HOME. Linux only;
+   * a run fails fast (never runs unsandboxed) when Landlock is unavailable,
+   * and a canary must pass before pi starts. Network is not restricted.
+   * Default "off". See src/runner/sandbox.mjs and `bellows sandbox-check`.
+   */
+  sandbox?: "off" | "landlock";
+  /** Extra absolute paths to grant inside the sandbox (ro = read, rx = read +
+   *  execute, rw = full access), e.g. a probe venv. Ignored when sandbox is off. */
+  sandboxAllow?: { ro?: string[]; rx?: string[]; rw?: string[] };
 }
 
 export interface WorkerConfig {

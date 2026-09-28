@@ -37,6 +37,52 @@ start listing what was scrubbed) — values never are. **Recommended for any
 bench run where the agent's tool output isn't fully trusted.** A per-arm
 `env` (above) is applied after the scrub and is never scrubbed itself.
 
+### Keeping the agent inside its run dir (`sandbox: "landlock"`, Linux)
+
+`scrubPiEnv` hides secrets in the env, but by default the agent can still
+read the whole disk: other arms' solutions under `runs/`, the trial YAML,
+this run's own `host.jsonl` / `pi-rpc.log`, `bench.config.json`, anything in
+`$HOME`. On Linux, turn on the Landlock filesystem sandbox:
+
+```json
+{ "sandbox": "landlock" }
+```
+
+or per trial (`sandbox: landlock` in the YAML). A trial can switch the sandbox
+**on** when the config leaves it off, but can never switch off a sandbox the
+config enforces. pi is launched through `bin/landlock-exec.py`, which uses
+unprivileged Landlock (no root, no namespaces, no system changes) and then
+execs pi, so pi **and everything it spawns** (bash tool commands, python,
+the Accordion extension, WS conductor runners) can only reach:
+
+| access | paths |
+|---|---|
+| read + write | the run's `workspace/`, `agent/`, `accordion-home/`, `tmp/` (exported as `TMPDIR`), a few `/dev` nodes |
+| append only | the run's `completions.jsonl` (cannot be read back) |
+| read + exec | `/usr` `/bin` `/sbin` `/lib*` `/opt`, node's and pi's install dirs, the (pinned) Accordion checkout, the run's `bin/` |
+| read only | `/etc` `/proc` `/sys`, bellows' `src/runner/extensions` and (for a pinned Accordion worktree under `runs/`) bellows' `node_modules` |
+
+Everything else is denied, including `/tmp` and the rest of `/home`.
+Network is **not** restricted (the agent still needs the platform over HTTPS
+and its conductor over loopback). Extra paths (e.g. a probe venv) go in
+`"sandboxAllow": { "ro": [...], "rx": [...], "rw": [...] }`.
+
+Before pi starts, every sandboxed run executes a canary through the exact same
+wrapper argv (reads another run's workspace, lists `runs/` and the checkout's
+parent, reads `env.sh` and this run's `host.jsonl`, checks `/tmp`, writes the
+workspace and `TMPDIR`, runs `node -v` / `python3 -V`) and aborts the run if
+any isolation probe succeeds. Off Linux, or on a kernel without Landlock, a
+sandboxed run fails immediately rather than running unsandboxed. Check a
+machine without spending anything:
+
+```bash
+node bin/bellows.mjs sandbox-check [trials/x.yaml] [--keep]
+```
+
+Known gaps: the agent can still `stat` paths it cannot open, read other
+processes' command lines in `/proc`, read its own `agent/auth.json` (pi needs
+it in the same process), and connect to loopback ports.
+
 ## Write a trial
 
 A trial is one YAML file in `trials/`:

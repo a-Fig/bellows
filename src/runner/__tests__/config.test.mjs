@@ -377,3 +377,41 @@ describe("normalizeBenchConfig", () => {
     expect(() => normalizeBenchConfig({ ...rawBenchConfigBase, piEnvPassthrough: [1, 2] })).toThrow(/piEnvPassthrough/);
   });
 });
+
+describe("sandbox config (Landlock opt-in)", () => {
+  it("defaults to sandbox: off with no sandboxAllow", () => {
+    const cfg = normalizeBenchConfig({ ...rawBenchConfigBase });
+    expect(cfg.sandbox).toBe("off");
+    expect(cfg.sandboxAllow).toBeUndefined();
+  });
+
+  it("accepts sandbox: landlock and a well-formed sandboxAllow (copied, not aliased)", () => {
+    const allow = { ro: ["/srv/data"], rx: ["/opt/probe-venv"], rw: ["/scratch"] };
+    const cfg = normalizeBenchConfig({ ...rawBenchConfigBase, sandbox: "landlock", sandboxAllow: allow });
+    expect(cfg.sandbox).toBe("landlock");
+    expect(cfg.sandboxAllow).toEqual(allow);
+    expect(cfg.sandboxAllow.ro).not.toBe(allow.ro);
+  });
+
+  it("rejects an unknown sandbox mode", () => {
+    expect(() => normalizeBenchConfig({ ...rawBenchConfigBase, sandbox: "bwrap" })).toThrow(/sandbox: must be one of off, landlock/);
+    expect(() => normalizeBenchConfig({ ...rawBenchConfigBase, sandbox: true })).toThrow(/sandbox/);
+  });
+
+  it("rejects malformed sandboxAllow (unknown key, non-array, relative path)", () => {
+    expect(() => normalizeBenchConfig({ ...rawBenchConfigBase, sandboxAllow: { wx: ["/a"] } })).toThrow(/sandboxAllow\.wx: unknown key/);
+    expect(() => normalizeBenchConfig({ ...rawBenchConfigBase, sandboxAllow: { ro: "/a" } })).toThrow(/sandboxAllow\.ro: must be a string\[\]/);
+    expect(() => normalizeBenchConfig({ ...rawBenchConfigBase, sandboxAllow: { rw: ["relative/dir"] } })).toThrow(/must be an absolute path/);
+    expect(() => normalizeBenchConfig({ ...rawBenchConfigBase, sandboxAllow: ["/a"] })).toThrow(/sandboxAllow: must be an object/);
+  });
+
+  it("validateTrialSpec carries a per-trial sandbox and omits it when absent", () => {
+    expect(validateTrialSpec({ ...base }).sandbox).toBeUndefined();
+    expect(validateTrialSpec({ ...base, sandbox: "landlock" }).sandbox).toBe("landlock");
+    expect(validateTrialSpec({ ...base, sandbox: "off" }).sandbox).toBe("off");
+  });
+
+  it("validateTrialSpec rejects an unknown per-trial sandbox value", () => {
+    expect(() => validateTrialSpec({ ...base, sandbox: "yes" })).toThrow(/sandbox: "yes" not one of off, landlock/);
+  });
+});

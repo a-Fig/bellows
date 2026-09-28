@@ -370,3 +370,23 @@ describe("generateReport — plan RTT column + stat block gating (Accordion issu
     expect(rttHtml).toContain("123ms / 400ms");
   });
 });
+
+describe("sandbox soft field (Landlock opt-in)", () => {
+  const run = (id, fp) => ({ label: id, fingerprint: { ...SHARED_FP, conductorId: "keel", ...fp } });
+
+  it("treats records that predate the field as sandbox: off (no false 'varies')", async () => {
+    const { groupRuns } = await import("./grouping.mjs");
+    const { groups } = groupRuns([run("a", {}), run("b", { sandbox: "off" })]);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].softWarnings.has("sandbox")).toBe(false);
+  });
+
+  it("keeps sandboxed and unsandboxed runs in one group but flags it", async () => {
+    const { groupRuns, fpField } = await import("./grouping.mjs");
+    const { groups } = groupRuns([run("a", {}), run("b", { sandbox: "landlock" })]);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].softWarnings.has("sandbox")).toBe(true);
+    expect(fpField({}, "sandbox")).toBe("off");
+    expect(fpField({}, "piVersion")).toBeUndefined();
+  });
+});

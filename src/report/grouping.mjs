@@ -22,7 +22,20 @@ export const HARD_FIELDS = [
 
 // Fields that differing produces a soft warning badge on the group, but
 // never splits it.
-export const SOFT_FIELDS = ["piVersion", "accordionCommit", "bellowsVersion"];
+// `sandbox` ("off" | "landlock"): whether the agent ran under bellows' Landlock
+// filesystem sandbox. Soft, not hard, so turning the sandbox on doesn't orphan
+// every earlier record — but a group mixing both gets a visible badge.
+export const SOFT_FIELDS = ["piVersion", "accordionCommit", "bellowsVersion", "sandbox"];
+
+// Value a record implies for a field it predates (records written before the
+// sandbox existed were all unsandboxed).
+export const SOFT_FIELD_DEFAULTS = { sandbox: "off" };
+
+/** A fingerprint field's value, with SOFT_FIELD_DEFAULTS applied. */
+export function fpField(fp, f) {
+  const v = fp?.[f];
+  return v === undefined && f in SOFT_FIELD_DEFAULTS ? SOFT_FIELD_DEFAULTS[f] : v;
+}
 
 function groupKey(fp) {
   return HARD_FIELDS.map((f) => String(fp[f])).join("");
@@ -53,7 +66,7 @@ export function groupRuns(runs) {
     const group = byKey.get(key);
     group.runs.push(run);
     for (const f of SOFT_FIELDS) {
-      if (String(group.fingerprint[f]) !== String(fp[f])) {
+      if (String(fpField(group.fingerprint, f)) !== String(fpField(fp, f))) {
         group.softWarnings.add(f);
       }
     }
