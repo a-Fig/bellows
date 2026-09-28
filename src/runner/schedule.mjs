@@ -10,7 +10,7 @@ import { TEMPLATE_DIR, KICKOFF_PROMPT, renderBriefing } from "./provision.mjs";
 import { executeRun, platformAgentName, hostEntryForAccordion } from "./run.mjs";
 import { createRoom, probeRoomJoinable, sleep } from "./platform.mjs";
 import { slopcodeRoomConfig } from "./roomConfig.mjs";
-import { resolveSandboxMode, assertLandlockAvailable } from "./sandbox.mjs";
+import { resolveSandboxMode, resolveSandboxEgress, assertLandlockAvailable } from "./sandbox.mjs";
 
 /**
  * Expand a spec into the flat list of runs (arm × seed).
@@ -151,7 +151,9 @@ export async function runTrial({ spec, config, apiKey, log }) {
   // requested sandbox can't be enforced on this machine. executeRun re-checks
   // per run for callers that bypass runTrial (the worker path).
   const sandboxMode = resolveSandboxMode(config, spec);
+  const sandboxEgress = resolveSandboxEgress(config, spec);
   if (sandboxMode === "landlock") log(`[trial] sandbox: landlock (kernel Landlock ABI ${assertLandlockAvailable()})`);
+  if (sandboxEgress === "blocked") log(`[trial] sandboxEgress: blocked (canary will verify no open-internet egress)`);
 
   const pool = new RoomPool({
     pool: spec.room.pool || [],
@@ -274,6 +276,13 @@ export function planDryRun(spec, config) {
     sandboxLine = `INVALID — ${e.message}`;
   }
   lines.push(`sandbox:    ${sandboxLine}`);
+  let sandboxEgressLine;
+  try {
+    sandboxEgressLine = resolveSandboxEgress(config, spec);
+  } catch (e) {
+    sandboxEgressLine = `INVALID — ${e.message}`;
+  }
+  lines.push(`sandboxEgress: ${sandboxEgressLine}`);
   lines.push(`platform:   ${base}  (apiKeyEnv=${config.platformApiKeyEnv})`);
   const poolStr = (spec.room.pool || []).length ? (spec.room.pool || []).join(", ") : spec.room.create ? "(create on demand)" : "(NONE)";
   lines.push(`rooms:      ${poolStr}  create=${spec.room.create === true}`);

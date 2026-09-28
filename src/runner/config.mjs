@@ -9,7 +9,12 @@ import { fileURLToPath } from "node:url";
 import YAML from "yaml";
 import { validateAccordionRef } from "./accordionRef.mjs";
 import { slopcodeRoomConfig } from "./roomConfig.mjs";
-import { SANDBOX_MODES as SANDBOX_VALUES, validateSandboxAllow } from "./sandbox.mjs";
+import {
+  SANDBOX_MODES as SANDBOX_VALUES,
+  validateSandboxAllow,
+  SANDBOX_EGRESS_VALUES,
+  validateSandboxEgressAllow,
+} from "./sandbox.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 /** Repo root = two levels up from src/runner/. */
@@ -139,6 +144,15 @@ export function normalizeBenchConfig(raw) {
   if (raw && raw.sandbox !== undefined && !SANDBOX_VALUES.has(raw.sandbox))
     errs.push(`sandbox: must be one of ${[...SANDBOX_VALUES].join(", ")} if present`);
   if (raw) errs.push(...validateSandboxAllow(raw.sandboxAllow));
+  if (raw && raw.sandboxEgress !== undefined && !SANDBOX_EGRESS_VALUES.has(raw.sandboxEgress))
+    errs.push(`sandboxEgress: must be one of ${[...SANDBOX_EGRESS_VALUES].join(", ")} if present`);
+  if (raw) errs.push(...validateSandboxEgressAllow(raw.sandboxEgressAllow));
+  // Note: sandboxEgress:"blocked" also requires the effective sandbox mode to
+  // be "landlock" (egress probes run inside the Landlock-wrapped canary), but
+  // that coupling is checked at runtime by resolveSandboxEgress (sandbox.mjs)
+  // once config AND trial spec are both known — a trial may set sandbox:
+  // "landlock" per-trial even when this config's own `sandbox` is "off", so
+  // it can't be rejected here from the config alone.
   if (errs.length) throw new Error(`Invalid bench config:\n  - ${errs.join("\n  - ")}`);
   return {
     accordionRepo,
@@ -164,6 +178,10 @@ export function normalizeBenchConfig(raw) {
           ),
         }
       : {}),
+    // Default "unchecked" (opt-in). "blocked" makes the sandbox canary also
+    // verify no open-internet egress — see src/runner/sandbox.mjs.
+    sandboxEgress: raw.sandboxEgress || "unchecked",
+    ...(raw.sandboxEgressAllow !== undefined ? { sandboxEgressAllow: raw.sandboxEgressAllow.slice() } : {}),
   };
 }
 
@@ -260,6 +278,13 @@ export function validateTrialSpec(raw) {
   // rejected at run time by sandbox.mjs resolveSandboxMode (which sees both).
   if (raw.sandbox !== undefined && !SANDBOX_VALUES.has(raw.sandbox))
     errs.push(`sandbox: "${raw.sandbox}" not one of ${[...SANDBOX_VALUES].join(", ")}`);
+
+  // Per-trial sandboxEgress: may turn egress checking ON. A trial "unchecked"
+  // cannot override a config that enforces "blocked" — rejected at run time
+  // by sandbox.mjs resolveSandboxEgress (which sees both, and also enforces
+  // that "blocked" requires the effective sandbox mode to be "landlock").
+  if (raw.sandboxEgress !== undefined && !SANDBOX_EGRESS_VALUES.has(raw.sandboxEgress))
+    errs.push(`sandboxEgress: "${raw.sandboxEgress}" not one of ${[...SANDBOX_EGRESS_VALUES].join(", ")}`);
 
   if (!Number.isFinite(raw.budget) || raw.budget <= 0)
     errs.push("budget: required positive number");
@@ -366,6 +391,7 @@ export function validateTrialSpec(raw) {
     thinkingLevel: raw.thinkingLevel || "medium",
     ...(raw.accordionRef !== undefined ? { accordionRef: raw.accordionRef } : {}),
     ...(raw.sandbox !== undefined ? { sandbox: raw.sandbox } : {}),
+    ...(raw.sandboxEgress !== undefined ? { sandboxEgress: raw.sandboxEgress } : {}),
     budget: raw.budget,
     protectTokens: raw.protectTokens,
     arms: raw.arms.map((a) => ({

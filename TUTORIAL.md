@@ -83,6 +83,91 @@ Known gaps: the agent can still `stat` paths it cannot open, read other
 processes' command lines in `/proc`, read its own `agent/auth.json` (pi needs
 it in the same process), and connect to loopback ports.
 
+### Verifying egress is blocked (`sandboxEgress: "blocked"`)
+
+Landlock restricts the **filesystem only** — it cannot restrict the network at
+all, and bellows runs unprivileged so it cannot set its own firewall rules
+either (see the "Network is not restricted" note above). This is a real gap,
+not a theoretical one: on 2026-09-28, a sandboxed DeepSeek agent used
+`curl`/`git clone` over plain HTTPS to fetch SlopCode's public hidden tests
+and reference solutions from `github.com/gabeorlanski/scb-problems`, ran the
+hidden tests locally, and read the reference solution — contaminating its
+score. The filesystem sandbox worked exactly as designed; it was never meant
+to stop this.
+
+The actual fix has to happen at the host level (a firewall bellows itself
+cannot install). What bellows *can* do — the same way the filesystem canary
+verifies isolation instead of trusting it — is **verify** the egress block is
+actually in place, and abort the run the same way a filesystem escape does if
+it isn't. Set:
+
+```json
+{ "sandbox": "landlock", "sandboxEgress": "blocked" }
+```
+
+or per trial (`sandboxEgress: blocked` in the YAML — a trial may only
+*tighten* this, `unchecked` -> `blocked`, never loosen a config that enforces
+`blocked`, mirroring `sandbox` itself). `sandboxEgress: "blocked"` requires
+`sandbox: "landlock"`: the egress probes run through the exact same
+Landlock-wrapped canary process as the filesystem probes, so there's nothing
+to run them in otherwise — bellows refuses the run up front rather than
+silently skipping the check.
+
+When enabled, the canary additionally does a plain TCP connect (5s timeout,
+dependency-free `socket.create_connection`, no libraries) to a fixed list of
+hosts that must be **unreachable**: `github.com:443`,
+`raw.githubusercontent.com:443`, `pypi.org:443`. Connection refused, reset,
+timeout, or a DNS failure all count as "blocked" — any of them is a PASS. If
+one of these connects successfully, that's an escape and the run is aborted
+before pi starts, exactly like a filesystem escape. Optionally, list hosts
+that **must** stay reachable (typically the model API) in
+`"sandboxEgressAllow": ["api.deepseek.com:443"]` — bench-config only, checked
+the same way in reverse. The run's `fingerprint.sandbox` records a short
+`egress: "unchecked" | "blocked"` alongside `mode` so reports show which runs
+actually had egress verified.
+
+**bellows only verifies — it never enforces.** You still need a host-level
+firewall. This is the allowlist that fixed the 2026-09-28 incident on the
+bench VM (run once as root; scope everything to the bench user's uid so the
+runner/report/git commands you run as yourself are unaffected):
+
+```bash
+#!/bin/bash
+set -e
+U=$(id -u smash)
+DS=3.173.21.63   # api.deepseek.com (CloudFront edge), pinned in /etc/hosts so DNS rotation can't break it
+grep -q "api.deepseek.com" /etc/hosts || echo "$DS api.deepseek.com" >> /etc/hosts
+iptables -N BENCH_EGRESS 2>/dev/null || iptables -F BENCH_EGRESS
+iptables -C OUTPUT -m owner --uid-owner $U -j BENCH_EGRESS 2>/dev/null || iptables -I OUTPUT 1 -m owner --uid-owner $U -j BENCH_EGRESS
+iptables -A BENCH_EGRESS -o lo -j ACCEPT
+iptables -A BENCH_EGRESS -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -A BENCH_EGRESS -p tcp -d $DS --dport 443 -j ACCEPT
+for i in 72 73 74 75 76 77 78 79; do iptables -A BENCH_EGRESS -p tcp -d 34.143.$i.2 --dport 443 -j ACCEPT; done   # agent-trials (Cloud Run)
+iptables -A BENCH_EGRESS -p tcp -j REJECT --reject-with tcp-reset
+iptables -A BENCH_EGRESS -j REJECT
+ip6tables -C OUTPUT -m owner --uid-owner $U ! -o lo -j REJECT 2>/dev/null || ip6tables -I OUTPUT 1 -m owner --uid-owner $U ! -o lo -j REJECT
+```
+
+**Residual gaps even with this allowlist in place** (the canary's default
+probe list targets exactly the hosts that bit us — it does not, and cannot,
+prove the allowlist has no other holes):
+
+- **IP-pinned CDN edges are shared hosting.** The `DS` address above is one
+  CloudFront edge IP for `api.deepseek.com`, allowed by IP+port, not by
+  hostname — TLS's SNI happens inside the encrypted handshake, so the
+  firewall can't see or check it. Anything else CloudFront (or another
+  provider using the same front-end fleet, e.g. many things sit behind
+  Google's or Cloudflare's edges) fronts on that IP is reachable too, if the
+  agent can guess/learn an IP that resolves there and sends a different SNI.
+  This is a real, known limitation of IP+port allowlisting against any
+  shared CDN edge, not specific to DeepSeek.
+- **DNS still resolves.** The allowlist doesn't block UDP/TCP 53, so the
+  agent can still resolve arbitrary hostnames to IPs — it just (mostly)
+  can't *connect* to what it resolves, except via the gap above.
+- The canary's fixed host list is a spot-check, not a firewall audit — it
+  catches "did today's incident's exact hosts get re-opened", not "is this
+  allowlist airtight."
+
 ## Write a trial
 
 A trial is one YAML file in `trials/`:

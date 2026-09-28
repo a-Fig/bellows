@@ -390,3 +390,40 @@ describe("sandbox soft field (Landlock opt-in)", () => {
     expect(fpField({}, "piVersion")).toBeUndefined();
   });
 });
+
+describe("sandboxEgress soft field (nested in fingerprint.sandbox)", () => {
+  const run = (id, fp) => ({ label: id, fingerprint: { ...SHARED_FP, conductorId: "keel", ...fp } });
+
+  it("a legacy plain-string sandbox value and an equivalent new object value compare EQUAL (both mean egress:unchecked)", async () => {
+    const { groupRuns, fpFieldDisplay } = await import("./grouping.mjs");
+    const legacy = run("a", { sandbox: "landlock" });
+    const modern = run("b", { sandbox: { mode: "landlock", egress: "unchecked" } });
+    expect(fpFieldDisplay(legacy.fingerprint, "sandbox")).toBe(fpFieldDisplay(modern.fingerprint, "sandbox"));
+    const { groups } = groupRuns([legacy, modern]);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].softWarnings.has("sandbox")).toBe(false);
+  });
+
+  it("a record that predates the field entirely (defaults to off) matches a new sandbox:off,egress:unchecked record", async () => {
+    const { groupRuns } = await import("./grouping.mjs");
+    const noField = run("a", {});
+    const modernOff = run("b", { sandbox: { mode: "off", egress: "unchecked" } });
+    const { groups } = groupRuns([noField, modernOff]);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].softWarnings.has("sandbox")).toBe(false);
+  });
+
+  it("flags a real difference: egress:blocked vs egress:unchecked under the same landlock mode", async () => {
+    const { groupRuns } = await import("./grouping.mjs");
+    const unchecked = run("a", { sandbox: { mode: "landlock", egress: "unchecked" } });
+    const blocked = run("b", { sandbox: { mode: "landlock", egress: "blocked" } });
+    const { groups } = groupRuns([unchecked, blocked]);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].softWarnings.has("sandbox")).toBe(true);
+  });
+
+  it("fpFieldDisplay renders the object as a readable string, not [object Object]", async () => {
+    const { fpFieldDisplay } = await import("./grouping.mjs");
+    expect(fpFieldDisplay({ sandbox: { mode: "landlock", egress: "blocked" } }, "sandbox")).toBe("egress=blocked mode=landlock");
+  });
+});

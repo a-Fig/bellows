@@ -23,7 +23,7 @@ import { provisionRun, KICKOFF_PROMPT } from "./provision.mjs";
 import { agentSpawnEnv } from "./agentEnv.mjs";
 import { scrubEnv } from "./envScrub.mjs";
 import { PiRpc } from "./rpc.mjs";
-import { resolveSandboxMode, assertLandlockAvailable, prepareLandlockRun } from "./sandbox.mjs";
+import { resolveSandboxMode, resolveSandboxEgress, assertLandlockAvailable, prepareLandlockRun } from "./sandbox.mjs";
 import {
   findNewestSessionFile,
   collectSession,
@@ -138,13 +138,15 @@ export async function executeRun(args) {
   // checked BEFORE anything is provisioned or spawned: a requested sandbox
   // that can't be enforced here fails the run, never silently runs without it.
   let sandboxMode;
+  let sandboxEgress;
   try {
     sandboxMode = resolveSandboxMode(config, spec);
+    sandboxEgress = resolveSandboxEgress(config, spec);
     if (sandboxMode === "landlock") assertLandlockAvailable();
   } catch (e) {
     return failEarly(e.message);
   }
-  fingerprint.sandbox = sandboxMode;
+  fingerprint.sandbox = { mode: sandboxMode, egress: sandboxEgress };
 
   // Per-trial accordionRef: resolve to a pinned worktree (the effective accordion
   // repo) WITHOUT touching config.accordionRepo's working tree. Absent => use
@@ -262,6 +264,7 @@ export async function executeRun(args) {
           piRpcLogFile: path.join(runDir, "pi-rpc.log"),
           runsRoot: runsRootFrom(config),
           piEnv,
+          sandboxEgress,
           log: (m) => log(`[${label}] ${m}`),
         });
         piCommand = sbx.piPath;
