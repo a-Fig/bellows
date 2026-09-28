@@ -1,0 +1,21 @@
+# First real comparison: Built-in vs Naive-compaction on one easy problem (xjq),
+# both under a 100k-token shared context budget. Fresh room per run (PR #98).
+# thermocline excluded — it's an external WS conductor bellows can't drive yet.
+trial: builtin-vs-naive-xjq-100k
+problems: xjq
+model: token-router:deepseek/deepseek-v4-flash
+thinkingLevel: medium
+budget: 100000          # the shared context window each conductor folds to
+protectTokens: 10000    # protected working tail
+arms:
+  - conductor: builtin
+  - conductor: compaction-naive
+seeds: 1
+caps:
+  costUsd: 2            # inert for token-router ($0 pricing) — validation requires it
+  turns: 60            # assistant messages per run
+  minutes: 45
+  totalTokens: 3000000 # safety backstop only (not the 100k you asked for — that's the budget)
+parallel: 2            # two disjoint arms concurrently
+room:
+  create: true

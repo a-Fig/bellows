@@ -27,7 +27,9 @@ const CONTROLLER_PROTOCOL_MIN = 16;
 const READINESS_PROTOCOL_MIN = 21;
 // One retry: enough to recover from a lease we lost to a stale reconnect race,
 // not so many that a genuinely-foreign holder drags us out to the 30s
-// attach-timeout instead of failing fast.
+// attach-timeout instead of failing fast. Bounding this is what makes the
+// read-only recovery path fail CLOSED — once the bound is spent the run fatals
+// rather than resending forever against a lease it is never going to win.
 const CLAIM_RETRY_LIMIT = 1;
 const SURFACE_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
 
@@ -180,34 +182,53 @@ async function main(): Promise<number> {
 	let lastHoldTimeouts = 0;
 	let configured = false;
 	let claimRetries = 0;
-	// The `seq` of the first command in the currently-outstanding configure batch. Set by
-	// sendConfigureCommands() so a `commandResult{refused:"read-only"}` can be correlated to
-	// the batch that produced it — see the commandResult handler below for why this matters.
-	let batchStartSeq = 0;
+	let configureTimer: ReturnType<typeof setTimeout> | null = null;
 
-	const sendCommand = (cmd: Record<string, unknown>) => {
-		if (!ws || ws.readyState !== WebSocket.OPEN) return;
-		ws.send(JSON.stringify({ type: "command", seq: ++commandSeq, cmd }));
+	const sendCommand = (cmd: Record<string, unknown>): number | null => {
+		if (!ws || ws.readyState !== WebSocket.OPEN) return null;
+		const seq = ++commandSeq;
+		ws.send(JSON.stringify({ type: "command", seq, cmd }));
+		return seq;
 	};
-	// Ordered commands: establish dials first, attach the conductor against those
-	// dials, then opt this benchmark session into folding. Shared by the initial
-	// snapshot-triggered configure and by the read-only-refusal retry, which must
-	// resend the exact same sequence after re-claiming the lease.
+
+	// The four configure commands, in the order they must be applied: establish the
+	// dials first, attach the conductor against those dials, then opt this benchmark
+	// session into folding. `setFolding:true` is LAST and is the one that actually
+	// makes this a conducted arm — a run missing it attaches, syncs and completes while
+	// folding nothing, i.e. a raw baseline mislabelled as a conducted arm.
+	const configurePlan: Record<string, unknown>[] = [
+		{ kind: "setBudget", value: args.budget },
+		{ kind: "setProtect", value: args.protect },
+		{ kind: "selectConductor", id: args.conductor },
+		{ kind: "setFolding", value: true },
+	];
+	// Per-command send/ack bookkeeping, indexed alongside configurePlan.
+	//   configureSeq[i]   the `seq` of the most recent SEND of configurePlan[i] (0 = not
+	//                     currently outstanding — never sent, or the send never left the
+	//                     socket). Commands carry seq >= 1, so 0 correlates to nothing.
+	//   configureAcked[i] true once a `commandResult` for THAT exact seq came back
+	//                     WITHOUT refused:"read-only" — i.e. the extension reached
+	//                     applyCommand for it (extension/accordion.ts ~line 1980).
 	//
-	// Re-sending all four — including the destructive `selectConductor` (which
-	// unconditionally calls `detachActive()`, freezing Truth as actor "you" and
-	// inheriting the conductor's tail into human protectTokens) — is CORRECT here.
-	// The read-only gate is per-socket lease state: it cannot change mid-batch, so if
-	// any one command in a batch was refused as read-only, ALL FOUR were refused
-	// (nothing in the batch was applied). There is therefore nothing destructive
-	// about resending the whole batch after re-claiming — the first attempt never
-	// touched Truth. Do not "optimize" this to resend only the refused command.
-	const sendConfigureCommands = () => {
-		batchStartSeq = commandSeq + 1;
-		sendCommand({ kind: "setBudget", value: args.budget });
-		sendCommand({ kind: "setProtect", value: args.protect });
-		sendCommand({ kind: "selectConductor", id: args.conductor });
-		sendCommand({ kind: "setFolding", value: true });
+	// This is per-command state on purpose. `attached` is NOT a proxy for "the batch was
+	// applied": `attached` only proves selectConductor (index 2) landed, and says nothing
+	// about setFolding (index 3), which is sent in a LATER WS frame and re-gated
+	// independently. See the commandResult handler for the mid-batch lease flip this
+	// exists to defend against.
+	const configureSeq: number[] = configurePlan.map(() => 0);
+	const configureAcked: boolean[] = configurePlan.map(() => false);
+	const unackedConfigure = (): number[] => configurePlan.flatMap((_, i) => (configureAcked[i] ? [] : [i]));
+	const describeConfigure = (indices: number[]) => indices.map((i) => String(configurePlan[i].kind)).join(", ");
+	/**
+	 * Send (or re-send) exactly the listed configure commands and record the seq each one
+	 * went out under, so its reply can be correlated back to it. Re-sending only the
+	 * UNACKNOWLEDGED subset is what makes a resend safe: `selectConductor` is destructive
+	 * (it unconditionally calls detachActive(), freezing Truth as actor "you" and
+	 * inheriting the conductor's tail into human protectTokens), so it must never be
+	 * resent once it has been acknowledged as applied.
+	 */
+	const sendConfigureCommands = (indices: number[] = configurePlan.map((_, i) => i)) => {
+		for (const i of indices) configureSeq[i] = sendCommand(configurePlan[i]) ?? 0;
 	};
 	const sendClaimController = () => {
 		if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -342,6 +363,22 @@ async function main(): Promise<number> {
 							if (attached) return;
 							beginFatal(new Error(`conductor "${args.conductor}" did not become active within ${args.attachTimeoutMs}ms`));
 						}, args.attachTimeoutMs);
+						// A conductor can go active (attachTimer satisfied) while a LATER configure
+						// command is still unacknowledged — attaching proves selectConductor landed,
+						// nothing more. Without this deadline a command that draws no reply at all
+						// (as opposed to an explicit read-only refusal, which the commandResult
+						// handler recovers from or fatals on immediately) would leave the run
+						// executing to completion with a dial silently unapplied. The extension
+						// replies to every `command` frame carrying a numeric seq, so anything still
+						// outstanding this late is a broken peer, not a slow one. Fail mid-run rather
+						// than at exit: the runner only converts a host failure into status=error
+						// while the run is still live (run.mjs's onHostExit), so a run-end-only check
+						// would be observed too late to keep the run out of the report.
+						configureTimer = setTimeout(() => {
+							const pending = unackedConfigure();
+							if (!pending.length) return;
+							beginFatal(new Error(`configure command(s) [${describeConfigure(pending)}] were never acknowledged within ${args.attachTimeoutMs}ms — this run's dials are not fully applied and its telemetry is not a valid "${args.conductor}" arm`));
+						}, args.attachTimeoutMs);
 					}
 					break;
 				}
@@ -362,7 +399,16 @@ async function main(): Promise<number> {
 					break;
 				}
 				case "conductorState": {
-					if (msg.active?.id === args.conductor && !attached) {
+					// `terminating` is part of the attach guard, not just the detach guard below.
+					// onSignal() emits `t:"detach"` and then leaves the socket open for ~50ms while
+					// detach() drains; a conductorState{active:<our conductor>} landing in that
+					// window would otherwise set attached = true and append a `t:"attach"` line
+					// AFTER the `t:"detach"` line — telemetry that contradicts its own ordering and
+					// that foldHostTelemetry folds into attachCount: 1 regardless. It would also
+					// mask a genuinely-never-attached run from the `if (!attached) throw` at the
+					// bottom of main(). Nothing useful can be learned from an attach observed after
+					// we have already begun tearing down, so ignore it outright.
+					if (!terminating && msg.active?.id === args.conductor && !attached) {
 						attached = true;
 						if (attachTimer) clearTimeout(attachTimer);
 						tel.emit({ t: "attach", at: Date.now(), sessionId: session!.sessionId, conductor: args.conductor, budget: args.budget, protectTokens: args.protect, protocolVersion: accordion.PROTOCOL_VERSION });

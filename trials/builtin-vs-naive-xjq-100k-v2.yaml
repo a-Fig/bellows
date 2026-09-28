@@ -1,0 +1,22 @@
+# Re-run with the turn cap effectively removed (turns: 10000). Lets the agent
+# run until it solves xjq, hits the 45-min wall-clock safety, or the 3M-token
+# backstop. Same 100k budget/problem/model as -v1 -> report groups both.
+# thermocline excluded (external WS conductor bellows can't drive yet).
+trial: builtin-vs-naive-xjq-100k-v2
+problems: xjq
+model: token-router:deepseek/deepseek-v4-flash
+thinkingLevel: medium
+budget: 100000          # unchanged shared context window
+protectTokens: 10000
+arms:
+  - conductor: builtin
+  - conductor: compaction-naive
+seeds: 1
+caps:
+  costUsd: 2            # inert for token-router ($0 pricing) — validation requires it
+  turns: 10000         # turn cap effectively removed
+  minutes: 45          # binding wall-clock safety now
+  totalTokens: 3000000 # token backstop
+parallel: 2
+room:
+  create: true

@@ -1,0 +1,22 @@
+# builtin vs compaction-naive on xjq at a 100k budget.
+# ONLY cap: 90-minute wall clock. turns/costUsd set absurdly high (schema requires
+# a positive value; they can never bind); totalTokens omitted entirely.
+# A healthy run ends only on agent-finish or the 90-min clock.
+trial: builtin-vs-naive-xjq-100k-v3
+problems: xjq
+model: token-router:deepseek/deepseek-v4-flash
+thinkingLevel: medium
+budget: 100000
+protectTokens: 10000
+arms:
+  - conductor: builtin
+  - conductor: compaction-naive
+seeds: 1
+caps:
+  costUsd: 1000000     # inert ($0 pricing) + absurdly high — can never fire
+  turns: 100000000     # effectively no turn cap
+  minutes: 90          # THE ONLY REAL CAP
+  # totalTokens: intentionally omitted — no token cap
+parallel: 2
+room:
+  create: true
