@@ -495,6 +495,47 @@ describe("buildPiEnv — pi's spawn env: base + scrubPiEnv + arm env merge", () 
     const env = buildPiEnv({ processEnv, agentDir: "/a", accordionHome: "/h", armEnv: { PATH: "/custom/path" } });
     expect(env.PATH).toBe("/custom/path");
   });
+
+  // ACCORDION_COMPLETION_LOG (Accordion extension completion side log, see
+  // extension/accordion.ts runCompletion + collect.mjs foldCompletionLog) is
+  // runner-owned telemetry plumbing: unlike PATH above, an arm must never be
+  // able to redirect or drop it.
+  it("sets ACCORDION_COMPLETION_LOG from completionLogFile", () => {
+    const env = buildPiEnv({
+      processEnv,
+      agentDir: "/a",
+      accordionHome: "/h",
+      completionLogFile: "/run/dir/completions.jsonl",
+    });
+    expect(env.ACCORDION_COMPLETION_LOG).toBe("/run/dir/completions.jsonl");
+  });
+
+  it("omits ACCORDION_COMPLETION_LOG when no completionLogFile is given", () => {
+    const env = buildPiEnv({ processEnv, agentDir: "/a", accordionHome: "/h" });
+    expect("ACCORDION_COMPLETION_LOG" in env).toBe(false);
+  });
+
+  it("armEnv cannot override ACCORDION_COMPLETION_LOG — the runner's value always wins", () => {
+    const env = buildPiEnv({
+      processEnv,
+      agentDir: "/a",
+      accordionHome: "/h",
+      completionLogFile: "/run/dir/completions.jsonl",
+      armEnv: { ACCORDION_COMPLETION_LOG: "/arm/attempted/override.jsonl" },
+    });
+    expect(env.ACCORDION_COMPLETION_LOG).toBe("/run/dir/completions.jsonl");
+  });
+
+  it("survives scrubPiEnv (it's set after scrubbing, and isn't secret-shaped anyway)", () => {
+    const env = buildPiEnv({
+      processEnv,
+      agentDir: "/a",
+      accordionHome: "/h",
+      scrubPiEnv: true,
+      completionLogFile: "/run/dir/completions.jsonl",
+    });
+    expect(env.ACCORDION_COMPLETION_LOG).toBe("/run/dir/completions.jsonl");
+  });
 });
 
 describe("hostEnv — the effective-accordion-repo env seam", () => {

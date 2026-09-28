@@ -27,8 +27,10 @@ import {
   findNewestSessionFile,
   collectSession,
   collectHostTelemetry,
+  collectCompletionLog,
   enrichTurnsWithWire,
   computePlanRtt,
+  round6,
 } from "./collect.mjs";
 import { harvestLeaderboard, normalizeLabel, finalizeStaleAgent, resolveSessionRoomId } from "./platform.mjs";
 
@@ -204,6 +206,7 @@ export async function executeRun(args) {
       scrubPiEnv: config.scrubPiEnv,
       piEnvPassthrough: config.piEnvPassthrough,
       armEnv,
+      completionLogFile: path.join(runDir, "completions.jsonl"),
       log: (m) => log(`[${label}] ${m}`),
     });
     // Issue #16: heal macOS worker-provisioning defects before the agent's first
@@ -373,6 +376,30 @@ export async function executeRun(args) {
     turns = enrichTurnsWithWire(turns, conductor);
   } catch (e) {
     log(`[${label}] host telemetry collect error: ${e.message}`);
+  }
+
+  // Fold in the Accordion extension's completions.jsonl side log (see
+  // buildPiEnv's ACCORDION_COMPLETION_LOG + collect.mjs foldCompletionLog).
+  // Under Accordion protocol v22 every conductor's out-of-band completion
+  // (compaction-naive/triptych/handoff summary calls) runs inside the
+  // extension, never surfacing as a host.jsonl "complete" row — this is the
+  // ONLY source of completion cost/telemetry for those runs. Additive with
+  // whatever foldHostTelemetry already summed from host.jsonl (pre-v22 /
+  // legacy hosts that DO emit "complete" rows), never a replacement.
+  if (conductor) {
+    try {
+      const completionLog = collectCompletionLog(path.join(runDir, "completions.jsonl"));
+      if (completionLog) {
+        conductor.completeCostUsd = round6(conductor.completeCostUsd + completionLog.completeCostUsd);
+        conductor.completeCalls = completionLog.completeCalls;
+        conductor.completeErrors = completionLog.completeErrors;
+        conductor.completeInputTokens = completionLog.completeInputTokens;
+        conductor.completeOutputTokens = completionLog.completeOutputTokens;
+        conductor.completeCacheReadTokens = completionLog.completeCacheReadTokens;
+      }
+    } catch (e) {
+      log(`[${label}] completion log collect error: ${e.message}`);
+    }
   }
 
   // Integrity guard: a run whose conductor never attached must not be scored as that conductor.
@@ -824,8 +851,13 @@ export function hostEnv(config) {
  * envScrub.mjs), with the arm's env (ArmSpec.env, Feature 1) merged in LAST:
  * explicit, arm-authored config always wins, and is never itself scrubbed (an
  * arm author who puts a secret-shaped name in `env` gets exactly that name,
- * unfiltered — scrubPiEnv only strips AMBIENT/inherited env). Pure aside from
- * the injectable `log`; agentSpawnEnv's health-fix additions (SSL/python shim)
+ * unfiltered — scrubPiEnv only strips AMBIENT/inherited env). ONE exception:
+ * ACCORDION_COMPLETION_LOG (when `completionLogFile` is given) is applied
+ * AFTER the armEnv merge, so an arm can never override it — it's a
+ * runner-owned telemetry sink (RUNNER_CONTROLLED_ENV_VARS in config.mjs also
+ * rejects it at arm-spec validation time; this is the defense-in-depth
+ * enforcement for callers that bypass that validation). Pure aside from the
+ * injectable `log`; agentSpawnEnv's health-fix additions (SSL/python shim)
  * are layered on by the caller separately, after this. Exported as the
  * unit-testable seam for executeRun's env-shaping step.
  * @param {object} args
@@ -835,10 +867,22 @@ export function hostEnv(config) {
  * @param {boolean} [args.scrubPiEnv]
  * @param {string[]} [args.piEnvPassthrough]
  * @param {Record<string,string>} [args.armEnv]
+ * @param {string} [args.completionLogFile]  absolute path for the Accordion extension's
+ *   completion side log (see extension/accordion.ts runCompletion + collect.mjs
+ *   foldCompletionLog); set as ACCORDION_COMPLETION_LOG, non-overridable by armEnv.
  * @param {(m:string)=>void} [args.log]               logs scrubbed var NAMES only, never values
  * @returns {NodeJS.ProcessEnv}
  */
-export function buildPiEnv({ processEnv, agentDir, accordionHome, scrubPiEnv, piEnvPassthrough, armEnv, log = () => {} }) {
+export function buildPiEnv({
+  processEnv,
+  agentDir,
+  accordionHome,
+  scrubPiEnv,
+  piEnvPassthrough,
+  armEnv,
+  completionLogFile,
+  log = () => {},
+}) {
   let piEnv = {
     ...processEnv,
     PI_CODING_AGENT_DIR: agentDir,
@@ -855,6 +899,10 @@ export function buildPiEnv({ processEnv, agentDir, accordionHome, scrubPiEnv, pi
   }
 
   if (armEnv) Object.assign(piEnv, armEnv);
+
+  // Applied LAST, after armEnv, so an arm's env can never redirect or drop
+  // this run's completion-cost telemetry.
+  if (completionLogFile) piEnv.ACCORDION_COMPLETION_LOG = completionLogFile;
 
   return piEnv;
 }
