@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import YAML from "yaml";
 import { validateAccordionRef } from "./accordionRef.mjs";
 import { slopcodeRoomConfig } from "./roomConfig.mjs";
+import { SANDBOX_MODES as SANDBOX_VALUES, validateSandboxAllow } from "./sandbox.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 /** Repo root = two levels up from src/runner/. */
@@ -135,6 +136,9 @@ export function normalizeBenchConfig(raw) {
     (!Array.isArray(raw.piEnvPassthrough) || !raw.piEnvPassthrough.every((n) => typeof n === "string"))
   )
     errs.push("piEnvPassthrough: must be a string[] if present");
+  if (raw && raw.sandbox !== undefined && !SANDBOX_VALUES.has(raw.sandbox))
+    errs.push(`sandbox: must be one of ${[...SANDBOX_VALUES].join(", ")} if present`);
+  if (raw) errs.push(...validateSandboxAllow(raw.sandboxAllow));
   if (errs.length) throw new Error(`Invalid bench config:\n  - ${errs.join("\n  - ")}`);
   return {
     accordionRepo,
@@ -150,6 +154,16 @@ export function normalizeBenchConfig(raw) {
     // fully trusted; see src/runner/envScrub.mjs.
     scrubPiEnv: raw.scrubPiEnv === true,
     piEnvPassthrough: Array.isArray(raw.piEnvPassthrough) ? raw.piEnvPassthrough.slice() : [],
+    // Default "off" (opt-in). "landlock" confines pi + its whole process tree
+    // to the run's own dirs — see src/runner/sandbox.mjs.
+    sandbox: raw.sandbox || "off",
+    ...(raw.sandboxAllow !== undefined
+      ? {
+          sandboxAllow: Object.fromEntries(
+            Object.entries(raw.sandboxAllow).map(([k, v]) => [k, v.slice()]),
+          ),
+        }
+      : {}),
   };
 }
 
@@ -240,6 +254,12 @@ export function validateTrialSpec(raw) {
       errs.push(e.message);
     }
   }
+
+  // Per-trial sandbox: may turn the sandbox ON for this trial. A trial "off"
+  // cannot override a bench config that enforces "landlock" — that conflict is
+  // rejected at run time by sandbox.mjs resolveSandboxMode (which sees both).
+  if (raw.sandbox !== undefined && !SANDBOX_VALUES.has(raw.sandbox))
+    errs.push(`sandbox: "${raw.sandbox}" not one of ${[...SANDBOX_VALUES].join(", ")}`);
 
   if (!Number.isFinite(raw.budget) || raw.budget <= 0)
     errs.push("budget: required positive number");
@@ -345,6 +365,7 @@ export function validateTrialSpec(raw) {
     model: raw.model,
     thinkingLevel: raw.thinkingLevel || "medium",
     ...(raw.accordionRef !== undefined ? { accordionRef: raw.accordionRef } : {}),
+    ...(raw.sandbox !== undefined ? { sandbox: raw.sandbox } : {}),
     budget: raw.budget,
     protectTokens: raw.protectTokens,
     arms: raw.arms.map((a) => ({

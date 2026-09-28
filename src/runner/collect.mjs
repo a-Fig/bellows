@@ -411,7 +411,7 @@ function resolvePlanOutcomes({ wsTally, metaStart, metaEnd, infos }) {
 
 /** Read + fold host telemetry file. Returns null if absent (conductor "none"). */
 export function collectHostTelemetry(hostFile, fallbackConductorId = "") {
-  if (!hostFile || !fs.existsSync(hostFile)) return null;
+  if (!hostFile || isAbsentOrEmpty(hostFile)) return null;
   return foldHostTelemetry(fs.readFileSync(hostFile, "utf8"), fallbackConductorId);
 }
 
@@ -469,8 +469,22 @@ export function foldCompletionLog(text) {
  *  ACCORDION_COMPLETION_LOG writer ran — e.g. arm "none", or a run predating
  *  the env var). */
 export function collectCompletionLog(file) {
-  if (!file || !fs.existsSync(file)) return null;
+  if (!file || isAbsentOrEmpty(file)) return null;
   return foldCompletionLog(fs.readFileSync(file, "utf8"));
+}
+
+/**
+ * True when `file` is missing OR zero bytes. A sandboxed run (sandbox.mjs)
+ * pre-creates host.jsonl/completions.jsonl empty before pi starts, so "empty"
+ * must read exactly like "never written" — otherwise an empty completion log
+ * would overwrite host-summed completion counts with zeros.
+ */
+function isAbsentOrEmpty(file) {
+  try {
+    return fs.statSync(file).size === 0;
+  } catch {
+    return true;
+  }
 }
 
 /** Attach wireTokens onto turns by matching each turn's timestamp to the

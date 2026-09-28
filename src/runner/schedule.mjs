@@ -10,6 +10,7 @@ import { TEMPLATE_DIR, KICKOFF_PROMPT, renderBriefing } from "./provision.mjs";
 import { executeRun, platformAgentName, hostEntryForAccordion } from "./run.mjs";
 import { createRoom, probeRoomJoinable, sleep } from "./platform.mjs";
 import { slopcodeRoomConfig } from "./roomConfig.mjs";
+import { resolveSandboxMode, assertLandlockAvailable } from "./sandbox.mjs";
 
 /**
  * Expand a spec into the flat list of runs (arm × seed).
@@ -146,6 +147,12 @@ export async function runTrial({ spec, config, apiKey, log }) {
   const { sharedFp } = buildSharedContext(spec, config);
   const base = spec.room.base || config.platformBase;
 
+  // Fail the whole trial up front (before any room is created) when a
+  // requested sandbox can't be enforced on this machine. executeRun re-checks
+  // per run for callers that bypass runTrial (the worker path).
+  const sandboxMode = resolveSandboxMode(config, spec);
+  if (sandboxMode === "landlock") log(`[trial] sandbox: landlock (kernel Landlock ABI ${assertLandlockAvailable()})`);
+
   const pool = new RoomPool({
     pool: spec.room.pool || [],
     create: spec.room.create === true,
@@ -260,6 +267,13 @@ export function planDryRun(spec, config) {
   lines.push(`problems:   ${normalizeProblemsDisplay(spec.problems)}`);
   lines.push(`caps:       cost=$${spec.caps.costUsd}  turns=${spec.caps.turns}  minutes=${spec.caps.minutes}`);
   lines.push(`parallel:   ${spec.parallel || 1}`);
+  let sandboxLine;
+  try {
+    sandboxLine = resolveSandboxMode(config, spec);
+  } catch (e) {
+    sandboxLine = `INVALID — ${e.message}`;
+  }
+  lines.push(`sandbox:    ${sandboxLine}`);
   lines.push(`platform:   ${base}  (apiKeyEnv=${config.platformApiKeyEnv})`);
   const poolStr = (spec.room.pool || []).length ? (spec.room.pool || []).join(", ") : spec.room.create ? "(create on demand)" : "(NONE)";
   lines.push(`rooms:      ${poolStr}  create=${spec.room.create === true}`);
