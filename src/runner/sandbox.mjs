@@ -319,7 +319,9 @@ for p in json.loads(sys.argv[1]):
             os.close(fd)
             os.unlink(target)
         elif op == "open-wo":
-            fd = os.open(target, os.O_WRONLY | os.O_APPEND)
+            # Same flags as node's fs.appendFile ("a"): the file already exists,
+            # so O_CREAT must not need MAKE_REG.
+            fd = os.open(target, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
             os.close(fd)
         elif op == "tmpdir":
             if os.environ.get("TMPDIR") != target:
