@@ -8,7 +8,7 @@
  * the shim's absolute path and, on Windows, invoke it through `cmd.exe /c` with
  * a properly quoted command line so `shell:false` spawning stays safe.
  */
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -71,13 +71,12 @@ function winQuote(arg) {
 }
 
 /**
- * Spawn a command (possibly a Windows .cmd shim) safely with an args array,
- * without shell:true and without the DEP0190 warning.
- * @param {string} command
- * @param {string[]} args
- * @param {import("node:child_process").SpawnOptions} [options]
+ * Resolve `command`+`args` to the actual {file, args, extraOpts} spawn(Sync)
+ * should be called with, handling the Windows .cmd-shim case identically for
+ * both the async and sync spawn helpers below (ONE place for the quoting
+ * logic, so it can't drift between them).
  */
-export function spawnSafe(command, args, options = {}) {
+function resolveSpawnInvocation(command, args) {
   const resolved = resolveCommand(command);
   if (process.platform === "win32" && resolved.toLowerCase().endsWith(".cmd")) {
     // Run the .cmd through cmd.exe with an explicitly quoted command line.
@@ -86,11 +85,39 @@ export function spawnSafe(command, args, options = {}) {
     // ... "C:\...\host.jsonl") gets mangled unless the whole line is wrapped in
     // one extra outer quote pair, which /s then strips verbatim.
     const line = [winQuote(resolved), ...args.map(winQuote)].join(" ");
-    return spawn(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", `"${line}"`], {
-      ...options,
-      shell: false,
-      windowsVerbatimArguments: true,
-    });
+    return {
+      file: process.env.ComSpec || "cmd.exe",
+      args: ["/d", "/s", "/c", `"${line}"`],
+      extraOpts: { shell: false, windowsVerbatimArguments: true },
+    };
   }
-  return spawn(resolved, args, { ...options, shell: false });
+  return { file: resolved, args, extraOpts: { shell: false } };
+}
+
+/**
+ * Spawn a command (possibly a Windows .cmd shim) safely with an args array,
+ * without shell:true and without the DEP0190 warning.
+ * @param {string} command
+ * @param {string[]} args
+ * @param {import("node:child_process").SpawnOptions} [options]
+ */
+export function spawnSafe(command, args, options = {}) {
+  const { file, args: finalArgs, extraOpts } = resolveSpawnInvocation(command, args);
+  return spawn(file, finalArgs, { ...options, ...extraOpts });
+}
+
+/**
+ * Synchronous counterpart to spawnSafe — same .cmd-shim handling, but blocks
+ * and returns a SpawnSyncReturns instead of a ChildProcess. For call sites
+ * that are already fully synchronous (e.g. accordionRef.mjs's worktree
+ * provisioning, which runs under a cross-process lockfile using sync fs
+ * calls) and would rather block than thread a Promise through that code.
+ * @param {string} command
+ * @param {string[]} args
+ * @param {import("node:child_process").SpawnSyncOptions} [options]
+ * @returns {import("node:child_process").SpawnSyncReturns<string|Buffer>}
+ */
+export function spawnSafeSync(command, args, options = {}) {
+  const { file, args: finalArgs, extraOpts } = resolveSpawnInvocation(command, args);
+  return spawnSync(file, finalArgs, { ...options, ...extraOpts });
 }

@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import http from "node:http";
-import { RoomPool } from "../schedule.mjs";
+import path from "node:path";
+import { RoomPool, expandRuns } from "../schedule.mjs";
 
 /**
  * Tiny in-test HTTP stub of POST /api/rooms, mirroring the style of
@@ -42,6 +43,43 @@ class StubRoomsApi {
     });
   }
 }
+
+describe("expandRuns — arm env carries through (Feature 1)", () => {
+  const runsRoot = path.join("C:", "runs");
+
+  it("carries an empty env object for an arm with no env", () => {
+    const spec = { trial: "t1", arms: [{ conductor: "keel", name: "keel" }], seeds: 1 };
+    const [run] = expandRuns(spec, runsRoot);
+    expect(run.env).toEqual({});
+  });
+
+  it("carries the arm's env through to the run", () => {
+    const spec = {
+      trial: "t1",
+      arms: [{ conductor: "compaction-naive", name: "naive-t075", env: { ACCORDION_SUMMARY_TRIGGER: "0.75" } }],
+      seeds: 1,
+    };
+    const [run] = expandRuns(spec, runsRoot);
+    expect(run.env).toEqual({ ACCORDION_SUMMARY_TRIGGER: "0.75" });
+  });
+
+  it("distinguishes two same-conductor arms by name and env", () => {
+    const spec = {
+      trial: "t1",
+      arms: [
+        { conductor: "compaction-naive", name: "naive-a", env: { ACCORDION_SUMMARY_TRIGGER: "0.5" } },
+        { conductor: "compaction-naive", name: "naive-b", env: { ACCORDION_SUMMARY_TRIGGER: "0.9" } },
+      ],
+      seeds: 1,
+    };
+    const runs = expandRuns(spec, runsRoot);
+    expect(runs).toHaveLength(2);
+    expect(runs[0].armName).toBe("naive-a");
+    expect(runs[0].env).toEqual({ ACCORDION_SUMMARY_TRIGGER: "0.5" });
+    expect(runs[1].armName).toBe("naive-b");
+    expect(runs[1].env).toEqual({ ACCORDION_SUMMARY_TRIGGER: "0.9" });
+  });
+});
 
 describe("RoomPool.lease — createRoom receives the derived roomConfig", () => {
   let stub;

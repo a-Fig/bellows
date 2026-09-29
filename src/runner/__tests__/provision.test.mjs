@@ -206,6 +206,7 @@ describe("patchDeepSeekCompat — pure transform", () => {
     expect(entry.compat).toEqual({
       requiresReasoningContentOnAssistantMessages: true,
       thinkingFormat: "deepseek",
+      supportsDeveloperRole: false,
     });
     // apiKey sits untouched alongside — the transform never reads/copies it.
     expect(json.providers["token-router"].apiKey).toBe(CANARY_KEY);
@@ -257,6 +258,7 @@ describe("patchDeepSeekCompat — pure transform", () => {
               compat: {
                 requiresReasoningContentOnAssistantMessages: false,
                 thinkingFormat: "qwen",
+                supportsDeveloperRole: true,
                 someOtherCompatField: "keep-me",
               },
             },
@@ -286,6 +288,7 @@ describe("patchDeepSeekCompat — pure transform", () => {
     expect(entry.compat).toEqual({
       requiresReasoningContentOnAssistantMessages: true,
       thinkingFormat: "deepseek",
+      supportsDeveloperRole: false,
     });
   });
 
@@ -310,7 +313,68 @@ describe("patchDeepSeekCompat — pure transform", () => {
     expect(entry.compat).toEqual({
       requiresReasoningContentOnAssistantMessages: true,
       thinkingFormat: "deepseek",
+      supportsDeveloperRole: false,
     });
+  });
+
+  it("fills only the missing supportsDeveloperRole when the other two compat fields are already explicit — regression test for the 'role must be system, got developer' 400", () => {
+    // Reproduces the exact shape provisionRun would have produced before this
+    // fix: reasoning:true plus the original two compat fields already filled
+    // in by an earlier patch pass, but supportsDeveloperRole still missing.
+    // Left as-is, pi's detectCompat defaults supportsDeveloperRole to true for
+    // a token-router-shaped (non-deepseek.com, non-openrouter) provider, and
+    // `useDeveloperRole = model.reasoning && compat.supportsDeveloperRole`
+    // then sends the system prompt as {role: "developer", ...} — which
+    // token-router's deepseek-v4-flash backend rejects.
+    const json = {
+      providers: {
+        "token-router": {
+          baseUrl: "https://api.tokenrouter.com/v1",
+          models: [
+            {
+              id: "deepseek/deepseek-v4-flash",
+              reasoning: true,
+              compat: {
+                requiresReasoningContentOnAssistantMessages: true,
+                thinkingFormat: "deepseek",
+              },
+            },
+          ],
+        },
+      },
+    };
+    const patched = patchDeepSeekCompat(json);
+    expect(patched).toEqual(["token-router:deepseek/deepseek-v4-flash"]);
+    const entry = json.providers["token-router"].models[0];
+    expect(entry.compat).toEqual({
+      requiresReasoningContentOnAssistantMessages: true,
+      thinkingFormat: "deepseek",
+      supportsDeveloperRole: false,
+    });
+  });
+
+  it("never overrides an explicit supportsDeveloperRole:true — operator's choice wins", () => {
+    const json = {
+      providers: {
+        "token-router": {
+          baseUrl: "https://api.tokenrouter.com/v1",
+          models: [
+            {
+              id: "deepseek/deepseek-v4-flash",
+              reasoning: true,
+              compat: {
+                requiresReasoningContentOnAssistantMessages: true,
+                thinkingFormat: "deepseek",
+                supportsDeveloperRole: true,
+              },
+            },
+          ],
+        },
+      },
+    };
+    const patched = patchDeepSeekCompat(json);
+    expect(patched).toEqual([]);
+    expect(json.providers["token-router"].models[0].compat.supportsDeveloperRole).toBe(true);
   });
 
   it("never throws on missing/malformed shapes — degrades to no patches", () => {
@@ -365,6 +429,7 @@ describe("applyDeepSeekCompat — provisioned-copy file I/O", () => {
     expect(onDisk.providers["token-router"].models[0].compat).toEqual({
       requiresReasoningContentOnAssistantMessages: true,
       thinkingFormat: "deepseek",
+      supportsDeveloperRole: false,
     });
     expect(logs).toHaveLength(1);
     expect(logs[0]).toContain("token-router:deepseek/deepseek-v4-flash");
@@ -469,6 +534,7 @@ describe("provisionRun — DeepSeek compat integration (real copy path)", () => 
     expect(copied.providers["token-router"].models[0].compat).toEqual({
       requiresReasoningContentOnAssistantMessages: true,
       thinkingFormat: "deepseek",
+      supportsDeveloperRole: false,
     });
     expect(logs.join("\n")).not.toContain(CANARY_KEY);
   });

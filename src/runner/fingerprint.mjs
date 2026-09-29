@@ -84,13 +84,13 @@ export function hashString(s) {
 
 /**
  * Build the parts of the Fingerprint that are shared across all runs of a trial.
- * Per-run fields (conductorId) are filled in by the caller.
+ * Per-run fields (conductorId, env) are filled in by the caller.
  * @param {object} args
  * @param {import("../types.ts").TrialSpec} args.spec
  * @param {import("../types.ts").BenchConfig} args.config
  * @param {string} args.workspaceTemplateDir
  * @param {string} args.kickoffPrompt
- * @returns {Omit<import("../types.ts").Fingerprint, "conductorId">}
+ * @returns {Omit<import("../types.ts").Fingerprint, "conductorId" | "env">}
  */
 export function sharedFingerprint({ spec, config, workspaceTemplateDir, kickoffPrompt }) {
   return {
@@ -106,5 +106,6 @@ export function sharedFingerprint({ spec, config, workspaceTemplateDir, kickoffP
     conductorId: "", // filled per run
     bellowsVersion: bellowsVersion(),
     deepseekCompat: false, // filled per run once provisionRun's patch outcome is known
+    env: {}, // filled per run — arm.env, so same-conductor arms fingerprint distinctly
   };
 }

@@ -21,13 +21,16 @@ function runsRootFrom(config) {
 const BELLOWS_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 import { provisionRun, KICKOFF_PROMPT } from "./provision.mjs";
 import { agentSpawnEnv } from "./agentEnv.mjs";
+import { scrubEnv } from "./envScrub.mjs";
 import { PiRpc } from "./rpc.mjs";
 import {
   findNewestSessionFile,
   collectSession,
   collectHostTelemetry,
+  collectCompletionLog,
   enrichTurnsWithWire,
   computePlanRtt,
+  round6,
 } from "./collect.mjs";
 import { harvestLeaderboard, normalizeLabel, finalizeStaleAgent, resolveSessionRoomId } from "./platform.mjs";
 
@@ -45,11 +48,14 @@ const MAX_FAILED_STATS_POLLS = 6; // ~30s+ of cost blindness -> stop the run
  * @param {import("../types.ts").BenchConfig} args.config
  * @param {string} args.arm            conductor id for this arm
  * @param {string} args.armName
+ * @param {Record<string,string>} [args.armEnv]  ArmSpec.env for this arm (already
+ *   validated by validateTrialSpec / the worker path's own equivalent check) —
+ *   merged into pi's env LAST, after scrubPiEnv, and never itself scrubbed.
  * @param {number} args.seed
  * @param {string} args.roomId
  * @param {string} args.apiKey
  * @param {string} args.runDir
- * @param {Omit<import("../types.ts").Fingerprint,"conductorId">} args.sharedFp
+ * @param {Omit<import("../types.ts").Fingerprint,"conductorId"|"env">} args.sharedFp
  * @param {(m:string)=>void} args.log
  * @param {AbortSignal} [args.abortSignal]  when aborted, tears the run down early
  *   (status "error", statusDetail "cancelled"). Additive — omitted by `bellows run`;
@@ -57,7 +63,7 @@ const MAX_FAILED_STATS_POLLS = 6; // ~30s+ of cost blindness -> stop the run
  * @returns {Promise<import("../types.ts").RunRecord>}
  */
 export async function executeRun(args) {
-  const { spec, config, arm, armName, seed, roomId, apiKey, runDir, sharedFp, log, abortSignal } = args;
+  const { spec, config, arm, armName, armEnv, seed, roomId, apiKey, runDir, sharedFp, log, abortSignal } = args;
   // Label = "<trial>/<arm>/<seed>", trimmed + clamped to the platform's 64-char
   // limit. Used both as the run id and the leaderboard label (pull key).
   const label = normalizeLabel(`${spec.trial}/${armName}/${seed}`);
@@ -90,7 +96,7 @@ export async function executeRun(args) {
   // is never touched.
   let armDispatch = arm === "none" ? { type: "in-process", id: "none" } : parseConductorArm(arm);
 
-  const fingerprint = { ...sharedFp, conductorId: arm };
+  const fingerprint = { ...sharedFp, conductorId: arm, env: armEnv || {} };
   // Per-trial accordionRef: resolve to a pinned worktree (the effective accordion
   // repo) WITHOUT touching config.accordionRepo's working tree. Absent => use
   // config.accordionRepo as-is (today's behavior). The resolved SHA overrides the
@@ -193,14 +199,16 @@ export async function executeRun(args) {
     // remain real tuning knobs. The armed bit that used to ride a steering env
     // var no longer travels as env: the host (src/host/main.ts) now declares
     // it over the wire to the attached extension on every (re)connect.
-    const piEnv = {
-      ...process.env,
-      PI_CODING_AGENT_DIR: agentDir,
-      ACCORDION_HOME: accordionHome,
-    };
-    // A parent-shell PI_CODING_AGENT_SESSION_DIR would redirect the session
-    // JSONL outside agentDir and blind the collector — force the default layout.
-    delete piEnv.PI_CODING_AGENT_SESSION_DIR;
+    const piEnv = buildPiEnv({
+      processEnv: process.env,
+      agentDir,
+      accordionHome,
+      scrubPiEnv: config.scrubPiEnv,
+      piEnvPassthrough: config.piEnvPassthrough,
+      armEnv,
+      completionLogFile: path.join(runDir, "completions.jsonl"),
+      log: (m) => log(`[${label}] ${m}`),
+    });
     // Issue #16: heal macOS worker-provisioning defects before the agent's first
     // command — wire certifi into SSL_CERT_FILE (else every HTTPS call fails with
     // CERTIFICATE_VERIFY_FAILED) and shim `python` -> `python3` on PATH (the
@@ -267,7 +275,7 @@ export async function executeRun(args) {
     // extension socket is still alive so POSIX workers can disarm/detach
     // cleanly; on Windows the child is terminated directly and pi follows
     // immediately. Legacy hosts retain their established pi-first ordering.
-    const v15Host = hostEntryForAccordion(effConfig.accordionRepo) === "src/host/main-v15.ts";
+    const v15Host = isResidentHostCheckout(effConfig.accordionRepo);
     if (v15Host) {
       try {
         await stopHost();
@@ -368,6 +376,30 @@ export async function executeRun(args) {
     turns = enrichTurnsWithWire(turns, conductor);
   } catch (e) {
     log(`[${label}] host telemetry collect error: ${e.message}`);
+  }
+
+  // Fold in the Accordion extension's completions.jsonl side log (see
+  // buildPiEnv's ACCORDION_COMPLETION_LOG + collect.mjs foldCompletionLog).
+  // Under Accordion protocol v22 every conductor's out-of-band completion
+  // (compaction-naive/triptych/handoff summary calls) runs inside the
+  // extension, never surfacing as a host.jsonl "complete" row — this is the
+  // ONLY source of completion cost/telemetry for those runs. Additive with
+  // whatever foldHostTelemetry already summed from host.jsonl (pre-v22 /
+  // legacy hosts that DO emit "complete" rows), never a replacement.
+  if (conductor) {
+    try {
+      const completionLog = collectCompletionLog(path.join(runDir, "completions.jsonl"));
+      if (completionLog) {
+        conductor.completeCostUsd = round6(conductor.completeCostUsd + completionLog.completeCostUsd);
+        conductor.completeCalls = completionLog.completeCalls;
+        conductor.completeErrors = completionLog.completeErrors;
+        conductor.completeInputTokens = completionLog.completeInputTokens;
+        conductor.completeOutputTokens = completionLog.completeOutputTokens;
+        conductor.completeCacheReadTokens = completionLog.completeCacheReadTokens;
+      }
+    } catch (e) {
+      log(`[${label}] completion log collect error: ${e.message}`);
+    }
   }
 
   // Integrity guard: a run whose conductor never attached must not be scored as that conductor.
@@ -812,6 +844,70 @@ export function hostEnv(config) {
 }
 
 /**
+ * Build pi's spawn env: base process env + PI_CODING_AGENT_DIR/ACCORDION_HOME,
+ * minus PI_CODING_AGENT_SESSION_DIR (a parent-shell value would redirect the
+ * session JSONL outside agentDir and blind the collector — force the default
+ * layout), optionally scrubbed of secret-shaped vars (config.scrubPiEnv — see
+ * envScrub.mjs), with the arm's env (ArmSpec.env, Feature 1) merged in LAST:
+ * explicit, arm-authored config always wins, and is never itself scrubbed (an
+ * arm author who puts a secret-shaped name in `env` gets exactly that name,
+ * unfiltered — scrubPiEnv only strips AMBIENT/inherited env). ONE exception:
+ * ACCORDION_COMPLETION_LOG (when `completionLogFile` is given) is applied
+ * AFTER the armEnv merge, so an arm can never override it — it's a
+ * runner-owned telemetry sink (RUNNER_CONTROLLED_ENV_VARS in config.mjs also
+ * rejects it at arm-spec validation time; this is the defense-in-depth
+ * enforcement for callers that bypass that validation). Pure aside from the
+ * injectable `log`; agentSpawnEnv's health-fix additions (SSL/python shim)
+ * are layered on by the caller separately, after this. Exported as the
+ * unit-testable seam for executeRun's env-shaping step.
+ * @param {object} args
+ * @param {NodeJS.ProcessEnv} args.processEnv        base env to spread (normally process.env)
+ * @param {string} args.agentDir
+ * @param {string} args.accordionHome
+ * @param {boolean} [args.scrubPiEnv]
+ * @param {string[]} [args.piEnvPassthrough]
+ * @param {Record<string,string>} [args.armEnv]
+ * @param {string} [args.completionLogFile]  absolute path for the Accordion extension's
+ *   completion side log (see extension/accordion.ts runCompletion + collect.mjs
+ *   foldCompletionLog); set as ACCORDION_COMPLETION_LOG, non-overridable by armEnv.
+ * @param {(m:string)=>void} [args.log]               logs scrubbed var NAMES only, never values
+ * @returns {NodeJS.ProcessEnv}
+ */
+export function buildPiEnv({
+  processEnv,
+  agentDir,
+  accordionHome,
+  scrubPiEnv,
+  piEnvPassthrough,
+  armEnv,
+  completionLogFile,
+  log = () => {},
+}) {
+  let piEnv = {
+    ...processEnv,
+    PI_CODING_AGENT_DIR: agentDir,
+    ACCORDION_HOME: accordionHome,
+  };
+  delete piEnv.PI_CODING_AGENT_SESSION_DIR;
+
+  if (scrubPiEnv) {
+    const { env: scrubbed, scrubbed: droppedNames } = scrubEnv(piEnv, piEnvPassthrough || []);
+    piEnv = scrubbed;
+    if (droppedNames.length) {
+      log(`[env] scrubPiEnv dropped ${droppedNames.length} var(s) from pi's env: ${droppedNames.join(", ")}`);
+    }
+  }
+
+  if (armEnv) Object.assign(piEnv, armEnv);
+
+  // Applied LAST, after armEnv, so an arm's env can never redirect or drop
+  // this run's completion-cost telemetry.
+  if (completionLogFile) piEnv.ACCORDION_COMPLETION_LOG = completionLogFile;
+
+  return piEnv;
+}
+
+/**
  * Issue #14 integrity guard: true when a real conductor was requested (arm !== "none")
  * but its telemetry shows it never attached (0 attach / 0 sync) while surfacing at least
  * one error — i.e. the conductor under test never ran, so a "completed" status would
@@ -902,9 +998,19 @@ export function isLegacyAccordionCheckout(accordionRepo) {
   return !(typeof accordionRepo === "string" && fs.existsSync(path.join(accordionRepo, "core", "protocol.ts")));
 }
 
+// Entry point for the resident (truth-in-extension) controller. The filename keeps
+// the "main-v15" name for path stability — see main-v15.ts's header comment — even
+// though it now bridges protocol v15 through v22.
+export const RESIDENT_HOST_ENTRY = "src/host/main-v15.ts";
+
+/** True for any checkout the resident host (RESIDENT_HOST_ENTRY) can drive. */
+export function isResidentHostCheckout(accordionRepo) {
+  return !isLegacyAccordionCheckout(accordionRepo);
+}
+
 /** Select the protocol-v15 controller for truth-in-extension checkouts. */
 export function hostEntryForAccordion(accordionRepo) {
-  return isLegacyAccordionCheckout(accordionRepo) ? "src/host/main.ts" : "src/host/main-v15.ts";
+  return isLegacyAccordionCheckout(accordionRepo) ? "src/host/main.ts" : RESIDENT_HOST_ENTRY;
 }
 
 /**

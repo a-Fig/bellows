@@ -189,6 +189,9 @@ describe.skipIf(ACCORDION_MISSING || ACCORDION_IS_V15)("headless conductor host"
 			expect(attach).toBeTruthy();
 			expect(attach.conductor).toBe("builtin");
 			expect(attach.budget).toBe(30_000);
+			// The mock's default hello (protocolVersion 5) must be recorded verbatim, not a
+			// hardcoded constant — see main.ts's attach-event comment.
+			expect(attach.protocolVersion).toBe(5);
 			expect(tel.some((e) => e.t === "sync" && e.blocks > 0)).toBe(true);
 			expect(tel.some((e) => e.t === "plan")).toBe(true);
 			const conductWithFolds = tel.find((e) => e.t === "conduct" && e.commands > 0);
@@ -348,6 +351,8 @@ describe.skipIf(ACCORDION_MISSING || ACCORDION_IS_V15)("headless conductor host"
 		try {
 			await waitFor(() => mock.client !== null, 60_000, "host WS connect");
 			await waitFor(() => readTelemetry(telemetryOut).some((e) => e.t === "attach"), 5000, "attach telemetry");
+			// The attach event must record the version this mock actually advertised (v7).
+			expect(readTelemetry(telemetryOut).find((e) => e.t === "attach").protocolVersion).toBe(7);
 
 			// The host's "start" meta snapshot fetch is fire-and-forget right after attach —
 			// wait for it to land, and it must carry the mock's served counters verbatim.
@@ -404,6 +409,8 @@ describe.skipIf(ACCORDION_MISSING || ACCORDION_IS_V15)("headless conductor host"
 		try {
 			await waitFor(() => mock.client !== null, 60_000, "host WS connect");
 			await waitFor(() => readTelemetry(telemetryOut).some((e) => e.t === "attach"), 5000, "attach telemetry");
+			// The attach event must record the version this mock actually advertised (v8).
+			expect(readTelemetry(telemetryOut).find((e) => e.t === "attach").protocolVersion).toBe(8);
 
 			// A v8 extension can still send a `passthrough` ack — v8 is wire-identical to v7,
 			// it only makes that ack mandatory on the Accordion side, so the host must fold it
@@ -433,6 +440,8 @@ describe.skipIf(ACCORDION_MISSING || ACCORDION_IS_V15)("headless conductor host"
 		try {
 			await waitFor(() => mock.client !== null, 60_000, "host WS connect");
 			await waitFor(() => readTelemetry(telemetryOut).some((e) => e.t === "attach"), 5000, "attach telemetry");
+			// The attach event must record the version this mock actually advertised (v9).
+			expect(readTelemetry(telemetryOut).find((e) => e.t === "attach").protocolVersion).toBe(9);
 
 			// Protocol v9 removed `PassthroughMessage.recalls`. The mock omits it on the wire;
 			// Bellows keeps its historical telemetry schema stable by normalizing it to zero.

@@ -1,0 +1,48 @@
+# Accordion main smoke: proves the resident v22 host actually attaches and
+# negotiates protocol v22 against main's tree (SHA
+# 39667c8558b96d9d59adb6f25ec3c3a7bb295fdb) BEFORE spending 5 x 90 minutes on
+# main-conductors-xjq-100k. Run this first; only proceed to the full lineup
+# if this comes back "completed".
+#
+# Pinned to the exact main SHA (not the branch name) so this trial name stays
+# comparable across re-runs even as main moves — accordionRef.mjs's
+# resolveRefToSha resolves branch refs at run time, which would make two runs
+# a week apart silently diverge while sharing this trial name.
+#
+# Two arms, deliberately:
+#   compaction-naive — the control devmain-smoke uses. Cleanest signal for
+#     "did the v22 host attach, select a conductor, and fold at all", with
+#     nothing arm-specific to confound a failure.
+#   none — the detached sentinel. NOT redundant: it exercises a different
+#     path (no conductor selected), and that path has regressed before —
+#     bellows #30 "Stop sentinel-echo runs from masquerading as completed"
+#     was exactly a sentinel run reporting success while producing nothing.
+#     It is also an arm of the full lineup, so a silent failure here would
+#     otherwise only surface 90 minutes into the real trial.
+# handoff/doorman/thermocline are exercised by the comparison trial, not here.
+#
+# Budget/cap shape matches devmain-smoke.yaml: small budget (15k) so folding
+# is forced almost immediately rather than depending on the agent writing
+# enough context to reach a 100k ceiling, and a tight wall clock (20 min) so
+# a hung v22 host/attach against main's tree fails fast instead of silently
+# burning the usual 90-minute wall clock before anyone notices.
+trial: main-smoke
+problems: xjq
+model: token-router:deepseek/deepseek-v4-flash
+thinkingLevel: medium
+accordionRef: 39667c8558b96d9d59adb6f25ec3c3a7bb295fdb
+budget: 15000
+protectTokens: 5000
+arms:
+  - conductor: compaction-naive
+  - conductor: none
+seeds: 1
+caps:
+  costUsd: 10          # inert for token-router ($0 pricing) — validation requires it
+  turns: 10000         # effectively off — not the cap we're testing
+  minutes: 20           # THE REAL CAP — a hang on the new host must fail fast
+parallel: 2            # both arms concurrently, so the smoke still costs ~20
+                        # minutes of wall clock, not 40 — and matches the
+                        # concurrency the full trial will run at
+room:
+  create: true

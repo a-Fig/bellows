@@ -1,0 +1,35 @@
+# Accordion devmain smoke: first end-to-end run of the v22 host
+# (368498a63fef5985dcb850ef5a492b076c29221b, protocol v22) via bellows.
+# Pinned to the exact devmain SHA (not the branch name) so this trial name
+# stays comparable across re-runs even as devmain moves — accordionRef.mjs's
+# resolveRefToSha resolves branch refs at run time, which would make two runs
+# a week apart silently diverge while sharing this trial name.
+#
+# Single arm: compaction-naive, the only conductor id that exists on BOTH the
+# legacy main branch and devmain (see core/conductor/registry.ts ENTRIES on
+# devmain), so it's the cleanest control for "did the v22 host attach and fold
+# at all" with nothing devmain-specific to confound a failure. handoff/doorman/
+# thermocline are devmain-only and belong in the comparison trial, not here.
+#
+# Budget deliberately small (15k, matching thermocline-smoke's spirit) so
+# folding is forced almost immediately rather than depending on the agent
+# writing enough context to reach a 100k ceiling. minutes is kept tight (20)
+# so a hung v22 host/attach fails fast instead of silently burning the usual
+# 90-minute wall clock before anyone notices the new host is broken.
+trial: devmain-smoke
+problems: xjq
+model: token-router:deepseek/deepseek-v4-flash
+thinkingLevel: medium
+accordionRef: 368498a63fef5985dcb850ef5a492b076c29221b
+budget: 15000
+protectTokens: 5000
+arms:
+  - conductor: compaction-naive
+seeds: 1
+caps:
+  costUsd: 10          # inert for token-router ($0 pricing) — validation requires it
+  turns: 10000         # effectively off — not the cap we're testing
+  minutes: 20           # THE REAL CAP — a hang on the new host must fail fast
+parallel: 1
+room:
+  create: true

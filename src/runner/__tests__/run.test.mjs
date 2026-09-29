@@ -12,6 +12,8 @@ import {
   spawnHost,
   hostEntryForAccordion,
   isLegacyAccordionCheckout,
+  isResidentHostCheckout,
+  RESIDENT_HOST_ENTRY,
   autoUpgradeArmDispatch,
   hostEnv,
   modelShortName,
@@ -22,6 +24,7 @@ import {
   looksLikeAgentFinalizeCall,
   appendAgentFinalizeNote,
   resolvePlatformBase,
+  buildPiEnv,
 } from "../run.mjs";
 
 class FakePi extends EventEmitter {
@@ -291,10 +294,11 @@ describe("appendAgentFinalizeNote", () => {
 });
 
 describe("hostEntryForAccordion", () => {
-  it("selects the v15 controller for a truth-in-extension checkout", () => {
+  it("selects the resident (v15-v22) controller for a truth-in-extension checkout", () => {
     const repo = fs.mkdtempSync(path.join(tmpdir(), "accordion-v15-"));
     fs.mkdirSync(path.join(repo, "core"));
     fs.writeFileSync(path.join(repo, "core", "protocol.ts"), "export const PROTOCOL_VERSION = 15;\n");
+    expect(hostEntryForAccordion(repo)).toBe(RESIDENT_HOST_ENTRY);
     expect(hostEntryForAccordion(repo)).toBe("src/host/main-v15.ts");
     fs.rmSync(repo, { recursive: true, force: true });
   });
@@ -315,6 +319,22 @@ describe("isLegacyAccordionCheckout — shared predicate behind hostEntryForAcco
 
   it("true for a checkout with no core/protocol.ts", () => {
     expect(isLegacyAccordionCheckout("C:/missing/legacy-accordion")).toBe(true);
+  });
+});
+
+describe("isResidentHostCheckout — gates whether run.mjs treats the checkout as the resident (main-v15.ts) host", () => {
+  it("true for a core/protocol.ts-shaped (truth-in-extension) checkout", () => {
+    const repo = fs.mkdtempSync(path.join(tmpdir(), "accordion-resident-"));
+    fs.mkdirSync(path.join(repo, "core"));
+    fs.writeFileSync(path.join(repo, "core", "protocol.ts"), "export const PROTOCOL_VERSION = 22;\n");
+    expect(isResidentHostCheckout(repo)).toBe(true);
+    fs.rmSync(repo, { recursive: true, force: true });
+  });
+
+  it("false for a legacy-shaped checkout with no core/protocol.ts", () => {
+    const repo = fs.mkdtempSync(path.join(tmpdir(), "accordion-legacy-"));
+    expect(isResidentHostCheckout(repo)).toBe(false);
+    fs.rmSync(repo, { recursive: true, force: true });
   });
 });
 
@@ -410,6 +430,111 @@ describe("resolvePlatformBase — guards spec.room being undefined (malformed pl
   it("returns null when spec itself is missing", () => {
     expect(resolvePlatformBase(null, { platformBase: "https://cfg-base" })).toBeNull();
     expect(resolvePlatformBase(undefined, { platformBase: "https://cfg-base" })).toBeNull();
+  });
+});
+
+describe("buildPiEnv — pi's spawn env: base + scrubPiEnv + arm env merge", () => {
+  const processEnv = { PATH: "/usr/bin", HOME: "/home/x", AGENT_TRIALS_API_KEY: "secret", NODE_ENV: "test" };
+
+  it("sets PI_CODING_AGENT_DIR/ACCORDION_HOME and drops PI_CODING_AGENT_SESSION_DIR", () => {
+    const env = buildPiEnv({
+      processEnv: { ...processEnv, PI_CODING_AGENT_SESSION_DIR: "/somewhere/else" },
+      agentDir: "/run/agent",
+      accordionHome: "/run/accordion-home",
+    });
+    expect(env.PI_CODING_AGENT_DIR).toBe("/run/agent");
+    expect(env.ACCORDION_HOME).toBe("/run/accordion-home");
+    expect("PI_CODING_AGENT_SESSION_DIR" in env).toBe(false);
+  });
+
+  it("without scrubPiEnv, inherits the full process env (backward compat)", () => {
+    const env = buildPiEnv({ processEnv, agentDir: "/a", accordionHome: "/h" });
+    expect(env.AGENT_TRIALS_API_KEY).toBe("secret");
+  });
+
+  it("with scrubPiEnv, drops secret-shaped vars and logs their names (never values)", () => {
+    const logs = [];
+    const env = buildPiEnv({
+      processEnv,
+      agentDir: "/a",
+      accordionHome: "/h",
+      scrubPiEnv: true,
+      log: (m) => logs.push(m),
+    });
+    expect("AGENT_TRIALS_API_KEY" in env).toBe(false);
+    expect(env.PATH).toBe("/usr/bin");
+    expect(env.NODE_ENV).toBe("test");
+    expect(logs.some((m) => m.includes("AGENT_TRIALS_API_KEY"))).toBe(true);
+    expect(logs.some((m) => m.includes("secret"))).toBe(false);
+  });
+
+  it("piEnvPassthrough exempts a named var from scrubPiEnv", () => {
+    const env = buildPiEnv({
+      processEnv,
+      agentDir: "/a",
+      accordionHome: "/h",
+      scrubPiEnv: true,
+      piEnvPassthrough: ["AGENT_TRIALS_API_KEY"],
+    });
+    expect(env.AGENT_TRIALS_API_KEY).toBe("secret");
+  });
+
+  it("merges armEnv LAST — after scrubPiEnv, never itself scrubbed", () => {
+    const env = buildPiEnv({
+      processEnv,
+      agentDir: "/a",
+      accordionHome: "/h",
+      scrubPiEnv: true,
+      armEnv: { ACCORDION_SUMMARY_TRIGGER: "0.75", MY_API_KEY: "explicit-not-scrubbed" },
+    });
+    expect(env.ACCORDION_SUMMARY_TRIGGER).toBe("0.75");
+    expect(env.MY_API_KEY).toBe("explicit-not-scrubbed");
+  });
+
+  it("armEnv overrides a base var of the same name", () => {
+    const env = buildPiEnv({ processEnv, agentDir: "/a", accordionHome: "/h", armEnv: { PATH: "/custom/path" } });
+    expect(env.PATH).toBe("/custom/path");
+  });
+
+  // ACCORDION_COMPLETION_LOG (Accordion extension completion side log, see
+  // extension/accordion.ts runCompletion + collect.mjs foldCompletionLog) is
+  // runner-owned telemetry plumbing: unlike PATH above, an arm must never be
+  // able to redirect or drop it.
+  it("sets ACCORDION_COMPLETION_LOG from completionLogFile", () => {
+    const env = buildPiEnv({
+      processEnv,
+      agentDir: "/a",
+      accordionHome: "/h",
+      completionLogFile: "/run/dir/completions.jsonl",
+    });
+    expect(env.ACCORDION_COMPLETION_LOG).toBe("/run/dir/completions.jsonl");
+  });
+
+  it("omits ACCORDION_COMPLETION_LOG when no completionLogFile is given", () => {
+    const env = buildPiEnv({ processEnv, agentDir: "/a", accordionHome: "/h" });
+    expect("ACCORDION_COMPLETION_LOG" in env).toBe(false);
+  });
+
+  it("armEnv cannot override ACCORDION_COMPLETION_LOG — the runner's value always wins", () => {
+    const env = buildPiEnv({
+      processEnv,
+      agentDir: "/a",
+      accordionHome: "/h",
+      completionLogFile: "/run/dir/completions.jsonl",
+      armEnv: { ACCORDION_COMPLETION_LOG: "/arm/attempted/override.jsonl" },
+    });
+    expect(env.ACCORDION_COMPLETION_LOG).toBe("/run/dir/completions.jsonl");
+  });
+
+  it("survives scrubPiEnv (it's set after scrubbing, and isn't secret-shaped anyway)", () => {
+    const env = buildPiEnv({
+      processEnv,
+      agentDir: "/a",
+      accordionHome: "/h",
+      scrubPiEnv: true,
+      completionLogFile: "/run/dir/completions.jsonl",
+    });
+    expect(env.ACCORDION_COMPLETION_LOG).toBe("/run/dir/completions.jsonl");
   });
 });
 
