@@ -215,7 +215,14 @@ IPs rotate — pinning keeps the allowlist valid without re-running the
 script every time DNS changes), allows that pinned IP on the given port, and
 rejects everything else for the bench user (TCP reset, plus a full IPv6
 block). Re-running is safe — it rebuilds its chain from scratch each time, so
-adding a host or refreshing a rotated IP is just running it again. Verify a
+adding a host or refreshing a rotated IP is just running it again: the
+resolution step always queries DNS directly (`getent -s dns`, bypassing
+`/etc/hosts`), so a re-run genuinely picks up a new edge IP instead of
+re-reading back the pin it wrote last time (2026-10-01 Fable re-review of
+#45, blocking note 2 — the earlier `getent ahostsv4` form checked
+`/etc/hosts` first per `nsswitch.conf`'s default order, so a re-run
+silently re-confirmed the stale pinned IP forever and this "refreshing a
+rotated IP" claim was false until fixed). Verify a
 sealed host without touching firewall rules — this probes AS the bench user
 (`sudo -u`), the same direction the per-run canary checks:
 
@@ -283,6 +290,17 @@ cannot, prove the allowlist has no other holes):
   resolves fine (its IP is pinned in `/etc/hosts`, checked before DNS), but
   any *other* hostname lookup fails outright at the resolver step instead of
   connecting-then-being-blocked.
+- **Re-applying to an already-sealed host has a brief open window.**
+  (2026-10-01 Fable re-review of #45, cheap note — left as is, documented
+  rather than fixed.) The script flushes the existing chain before rebuilding
+  it; the chain is still linked into `OUTPUT` from the previous run, so
+  between the flush and the first `REJECT` rule going back in (a handful of
+  `iptables` calls later), the bench user's egress briefly falls through to
+  `OUTPUT`'s own default policy (commonly `ACCEPT`) instead of being
+  rejected. This is much narrower than the whole-`--allow`-loop-wide
+  fail-open bug the ordering fixes above close, but it isn't zero — don't
+  re-run this script on a host with a benchmark actively running as the bench
+  user.
 
 ## Write a trial
 

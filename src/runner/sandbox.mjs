@@ -102,6 +102,23 @@ export const SANDBOX_EGRESS_VALUES = new Set(["unchecked", "blocked"]);
 export const DEFAULT_EGRESS_BLOCKED_HOSTS = ["github.com:443", "raw.githubusercontent.com:443", "pypi.org:443"];
 
 /**
+ * DNS-independent deny probes (2026-10-01 Fable re-review of bellows #45,
+ * cheap note: "add literal-IP probes to the canary"), mirroring
+ * LITERAL_BLOCKED_PROBES in scripts/egress-allowlist.sh — literal IPs the
+ * per-run canary connects to directly, with no hostname resolution step at
+ * all, so a DNS hiccup or a hijacked resolver inside the sandbox can never
+ * cause a false "blocked" the way it could for DEFAULT_EGRESS_BLOCKED_HOSTS
+ * above (whose resolution, while done by the runner rather than the
+ * sandbox, still depends on the runner's own DNS working). Kept in sync by
+ * hand with the shell script's array, same as DEFAULT_EGRESS_BLOCKED_HOSTS
+ * already is. Unbracketed (unlike the shell script's bracketed convention)
+ * because CANARY_PY's "tcp" op parses `path` with Python's
+ * `str.rpartition(":")`, which splits on the LAST colon and needs no
+ * bracket-stripping for a raw (unbracketed) IPv6 literal.
+ */
+export const DEFAULT_EGRESS_BLOCKED_LITERALS = ["1.1.1.1:443", "8.8.8.8:53", "140.82.112.3:443", "2606:4700:4700::1111:443"];
+
+/**
  * Effective sandboxEgress for a run. Owner decision, 2026-09-28 ("dont let
  * them have internet"), after a Landlock-sandboxed agent still reached the
  * open internet: the DEFAULT depends on the effective sandbox mode
@@ -688,6 +705,14 @@ export function buildEgressProbes({ egress, egressAllow = [], resolveHost = reso
   };
   const probes = [];
   for (const hostPort of DEFAULT_EGRESS_BLOCKED_HOSTS) probes.push(toIpProbe(hostPort, "deny", "must be blocked"));
+  // Literal-IP deny probes (2026-10-01 Fable re-review of #45, cheap note) —
+  // pushed directly, bypassing resolveHost entirely: these are fixed,
+  // hardcoded, already-known-safe literals (not loopback/unspecified/
+  // link-local), so there is no resolution step that could be hijacked and
+  // no isUnsafeEgressProbeTarget check to apply, unlike DEFAULT_EGRESS_BLOCKED_HOSTS
+  // above.
+  for (const ipPort of DEFAULT_EGRESS_BLOCKED_LITERALS)
+    probes.push({ name: `egress: literal ${ipPort} (must be blocked)`, op: "tcp", path: ipPort, kind: "net", expect: "deny" });
   for (const hostPort of egressAllow) probes.push(toIpProbe(hostPort, "allow", "must be reachable (sandboxEgressAllow)"));
   return probes;
 }

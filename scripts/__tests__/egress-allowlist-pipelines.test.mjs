@@ -87,6 +87,15 @@ describe.skipIf(!HAS_BASH)("egress-allowlist.sh shell pipelines (extracted from 
       'LISTEN 0      128    [::ffff:127.0.0.1]:9000 [::]:*    users:(("java",pid=5555,fd=6))',
       'LISTEN 0      128    10.0.0.5:443       0.0.0.0:*      users:(("nginx",pid=99,fd=3))',
       'LISTEN 0      128    127.0.0.53:53      0.0.0.0:*      users:(("systemd-resolve",pid=2,fd=3))',
+      // Literal "*:PORT" form (2026-10-01 Fable re-review of #45, cheap
+      // note: "document and test the *:PORT form") — some ss/util-linux
+      // versions print a bare "*" for an IPv4 wildcard bind instead of
+      // "0.0.0.0", already matched by the classifier's `host == "*"` arm.
+      'LISTEN 0      128    *:8005             *:*            users:(("legacytool",pid=77,fd=3))',
+      // Literal ::1 (NOT the "::" wildcard below) deliberately excluded from
+      // the SAMPLE's expectations, not from the SAMPLE itself: kept here so
+      // the "excludes ::1" test right below can assert on the exact same
+      // fixture the "flags everything else" test uses.
       'LISTEN 0      128    [::1]:9999         [::]:*         users:(("localtool",pid=42,fd=3))',
       "",
     ].join("\n");
@@ -104,14 +113,20 @@ describe.skipIf(!HAS_BASH)("egress-allowlist.sh shell pipelines (extracted from 
           "0.0.0.0:22\t1",
           "127.0.0.1:8080\t1234",
           "127.0.0.53:53\t2",
-          "[::1]:9999\t42",
           "[::]:22\t1",
           "[::ffff:127.0.0.1]:9000\t5555",
+          "*:8005\t77",
         ].sort(),
       );
       // The one real (non-loopback) LAN listener in the sample must never
       // be reported — the whole point of the classifier.
       expect(r.stdout).not.toContain("10.0.0.5");
+    });
+
+    it("does NOT flag a literal ::1 listener (2026-10-01 Fable re-review of #45, cheap note — IPv6 is fully ip6tables-rejected for the bench uid before any --allow processing, so a listener bound to literal ::1, unlike the \"::\" wildcard, is unreachable by the bench user; dropped from the classifier deliberately)", () => {
+      const r = runBash(`awk '${LOOPBACK_AWK}'`, SAMPLE);
+      expect(r.status).toBe(0);
+      expect(r.stdout).not.toContain("::1");
     });
 
     it("produces nothing when there are no loopback listeners at all", () => {

@@ -26,6 +26,7 @@ import {
   SYSTEM_RX,
   DEV_RW,
   DEFAULT_EGRESS_BLOCKED_HOSTS,
+  DEFAULT_EGRESS_BLOCKED_LITERALS,
 } from "../sandbox.mjs";
 
 describe("resolveSandboxMode", () => {
@@ -178,12 +179,50 @@ describe("buildEgressProbes", () => {
   it("adds a deny probe for every default blocked host, resolved to a literal IP", () => {
     const resolveHost = fakeResolve({ "github.com": "10.0.0.1", "raw.githubusercontent.com": "10.0.0.2", "pypi.org": "10.0.0.3" });
     const probes = buildEgressProbes({ egress: "blocked", resolveHost });
-    expect(probes).toHaveLength(DEFAULT_EGRESS_BLOCKED_HOSTS.length);
+    // Also includes DEFAULT_EGRESS_BLOCKED_LITERALS' deny probes (2026-10-01
+    // Fable re-review of #45, cheap note) — see the dedicated test below.
+    expect(probes).toHaveLength(DEFAULT_EGRESS_BLOCKED_HOSTS.length + DEFAULT_EGRESS_BLOCKED_LITERALS.length);
     for (const p of probes) expect(p).toMatchObject({ op: "tcp", kind: "net", expect: "deny" });
-    expect(probes.map((p) => p.path)).toEqual(["10.0.0.1:443", "10.0.0.2:443", "10.0.0.3:443"]);
+    expect(probes.slice(0, DEFAULT_EGRESS_BLOCKED_HOSTS.length).map((p) => p.path)).toEqual(["10.0.0.1:443", "10.0.0.2:443", "10.0.0.3:443"]);
     // The hostname is still in the name (for a readable canary table) even
     // though the probe itself never resolves it.
     expect(probes[0].name).toBe("egress: github.com:443 (10.0.0.1) must be blocked");
+  });
+
+  // 2026-10-01 Fable re-review of #45, cheap note ("add literal-IP probes to
+  // the canary"), mirroring LITERAL_BLOCKED_PROBES in
+  // scripts/egress-allowlist.sh — these never call resolveHost at all, so a
+  // DNS hiccup can't affect them, and the IPv6 literal proves the canary
+  // itself (not just the host-level firewall script) checks IPv6 is blocked.
+  it("adds a deny probe for every DEFAULT_EGRESS_BLOCKED_LITERALS entry, without resolving anything", () => {
+    const resolveHost = () => {
+      throw new Error("must not be called for literal probes");
+    };
+    // No DEFAULT_EGRESS_BLOCKED_HOSTS entries resolved here on purpose —
+    // isolate the literals by stubbing resolveHost to throw, proving the
+    // literal loop never touches it.
+    expect(() => buildEgressProbes({ egress: "blocked", resolveHost })).toThrow("must not be called for literal probes");
+  });
+
+  it("literal probes have the expected shape (unbracketed IPv6 included)", () => {
+    const resolveHost = fakeResolve({ "github.com": "10.0.0.1", "raw.githubusercontent.com": "10.0.0.2", "pypi.org": "10.0.0.3" });
+    const probes = buildEgressProbes({ egress: "blocked", resolveHost });
+    const literals = probes.slice(DEFAULT_EGRESS_BLOCKED_HOSTS.length);
+    expect(literals).toEqual(
+      DEFAULT_EGRESS_BLOCKED_LITERALS.map((ipPort) => ({
+        name: `egress: literal ${ipPort} (must be blocked)`,
+        op: "tcp",
+        path: ipPort,
+        kind: "net",
+        expect: "deny",
+      })),
+    );
+    // The IPv6 literal must be unbracketed, matching CANARY_PY's
+    // str.rpartition(":") parsing (see DEFAULT_EGRESS_BLOCKED_LITERALS'
+    // doc comment) — a bracketed "[2606:...]:443" would split wrong.
+    const ipv6 = literals.find((p) => p.path.includes("2606"));
+    expect(ipv6.path).toBe("2606:4700:4700::1111:443");
+    expect(ipv6.path.startsWith("[")).toBe(false);
   });
 
   it("adds an allow probe for every sandboxEgressAllow entry, resolved to a literal IP", () => {

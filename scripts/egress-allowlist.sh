@@ -106,6 +106,18 @@
 #     still resolves fine (its IP is pinned in /etc/hosts, checked before
 #     DNS), but any OTHER hostname lookup fails outright at the resolver
 #     step instead of connecting-then-being-blocked.
+#   - re-applying to an already-configured host has a brief open window
+#     (2026-10-01 Fable re-review of #45, cheap note — left as is, documented
+#     rather than fixed): `iptables -N "$CHAIN" || iptables -F "$CHAIN"`
+#     empties an EXISTING chain's rules first, and that chain is still linked
+#     into OUTPUT from the previous run, so between the flush and the first
+#     `-A "$CHAIN" ... REJECT` immediately after it, traffic from the bench
+#     uid falls through the now-empty chain to OUTPUT's own default policy
+#     (commonly ACCEPT) instead of being rejected. This window is a handful
+#     of iptables calls wide (not interruptible by anything this script
+#     itself does), unlike the old whole-loop-wide fail-open bug the
+#     reordering above fixes — but it is not zero, so don't re-apply this
+#     script on a host with a benchmark actively running as the bench user.
 #
 # See src/runner/sandbox.mjs DEFAULT_EGRESS_BLOCKED_HOSTS for the exact hosts
 # the per-run canary independently checks are blocked (kept in sync below).
@@ -127,8 +139,15 @@ DEFAULT_BLOCKED_HOSTS=(github.com raw.githubusercontent.com pypi.org)
 # DNS-independent deny probes (2026-09-30 Fable re-review of #45, blocking
 # note 2) — literal IPs, never resolved via getent/DNS at all, so --check
 # still catches an open egress even if hostname resolution itself were
-# somehow neutralized. See do_check().
-LITERAL_BLOCKED_PROBES=("1.1.1.1:443" "8.8.8.8:53" "140.82.112.3:443")
+# somehow neutralized. See do_check(). IPv6 literal (2606:4700:4700::1111,
+# Cloudflare's other public resolver) added 2026-10-01 (Fable re-review of
+# #45, blocking note 1) alongside check_ipv6_blocked() below, as a
+# behavioral (probe-based) signal to pair with that function's structural
+# one — bracketed here for human readability and unambiguous host:port
+# splitting on the LAST colon (`${hp%:*}`/`${hp##*:}` below), stripped
+# before probe_tcp is called since /dev/tcp/HOST/PORT does not use bracket
+# notation.
+LITERAL_BLOCKED_PROBES=("1.1.1.1:443" "8.8.8.8:53" "140.82.112.3:443" "[2606:4700:4700::1111]:443")
 
 usage() {
   cat >&2 <<'EOF'
@@ -146,24 +165,41 @@ Usage:
                        expected/intentional (repeatable) — e.g. a deliberate
                        local proxy, or stock sshd, which binds BOTH
                        "0.0.0.0:22" and "[::]:22" as two separate listeners
-                       (pass both). Without this, --check FAILS on any
+                       (pass both). An IPv4 wildcard bind may be reported as
+                       either "0.0.0.0:PORT" or the literal "*:PORT" form
+                       some ss/util-linux versions print instead — match
+                       whichever form the FAIL line actually shows you.
+                       Without this, --check FAILS on any
                        loopback listener it can't attribute to the bench user
                        itself, since 127.0.0.0/8 is always reachable
                        regardless of the allowlist (-o lo -d 127.0.0.0/8 -j
                        ACCEPT) — a wildcard listener is reachable only via
                        127.0.0.0/8, never via the host's other addresses (see
-                       header comment).
+                       header comment). A listener bound to the literal IPv6
+                       address "::1" (not the "[::]" wildcard above) is never
+                       flagged at all: IPv6 is fully rejected for the bench
+                       user regardless of --allow-loopback, so it is
+                       unreachable by definition.
   --check             do not touch firewall rules; report whether
                        github.com/raw.githubusercontent.com/pypi.org (each
-                       resolved HERE, as you the invoker, via getent — never
-                       by the bench user's own possibly-hijacked resolution)
+                       resolved HERE, as you the invoker, via DNS directly
+                       (getent -s dns) — never by the bench user's own
+                       possibly-hijacked resolution, and never by reading
+                       back a stale /etc/hosts pin)
                        plus a few fixed literal IPs (1.1.1.1:443, 8.8.8.8:53,
-                       140.82.112.3:443 — DNS-independent, so they still
-                       catch an open egress even if hostname resolution
+                       140.82.112.3:443, and an IPv6 literal
+                       [2606:4700:4700::1111]:443 — DNS-independent, so they
+                       still catch an open egress even if hostname resolution
                        itself were somehow neutralized) are blocked, every
                        --allow host is reachable (probed AS the bench user
                        via sudo -u, or directly if you already are that
-                       user), and no unexpected loopback listener exists.
+                       user), no unexpected loopback listener exists, and
+                       (when run as root) that ip6tables actually has its
+                       own OUTPUT REJECT rule for the bench uid — a
+                       structural check, since the IPv6 literal probe above
+                       alone can't tell "blocked by our rule" apart from "no
+                       IPv6 route exists at all" (degrades to a WARN, not a
+                       FAIL, when not root).
                        Requires root, to already BE --user, or passwordless
                        sudo to --user — exits 2 (not a PASS) if none of those
                        can be confirmed, rather than silently reporting
@@ -256,11 +292,24 @@ fi
 # — means the check probes the REAL address, never one the thing under test
 # could have poisoned.
 resolve_ip() {
-  # `|| true` on the left side of the pipe keeps a resolution failure (getent
-  # exits non-zero for an unknown host) from tripping `set -e`/`pipefail` on
-  # the caller's `ip="$(resolve_ip "$host")"` — the empty-result case is
-  # handled explicitly by the caller instead.
-  { getent ahostsv4 "$1" 2>/dev/null || true; } | awk '{print $1; exit}'
+  # `-s dns` (2026-10-01 Fable re-review of #45, blocking note 2): forces
+  # getent to use ONLY the `dns` NSS service for this lookup, never `files`
+  # (i.e. /etc/hosts). Plain `getent ahostsv4` follows nsswitch.conf's
+  # configured order, which on essentially every distro checks `files`
+  # BEFORE `dns` — and this same function's caller in the apply path PINS its
+  # result into /etc/hosts. Without `-s dns`, a re-run's resolve_ip call for
+  # an already-pinned host reads back the STALE pinned IP from /etc/hosts
+  # instead of querying DNS at all, so the pin perpetuates itself forever:
+  # TUTORIAL.md's "re-run to refresh a rotated CDN IP" was false, since the
+  # very re-run meant to pick up the new IP would just re-confirm the old
+  # one. Verified live (Fable's container repro) that `-s dns` bypasses the
+  # pin and returns the real current answer. `|| true` on the left side of
+  # the pipe keeps a resolution failure (getent exits non-zero for an unknown
+  # host, or when the `dns` service isn't configured in nsswitch.conf at all)
+  # from tripping `set -e`/`pipefail` on the caller's `ip="$(resolve_ip
+  # "$host")"` — the empty-result case is handled explicitly by the caller
+  # instead.
+  { getent -s dns ahostsv4 "$1" 2>/dev/null || true; } | awk '{print $1; exit}'
 }
 
 # Mirrors isUnsafeEgressProbeTarget in src/runner/sandbox.mjs (the IPv4-only
@@ -452,7 +501,26 @@ check_loopback_listeners() {
       # 1): a dual-stack listener bound explicitly to an IPv4-mapped address
       # is reachable via a plain IPv4 connect to 127.x — the old classifier
       # missed this form entirely, so such a listener passed unflagged.
-      is_loop = (host ~ /^127\./) || host == "::1" || host == "*" || host == "0.0.0.0" || host == "::" || (host ~ /^::ffff:127\./)
+      #
+      # "*" and "0.0.0.0" here also cover the literal `*:PORT` form `ss`
+      # prints for some wildcard-bound IPv4 listeners (equivalent to
+      # "0.0.0.0:PORT") — already matched by `host == "*"` above; no
+      # classifier change needed, just calling it out since it is easy to
+      # misread as unhandled at a glance.
+      #
+      # host == "::1" deliberately dropped (2026-10-01 Fable re-review of
+      # #45, cheap note): a listener bound to the LITERAL address ::1 (not
+      # the "::" wildcard, which stays flagged below) is IPv6-loopback-only —
+      # dual-stack IPv4-mapping only applies to a wildcard or an explicit
+      # ::ffff:x.x.x.x bind, never to literal ::1 — so it does NOT accept an
+      # IPv4 127.0.0.1 connection the way the old bug class (`-o lo -j
+      # ACCEPT` with no destination match) made it. This is only true because
+      # IPv6 is now unconditionally ip6tables-REJECTed for the bench uid
+      # BEFORE any --allow processing (see the ip6tables block above
+      # RESOLVE_FAILURES in the apply path) — flagging "::1" back as a loopback
+      # listener would be the safer call if that ordering ever regresses, so
+      # be careful touching either side of this without the other.
+      is_loop = (host ~ /^127\./) || host == "*" || host == "0.0.0.0" || host == "::" || (host ~ /^::ffff:127\./)
       if (!is_loop) next
       pid = ""
       if (match($0, /pid=[0-9]+/)) pid = substr($0, RSTART + 4, RLENGTH - 4)
@@ -469,6 +537,39 @@ check_loopback_listeners() {
     }
   ' <<<"$ss_out")
   return "$fail"
+}
+
+# Structural verification that IPv6 is actually rejected for the bench uid
+# (2026-10-01 Fable re-review of #45, blocking note 1) — the LITERAL_BLOCKED_PROBES
+# IPv6 entry above is only a behavioral signal, and ECONNREFUSED/unreachable
+# to a probe is ambiguous: it cannot distinguish "our own ip6tables REJECT
+# rule fired" from "nothing is listening/routable there at all" (a host with
+# zero IPv6 connectivity would show the exact same "blocked" result whether
+# or not the rule exists). When running as root — the only context that can
+# read ip6tables' own rule set — inspect it directly instead:
+# `ip6tables -C OUTPUT -m owner --uid-owner $UID_N -j REJECT` exits 0 iff
+# that exact rule is present, which is the thing actually guaranteeing IPv6
+# is blocked, independent of routing/connectivity. --check normally runs
+# unprivileged (as the bench user, or via sudo -u — see
+# require_sudo_to_bench_user), so this degrades to a WARN, not a FAIL, when
+# not root: the literal-IPv6 probe is the only signal available in that
+# case, with the weaker guarantee documented above — exactly why this
+# function exists as a second, independent check for when it CAN run.
+check_ipv6_blocked() {
+  if ! command -v ip6tables >/dev/null 2>&1; then
+    echo "  WARN: 'ip6tables' not found — cannot structurally verify IPv6 is blocked (relying on the literal IPv6 probe above only)"
+    return 0
+  fi
+  if [ "$(id -u)" != "0" ]; then
+    echo "  WARN: not root — cannot inspect ip6tables' own rule set to structurally verify IPv6 is blocked for $BENCH_USER (relying on the literal IPv6 probe above only, which can't tell 'blocked by our rule' apart from 'no IPv6 route exists at all')"
+    return 0
+  fi
+  if ip6tables -C OUTPUT -m owner --uid-owner "$UID_N" -j REJECT 2>/dev/null; then
+    echo "  ok:   ip6tables OUTPUT REJECT rule for uid $UID_N is present"
+    return 0
+  fi
+  echo "  FAIL: no ip6tables OUTPUT REJECT rule for uid $UID_N — IPv6 egress is NOT blocked for $BENCH_USER (run this script in apply mode, not just --check, to install it)"
+  return 1
 }
 
 do_check() {
@@ -516,6 +617,15 @@ do_check() {
   for hp in "${LITERAL_BLOCKED_PROBES[@]}"; do
     host="${hp%:*}"
     port="${hp##*:}"
+    # Strip IPv6 brackets, if present (a plain IPv4 literal like "1.1.1.1" is
+    # left untouched by both — # and % here strip a literal "[" prefix /
+    # "]" suffix only if one is actually there). LITERAL_BLOCKED_PROBES
+    # stores IPv6 entries bracketed (see its declaration) so the LAST-colon
+    # split above unambiguously isolates the port; bash's /dev/tcp pseudo-
+    # device, unlike URL syntax, does not accept bracket notation and needs
+    # the raw address.
+    host="${host#\[}"
+    host="${host%\]}"
     result="$(probe_tcp "$host" "$port")"
     case "$result" in
       refused | unreachable) echo "  ok:   $hp blocked ($result)" ;;
@@ -535,6 +645,7 @@ do_check() {
       ok=1
     fi
   done
+  check_ipv6_blocked || ok=1
   check_loopback_listeners || ok=1
   return "$ok"
 }
@@ -601,6 +712,26 @@ iptables -C OUTPUT -m owner --uid-owner "$UID_N" -j "$CHAIN" 2>/dev/null ||
 iptables -I "$CHAIN" 1 -o lo -d 127.0.0.0/8 -j ACCEPT
 iptables -I "$CHAIN" 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
+# Unconditional (no `! -o lo` exception): reject ALL IPv6 for the bench user,
+# loopback included (2026-09-30 Fable re-review of #45, blocking note 1) —
+# nothing in this codebase binds a loopback listener to anything but IPv4
+# 127.0.0.1, so there's no legitimate IPv6 loopback traffic this would break.
+#
+# Installed HERE — before the --allow loop below, not after it (2026-10-01
+# Fable re-review of #45, blocking note 1) — because the loop can abort
+# partway through under `set -e` (a malformed --allow entry, a killed
+# process, a lost SSH session) exactly the same way the IPv4 chain could
+# before the fail-closed reorder above. When the ip6tables REJECT lived after
+# the loop, an abort meant the loop's iptables (v4) work was already applied
+# but ip6tables was never reached at all: IPv6 was left fully open for the
+# bench uid — verified live (Fable's Ubuntu 24.04 container repro: `--allow
+# example.com` with no port aborts mid-loop, the v4 chain is closed, but
+# `ip6tables -S OUTPUT` is empty and `::1:8005` is reachable). Moving this
+# above the loop means every state the loop can be interrupted in already has
+# IPv6 fully rejected, matching the IPv4 fail-closed guarantee above.
+ip6tables -C OUTPUT -m owner --uid-owner "$UID_N" -j REJECT 2>/dev/null ||
+  ip6tables -I OUTPUT 1 -m owner --uid-owner "$UID_N" -j REJECT
+
 # Counts --allow hosts that failed to resolve so the script can exit non-zero
 # below rather than silently succeeding with one or more hosts never
 # allowlisted (2026-09-29 Fable re-review of #43, non-blocking note) — while
@@ -658,15 +789,6 @@ for hp in "${ALLOW[@]}"; do
   iptables -I "$CHAIN" 1 -p tcp -d "$ip" --dport "$port" -j ACCEPT
   echo "allowed: $host ($ip):$port"
 done
-
-# Unconditional (no `! -o lo` exception): reject ALL IPv6 for the bench
-# user, loopback included (2026-09-30 Fable re-review of #45, blocking note
-# 1) — nothing in this codebase binds a loopback listener to anything but
-# IPv4 127.0.0.1, so there's no legitimate IPv6 loopback traffic this would
-# break, and the old `! -o lo` exception left an IPv6 loopback listener
-# reachable the exact same way the IPv4 `-o lo -j ACCEPT` rule did.
-ip6tables -C OUTPUT -m owner --uid-owner "$UID_N" -j REJECT 2>/dev/null ||
-  ip6tables -I OUTPUT 1 -m owner --uid-owner "$UID_N" -j REJECT
 
 echo "done. DNS still works for $BENCH_USER (systemd-resolved does the upstream lookup as its own uid, via lo)."
 echo "Verify: $0 --user $BENCH_USER $(printf -- '--allow %s ' "${ALLOW[@]}")--check"
