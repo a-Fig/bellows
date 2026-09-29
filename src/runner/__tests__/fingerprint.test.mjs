@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { hashDir, hashString } from "../fingerprint.mjs";
+import { hashDir, hashString, sharedFingerprint } from "../fingerprint.mjs";
 
 let dirA, dirB, dirC;
 
@@ -41,5 +41,15 @@ describe("hashString", () => {
     expect(hashString("hello")).toBe(hashString("hello"));
     expect(hashString("hello")).not.toBe(hashString("world"));
     expect(hashString("x")).toMatch(/^[0-9a-f]{64}$/);
+  });
+});
+
+describe("sharedFingerprint — env placeholder (Feature 1)", () => {
+  it("includes an empty env placeholder, filled in per-run by the caller", () => {
+    const spec = { model: "token-router:m", thinkingLevel: "medium", budget: 1000, protectTokens: 100, problems: "all" };
+    const config = { accordionRepo: "C:/missing/accordion" };
+    const fp = sharedFingerprint({ spec, config, workspaceTemplateDir: dirA, kickoffPrompt: "kickoff" });
+    expect(fp.env).toEqual({});
+    expect(fp.conductorId).toBe(""); // also a per-run placeholder, filled by the caller (run.mjs)
   });
 });

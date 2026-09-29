@@ -4,6 +4,8 @@
   "platformApiKeyEnv": "AGENT_TRIALS_API_KEY",
   "piAgentDir": "C:/Users/you/.pi/agent",
   "runsDir": "./runs",
+  "scrubPiEnv": true,
+  "piEnvPassthrough": [],
   "worker": {
     "platformUrl": "https://your-agent-trials-instance.example.com",
     "name": "worker-1",

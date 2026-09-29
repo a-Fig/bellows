@@ -25,7 +25,7 @@ import { buildSharedContext, resolveRunsRoot, describeRoomConfig } from "../runn
 import { executeRun as realExecuteRun } from "../runner/run.mjs";
 import { createRoom, probeRoomJoinable } from "../runner/platform.mjs";
 import { slopcodeRoomConfig } from "../runner/roomConfig.mjs";
-import { isProblemScoped, REPO_ROOT } from "../runner/config.mjs";
+import { isProblemScoped, REPO_ROOT, validateArmEnv } from "../runner/config.mjs";
 
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const IDLE_POLL_BASE_MS = 5_000;
@@ -175,6 +175,16 @@ export async function resolveWorkerRoom({ spec, config, apiKey, log, probeFn = p
  * @returns {Promise<import("../types.ts").RunRecord>}
  */
 export async function defaultExecutor({ claimed, config, apiKey, runDir, abortSignal, log, onRoomResolved }) {
+  // claimed.arm comes straight off the platform's claim response (POST
+  // /workers/claim), unvalidated — it never passes through validateTrialSpec
+  // (that only runs for LOCAL specs loaded by `bellows run`/--dry). Run the
+  // same env checks (key shape, clobber list, entry count/length) here so a
+  // malformed or malicious claimed.arm.env can't reach buildPiEnv/pi's spawn
+  // env. See the COVERAGE note on validateArmEnv in src/runner/config.mjs.
+  const envErrs = validateArmEnv(claimed.arm?.env);
+  if (envErrs.length) {
+    throw new Error(`claimed run ${claimed.id}: invalid arm.env:\n  - ${envErrs.join("\n  - ")}`);
+  }
   const spec = claimed.config;
   const { sharedFp } = buildSharedContext(spec, config);
   const roomId = await resolveWorkerRoom({ spec, config, apiKey, log });
@@ -184,6 +194,7 @@ export async function defaultExecutor({ claimed, config, apiKey, runDir, abortSi
     config,
     arm: claimed.arm.conductor,
     armName: claimed.arm.name || claimed.arm.conductor,
+    armEnv: claimed.arm.env,
     seed: claimed.seed,
     roomId,
     apiKey,

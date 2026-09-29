@@ -857,6 +857,91 @@ describe("Accordion v22 resident host — v22 regression: teardown read-only ref
 	);
 });
 
+/*
+ * Mid-task addition: bellows' host client used to drop the conductor's status
+ * messages entirely (folded into an anonymous "t":"info" line), so nothing in
+ * any artifact explained WHY a conductor stalled (e.g. one that quietly stops
+ * compacting and lets context run over budget). Accordion protocol v22
+ * broadcasts a `conductorStatus` message whenever a conductor calls
+ * `host.setStatus(text, metrics)`, and a `conductorState` message on every
+ * attach/detach/swap of the active conductor. main-v15.ts now emits a
+ * dedicated "t":"status" row per conductorStatus (deduped on consecutive-
+ * identical text) and a "t":"conductorState" row for every conductorState
+ * broadcast, independent of the existing "t":"attach"/"t":"info" lines.
+ */
+describe("Accordion v22 resident host — conductorStatus/conductorState telemetry (mid-task addition)", () => {
+	it(
+		"logs a t:status row per conductorStatus (deduped on identical text) and a t:conductorState row per conductorState broadcast",
+		async () => {
+			const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bellows-host-v22-status-"));
+			const accordionRepo = path.join(tmp, "accordion");
+			const accordionHome = path.join(tmp, "home");
+			const telemetryOut = path.join(tmp, "host.jsonl");
+			const lease = makeLeaseServer();
+			let child;
+			try {
+				makeAccordionFixture(accordionRepo, 22);
+				await listen(lease.server);
+				const port = lease.server.address().port;
+				writeSession({ accordionHome, port, protocolVersion: 22 });
+
+				lease.server.on("connection", (socket) => {
+					sendHello(socket, { version: 22, conductorId: "compaction-naive", cwd: tmp });
+					sendSnapshot(socket);
+				});
+				lease.server.on("acceptedCommand", ({ socket, commands }) => {
+					if (commands.length !== 4) return;
+					// Attach (existing "t":"attach"/"t":"info" lines fire from this one).
+					socket.send(JSON.stringify({ type: "conductorState", active: { id: "compaction-naive" } }));
+					// Two DIFFERENT status texts, then a repeat of the second — the repeat must
+					// be deduped (no third "t":"status" row).
+					socket.send(JSON.stringify({ type: "conductorStatus", text: "waiting on summarizer" }));
+					socket.send(JSON.stringify({ type: "conductorStatus", text: "skipping fold: below trigger", metrics: { liveTokens: 42000 } }));
+					socket.send(JSON.stringify({ type: "conductorStatus", text: "skipping fold: below trigger", metrics: { liveTokens: 43000 } }));
+					// A second conductorState broadcast for the SAME already-attached conductor —
+					// isGenuineMidRunDetach treats this as a no-op (not a detach), but it must
+					// still produce its own "t":"conductorState" row (the raw broadcast log is
+					// independent of the attach-lifecycle logic).
+					socket.send(JSON.stringify({ type: "conductorState", active: { id: "compaction-naive", label: "Naive compaction" } }));
+				});
+
+				({ child } = spawnHost({ accordionRepo, accordionHome, telemetryOut, conductor: "compaction-naive" }));
+
+				await waitForFile(
+					() => readTelemetry(telemetryOut).split("\n").filter((l) => l.includes('"t":"status"')).length >= 2,
+					18_000,
+					"status telemetry",
+				);
+
+				const lines = readTelemetry(telemetryOut).split("\n").filter(Boolean).map((l) => JSON.parse(l));
+				const statusRows = lines.filter((l) => l.t === "status");
+				const stateRows = lines.filter((l) => l.t === "conductorState");
+
+				// Exactly 2 status rows: the dedup swallowed the repeated "skipping fold" text.
+				expect(statusRows.length).toBe(2);
+				expect(statusRows[0].text).toBe("waiting on summarizer");
+				expect(statusRows[1].text).toBe("skipping fold: below trigger");
+				expect(statusRows[1].metrics).toEqual({ liveTokens: 42000 });
+				expect(typeof statusRows[0].rev).toBe("number");
+
+				// Exactly 2 conductorState rows: the initial attach broadcast + the repeat.
+				expect(stateRows.length).toBe(2);
+				expect(stateRows[0].id).toBe("compaction-naive");
+				expect(stateRows[1].id).toBe("compaction-naive");
+				expect(stateRows[1].label).toBe("Naive compaction");
+
+				child.kill("SIGTERM");
+				const exit = await waitForExit(child);
+				expectGracefulExit(exit);
+			} finally {
+				await new Promise((resolve) => lease.server.close(resolve));
+				fs.rmSync(tmp, { recursive: true, force: true });
+			}
+		},
+		SUITE_TIMEOUT_MS,
+	);
+});
+
 describe("Accordion resident host — protocol range validation", () => {
 	it(
 		"rejects a fixture whose PROTOCOL_VERSION is outside the supported range",

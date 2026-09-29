@@ -14,7 +14,7 @@ import { slopcodeRoomConfig } from "./roomConfig.mjs";
 /**
  * Expand a spec into the flat list of runs (arm × seed).
  * @param {import("../types.ts").TrialSpec} spec
- * @returns {{arm:string, armName:string, seed:number, runDir:string, label:string}[]}
+ * @returns {{arm:string, armName:string, env:Record<string,string>, seed:number, runDir:string, label:string}[]}
  */
 export function expandRuns(spec, runsRoot) {
   const runs = [];
@@ -28,6 +28,7 @@ export function expandRuns(spec, runsRoot) {
       runs.push({
         arm: arm.conductor,
         armName,
+        env: arm.env || {},
         seed,
         runDir: path.join(trialDir, `${armDirName}-${seed}`),
         label: `${spec.trial}/${armName}/${seed}`,
@@ -181,7 +182,7 @@ export async function runTrial({ spec, config, apiKey, log }) {
         roomId = await pool.lease();
       } catch (e) {
         log(`[${run.label}] could not obtain room: ${e.message}`);
-        results[i] = errorRecord(run, spec, { ...sharedFp, conductorId: run.arm }, `no room: ${e.message}`);
+        results[i] = errorRecord(run, spec, { ...sharedFp, conductorId: run.arm, env: run.env }, `no room: ${e.message}`);
         continue;
       }
       log(`[${run.label}] -> room ${roomId}`);
@@ -191,6 +192,7 @@ export async function runTrial({ spec, config, apiKey, log }) {
           config,
           arm: run.arm,
           armName: run.armName,
+          armEnv: run.env,
           seed: run.seed,
           roomId,
           apiKey,
@@ -199,7 +201,7 @@ export async function runTrial({ spec, config, apiKey, log }) {
           log,
         });
       } catch (e) {
-        results[i] = errorRecord(run, spec, { ...sharedFp, conductorId: run.arm }, `executeRun threw: ${e.message}`);
+        results[i] = errorRecord(run, spec, { ...sharedFp, conductorId: run.arm, env: run.env }, `executeRun threw: ${e.message}`);
         log(`[${run.label}] executeRun threw: ${e.message}`);
       } finally {
         await pool.release(roomId);

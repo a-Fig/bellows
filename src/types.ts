@@ -74,6 +74,17 @@ export interface ArmSpec {
   conductor: string;
   /** Optional human-readable arm name. Defaults to the conductor id. */
   name?: string;
+  /**
+   * Extra env vars merged into pi's env for runs of this arm, e.g. to steer an
+   * in-process conductor's env-configurable options (ACCORDION_SUMMARY_TRIGGER,
+   * ...). Keys must match /^[A-Z][A-Z0-9_]{0,63}$/ and not collide with a
+   * runner-controlled var (PI_CODING_AGENT_DIR, ACCORDION_HOME, PATH, HOME,
+   * PI_CODING_AGENT_SESSION_DIR); at most 32 entries, values are strings
+   * <=500 chars. Applied AFTER scrubPiEnv, and never scrubbed itself (it's
+   * explicit, arm-authored config, not ambient inherited env). See
+   * validateTrialSpec in src/runner/config.mjs.
+   */
+  env?: Record<string, string>;
 }
 
 export interface RoomSupply {
@@ -162,6 +173,13 @@ export interface Fingerprint {
    *  patchDeepSeekCompat) changed >=1 model entry in this run's models.json
    *  copy — distinguishes post-surgery rows from pre-surgery rows in analysis. */
   deepseekCompat: boolean;
+  /**
+   * This arm's env overrides (ArmSpec.env, {} when absent). Two arms sharing a
+   * conductorId are only distinguishable in reports/comparisons via this field
+   * (and conductorId's sibling arm `name`, carried on the RunRecord/label) —
+   * see src/runner/run.mjs where this is filled in alongside conductorId.
+   */
+  env: Record<string, string>;
 }
 
 export interface UsageTotals {
@@ -244,7 +262,25 @@ export type HostEvent =
   // (older extension with no `planOutcomes` field). Best-effort only — never blocks or
   // retries (see src/host/main.ts `fetchMeta`).
   | { t: "meta_snapshot"; at: number; when: "start" | "end"; planOutcomes: Record<string, number> | null }
-  | { t: "detach"; at: number; reason: string };
+  | { t: "detach"; at: number; reason: string }
+  // A conductor called host.setStatus(text, metrics) — Accordion protocol v22's
+  // `conductorStatus` server->client broadcast. This is the only first-class
+  // channel a conductor has to narrate WHY it's doing (or not doing) something;
+  // without recording it, a stalled/misbehaving conductor leaves no trace in any
+  // artifact (see src/host/main-v15.ts's "conductorStatus" case, which dedupes
+  // consecutive identical `text` before emitting). `rev` is the replica revision
+  // in effect when the message arrived (0 if no sync has landed yet); `text` is
+  // null when the conductor explicitly clears its status; `metrics` is the raw
+  // wire field (the conductor's own free-form numeric/string/bool key-values),
+  // absent when the message carried none.
+  | { t: "status"; at: number; rev: number; text: string | null; metrics?: Record<string, number | string | boolean> }
+  // Raw log of every `conductorState` broadcast (attach/detach/swap of the
+  // ACTIVE conductor), trimmed to the fields useful for diagnosing a stall —
+  // distinct from `attach`/`detach` above, which only fire for THIS host's own
+  // attach lifecycle. A spawn-kind conductor that detaches and reattaches
+  // mid-run, or a swap to a different conductor, is otherwise invisible in
+  // host.jsonl. `id`/`label` are null when no conductor is active.
+  | { t: "conductorState"; at: number; id: string | null; label?: string };
 
 export interface ConductorTelemetry {
   conductorId: string;
@@ -265,11 +301,37 @@ export interface ConductorTelemetry {
   conductLatencyMs: { p50: number; max: number };
   /** Times the 250ms window forced the previously-computed plan. */
   heldPlanReplies: number;
-  /** Spend attributed to host.complete() calls (LLM conductors). */
+  /**
+   * Spend attributed to conductor LLM summary calls (compaction-naive,
+   * triptych, handoff, ...). Sums two sources: any legacy host.jsonl
+   * "complete" rows (foldHostTelemetry) PLUS the Accordion extension's
+   * ACCORDION_COMPLETION_LOG side log (completions.jsonl, foldCompletionLog
+   * in collect.mjs) — under Accordion protocol v22 the extension's own
+   * runCompletion() is the ONLY place these calls are observable, since they
+   * never round-trip through the host.
+   */
   completeCostUsd: number;
+  /** Total runCompletion() calls recorded in completions.jsonl, success + failure. */
+  completeCalls: number;
+  /** Of completeCalls, how many carried an "error" field (no usage was available). */
+  completeErrors: number;
+  /** Summed input tokens across successful completions.jsonl calls. */
+  completeInputTokens: number;
+  /** Summed output tokens across successful completions.jsonl calls. */
+  completeOutputTokens: number;
+  /** Summed cacheRead tokens across successful completions.jsonl calls. */
+  completeCacheReadTokens: number;
   errors: string[];
   /** Non-error informational notes (greet/status/disconnect, "died — cleared to raw", ...). */
   infos: string[];
+  /**
+   * Last non-deduped `conductorStatus` text seen (host event t:"status"), or
+   * null if the conductor never called host.setStatus() this run. The single
+   * most useful field for "why did this run stall" at a glance in the report.
+   */
+  lastStatusText: string | null;
+  /** Count of (deduped) t:"status" events folded — see foldHostTelemetry. */
+  statusCount: number;
   /**
    * Per-cause tally of every `context` hook resolution the attached Accordion extension
    * acked during this run (Accordion issue #60/#22, ADR 0020). Preferentially the diff of
@@ -342,6 +404,23 @@ export interface BenchConfig {
   >;
   /** `bellows worker` settings. Absent = worker mode unavailable (CLI errors clearly). */
   worker?: WorkerConfig;
+  /**
+   * When true, strip vars matching /(API_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|
+   * CREDENTIAL|PRIVATE_?KEY|AUTH)/i (by NAME) out of pi's env before spawning
+   * it, so the platform API key and friends aren't reachable from the
+   * benchmarked agent's bash tool. Default false, for backward compat with
+   * existing setups that rely on inherited env (e.g. a provider key pi reads
+   * from env) — but true is RECOMMENDED for any bench run where the agent's
+   * tool output isn't fully trusted. Arm env (ArmSpec.env) is applied AFTER
+   * the scrub and is never itself scrubbed. See src/runner/envScrub.mjs.
+   */
+  scrubPiEnv?: boolean;
+  /**
+   * Var names exempted from scrubPiEnv's regex match (e.g. a provider API key
+   * name pi itself needs to read from env instead of auth.json). Ignored when
+   * scrubPiEnv is false/absent.
+   */
+  piEnvPassthrough?: string[];
 }
 
 export interface WorkerConfig {
