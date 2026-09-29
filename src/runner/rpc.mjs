@@ -32,10 +32,14 @@ export class PiRpc extends EventEmitter {
    * @param {string} args.cwd         workspace dir
    * @param {Record<string,string>} args.env
    * @param {string[]} [args.extraArgs]
+   * @param {string[]} [args.commandPrefix]  argv pi is appended to, e.g. the
+   *   Landlock wrapper `[python3, -I, -S, landlock-exec.py, ...grants, --]`
+   *   (see sandbox.mjs). Empty = spawn pi directly.
    */
-  constructor({ piCommand, cwd, env, extraArgs = [] }) {
+  constructor({ piCommand, cwd, env, extraArgs = [], commandPrefix = [] }) {
     super();
     this.piCommand = piCommand;
+    this.commandPrefix = commandPrefix;
     this.cwd = cwd;
     this.env = env;
     this.extraArgs = extraArgs;
@@ -49,7 +53,10 @@ export class PiRpc extends EventEmitter {
 
   start() {
     const args = ["--mode", "rpc", ...this.extraArgs];
-    this.child = spawnSafe(this.piCommand, args, {
+    const [file, fileArgs] = this.commandPrefix.length
+      ? [this.commandPrefix[0], [...this.commandPrefix.slice(1), this.piCommand, ...args]]
+      : [this.piCommand, args];
+    this.child = spawnSafe(file, fileArgs, {
       cwd: this.cwd,
       env: this.env,
       windowsHide: true,

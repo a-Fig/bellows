@@ -4,6 +4,7 @@
  *   bellows run <trial.yaml> [--dry]
  *   bellows report [runsDir] [outFile]
  *   bellows worker --poll [--once]
+ *   bellows sandbox-check [trial.yaml] [--keep]
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -12,6 +13,7 @@ import { loadBenchConfig, loadTrialSpec } from "../src/runner/config.mjs";
 import { runTrial, planDryRun, resolveRunsRoot } from "../src/runner/schedule.mjs";
 import { runWorkerLoop } from "../src/worker/loop.mjs";
 import { makeShutdownSignalHandler } from "../src/worker/shutdownSignal.mjs";
+import { sandboxCheck } from "../src/runner/sandboxCheck.mjs";
 
 function log(msg) {
   process.stderr.write(msg + "\n");
@@ -24,11 +26,35 @@ Usage:
   bellows run <trial.yaml> [--dry]   Schedule and execute a trial (or plan it with --dry)
   bellows report [runsDir] [out]     Render RunRecords to an HTML report
   bellows worker --poll [--once]     Claim + execute runs dispatched by the platform
+  bellows sandbox-check [trial.yaml] [--keep]
+                                     Run the Landlock sandbox canary on a throwaway run dir
+                                     (no model, no platform); exits 1 if any probe misbehaves
 
 Options:
   --dry     Print the plan (runs, rooms, dirs, settings) without spawning pi/host
             or touching the platform.
-  --once    (worker only) Claim and execute at most one run, then exit.`);
+  --once    (worker only) Claim and execute at most one run, then exit.
+  --keep    (sandbox-check only) Keep the throwaway run dir for inspection.`);
+}
+
+async function cmdSandboxCheck(args) {
+  const specArg = args.find((a) => !a.startsWith("--"));
+  let config, spec;
+  try {
+    ({ config } = loadBenchConfig(log));
+    if (specArg) spec = loadTrialSpec(specArg);
+  } catch (e) {
+    log(`error: ${e.message}`);
+    process.exit(2);
+  }
+  let ok = false;
+  try {
+    const out = (s) => process.stdout.write(`${s}\n`);
+    ok = sandboxCheck({ config, spec, keep: args.includes("--keep"), log, out });
+  } catch (e) {
+    log(`error: ${e.message}`);
+  }
+  process.exit(ok ? 0 : 1);
 }
 
 async function cmdRun(args) {
@@ -186,6 +212,9 @@ async function main() {
       break;
     case "worker":
       await cmdWorker(rest);
+      break;
+    case "sandbox-check":
+      await cmdSandboxCheck(rest);
       break;
     case "-h":
     case "--help":

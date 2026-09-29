@@ -377,3 +377,83 @@ describe("normalizeBenchConfig", () => {
     expect(() => normalizeBenchConfig({ ...rawBenchConfigBase, piEnvPassthrough: [1, 2] })).toThrow(/piEnvPassthrough/);
   });
 });
+
+describe("sandbox config (Landlock opt-in)", () => {
+  it("defaults to sandbox: off with no sandboxAllow", () => {
+    const cfg = normalizeBenchConfig({ ...rawBenchConfigBase });
+    expect(cfg.sandbox).toBe("off");
+    expect(cfg.sandboxAllow).toBeUndefined();
+  });
+
+  it("accepts sandbox: landlock and a well-formed sandboxAllow (copied, not aliased)", () => {
+    const allow = { ro: ["/srv/data"], rx: ["/opt/probe-venv"], rw: ["/scratch"] };
+    const cfg = normalizeBenchConfig({ ...rawBenchConfigBase, sandbox: "landlock", sandboxAllow: allow });
+    expect(cfg.sandbox).toBe("landlock");
+    expect(cfg.sandboxAllow).toEqual(allow);
+    expect(cfg.sandboxAllow.ro).not.toBe(allow.ro);
+  });
+
+  it("rejects an unknown sandbox mode", () => {
+    expect(() => normalizeBenchConfig({ ...rawBenchConfigBase, sandbox: "bwrap" })).toThrow(/sandbox: must be one of off, landlock/);
+    expect(() => normalizeBenchConfig({ ...rawBenchConfigBase, sandbox: true })).toThrow(/sandbox/);
+  });
+
+  it("rejects malformed sandboxAllow (unknown key, non-array, relative path)", () => {
+    expect(() => normalizeBenchConfig({ ...rawBenchConfigBase, sandboxAllow: { wx: ["/a"] } })).toThrow(/sandboxAllow\.wx: unknown key/);
+    expect(() => normalizeBenchConfig({ ...rawBenchConfigBase, sandboxAllow: { ro: "/a" } })).toThrow(/sandboxAllow\.ro: must be a string\[\]/);
+    expect(() => normalizeBenchConfig({ ...rawBenchConfigBase, sandboxAllow: { rw: ["relative/dir"] } })).toThrow(/must be an absolute path/);
+    expect(() => normalizeBenchConfig({ ...rawBenchConfigBase, sandboxAllow: ["/a"] })).toThrow(/sandboxAllow: must be an object/);
+  });
+
+  it("validateTrialSpec carries a per-trial sandbox and omits it when absent", () => {
+    expect(validateTrialSpec({ ...base }).sandbox).toBeUndefined();
+    expect(validateTrialSpec({ ...base, sandbox: "landlock" }).sandbox).toBe("landlock");
+    expect(validateTrialSpec({ ...base, sandbox: "off" }).sandbox).toBe("off");
+  });
+
+  it("validateTrialSpec rejects an unknown per-trial sandbox value", () => {
+    expect(() => validateTrialSpec({ ...base, sandbox: "yes" })).toThrow(/sandbox: "yes" not one of off, landlock/);
+  });
+});
+
+describe("sandboxEgress config (egress verification opt-in)", () => {
+  it("defaults to sandboxEgress: unchecked with no sandboxEgressAllow", () => {
+    const cfg = normalizeBenchConfig({ ...rawBenchConfigBase });
+    expect(cfg.sandboxEgress).toBe("unchecked");
+    expect(cfg.sandboxEgressAllow).toBeUndefined();
+  });
+
+  it("accepts sandboxEgress: blocked and a well-formed sandboxEgressAllow (copied, not aliased)", () => {
+    const allow = ["api.deepseek.com:443"];
+    const cfg = normalizeBenchConfig({ ...rawBenchConfigBase, sandbox: "landlock", sandboxEgress: "blocked", sandboxEgressAllow: allow });
+    expect(cfg.sandboxEgress).toBe("blocked");
+    expect(cfg.sandboxEgressAllow).toEqual(allow);
+    expect(cfg.sandboxEgressAllow).not.toBe(allow);
+  });
+
+  it("rejects an unknown sandboxEgress mode", () => {
+    expect(() => normalizeBenchConfig({ ...rawBenchConfigBase, sandboxEgress: "closed" })).toThrow(/sandboxEgress: must be one of unchecked, blocked/);
+    expect(() => normalizeBenchConfig({ ...rawBenchConfigBase, sandboxEgress: true })).toThrow(/sandboxEgress/);
+  });
+
+  it("rejects malformed sandboxEgressAllow", () => {
+    expect(() => normalizeBenchConfig({ ...rawBenchConfigBase, sandboxEgressAllow: "api.deepseek.com:443" })).toThrow(
+      /sandboxEgressAllow: must be a string\[\]/,
+    );
+    expect(() => normalizeBenchConfig({ ...rawBenchConfigBase, sandboxEgressAllow: ["no-port"] })).toThrow(/must look like "host:port"/);
+  });
+
+  it("validateTrialSpec carries a per-trial sandboxEgress and omits it when absent", () => {
+    expect(validateTrialSpec({ ...base }).sandboxEgress).toBeUndefined();
+    expect(validateTrialSpec({ ...base, sandboxEgress: "blocked" }).sandboxEgress).toBe("blocked");
+    expect(validateTrialSpec({ ...base, sandboxEgress: "unchecked" }).sandboxEgress).toBe("unchecked");
+  });
+
+  it("validateTrialSpec rejects an unknown per-trial sandboxEgress value", () => {
+    expect(() => validateTrialSpec({ ...base, sandboxEgress: "yes" })).toThrow(/sandboxEgress: "yes" not one of unchecked, blocked/);
+  });
+
+  it("normalizeBenchConfig does NOT reject sandbox:off + sandboxEgress:blocked — a trial may still supply sandbox:landlock (checked at runtime by resolveSandboxEgress)", () => {
+    expect(() => normalizeBenchConfig({ ...rawBenchConfigBase, sandbox: "off", sandboxEgress: "blocked" })).not.toThrow();
+  });
+});
