@@ -235,7 +235,7 @@ describe("buildEgressProbes", () => {
   // block/DNS sinkhole/blocked resolver could make a "must be blocked" host
   // resolve to loopback, letting the canary "confirm" a block by probing an
   // address nothing relevant listens on — proving nothing about the real
-  // host. resolveEgressHost must reject these results outright.
+  // host.
   describe("isUnsafeEgressProbeTarget", () => {
     it("flags loopback, unspecified, and link-local addresses (v4 and v6)", () => {
       for (const ip of ["127.0.0.1", "127.1.2.3", "0.0.0.0", "::1", "::", "169.254.1.1", "169.254.255.255", "fe80::1"]) {
@@ -256,10 +256,43 @@ describe("buildEgressProbes", () => {
     });
   });
 
-  it("resolveEgressHost rejects a getent result that resolves to loopback/unspecified/link-local (never returns it, even though getent itself 'succeeded')", () => {
-    expect(resolveEgressHost("github.com", () => ({ status: 0, stdout: "127.0.0.1   STREAM github.com\n" }))).toBeNull();
-    expect(resolveEgressHost("github.com", () => ({ status: 0, stdout: "0.0.0.0   STREAM github.com\n" }))).toBeNull();
-    expect(resolveEgressHost("github.com", () => ({ status: 0, stdout: "169.254.1.1   STREAM github.com\n" }))).toBeNull();
+  // 2026-09-30 Fable re-review of #45, blocking note: an earlier version of
+  // this fix rejected an unsafe (loopback/unspecified/link-local) resolution
+  // inside resolveEgressHost itself — which is shared by BOTH the "must be
+  // blocked" default hosts and any operator-configured "must be reachable"
+  // sandboxEgressAllow host, so it also broke a legitimate allow entry
+  // pointing at a local model proxy (e.g. `127.0.0.1:8080`). The rejection
+  // now lives in buildEgressProbes, scoped to expect:"deny" probes only.
+  it("resolveEgressHost itself is a pure resolver — it does NOT reject loopback/unspecified/link-local results", () => {
+    expect(resolveEgressHost("localhost", () => ({ status: 0, stdout: "127.0.0.1   STREAM localhost\n" }))).toBe("127.0.0.1");
+    expect(resolveEgressHost("wildcard.invalid", () => ({ status: 0, stdout: "0.0.0.0   STREAM wildcard.invalid\n" }))).toBe("0.0.0.0");
+  });
+
+  it("a DENY probe (default blocked host) throws when its resolver returns loopback/unspecified/link-local, instead of silently 'confirming' a block", () => {
+    for (const stdout of ["127.0.0.1   STREAM github.com\n", "0.0.0.0   STREAM github.com\n", "169.254.1.1   STREAM github.com\n"]) {
+      const resolveHost = fakeResolve({
+        "github.com": stdout.trim().split(/\s+/)[0],
+        "raw.githubusercontent.com": "10.0.0.2",
+        "pypi.org": "10.0.0.3",
+      });
+      expect(() => buildEgressProbes({ egress: "blocked", resolveHost })).toThrow(
+        /resolved to .* loopback\/unspecified\/link-local.*inconclusive and must fail/s,
+      );
+    }
+  });
+
+  it("an ALLOW probe (sandboxEgressAllow) permits a loopback resolution — a local model proxy is a legitimate target", () => {
+    const resolveHost = fakeResolve({
+      "github.com": "10.0.0.1",
+      "raw.githubusercontent.com": "10.0.0.2",
+      "pypi.org": "10.0.0.3",
+      "local-proxy.invalid": "127.0.0.1",
+    });
+    const probes = buildEgressProbes({ egress: "blocked", egressAllow: ["local-proxy.invalid:8080"], resolveHost });
+    const allow = probes.filter((p) => p.expect === "allow");
+    expect(allow).toEqual([
+      { name: "egress: local-proxy.invalid:8080 (127.0.0.1) must be reachable (sandboxEgressAllow)", op: "tcp", path: "127.0.0.1:8080", kind: "net", expect: "allow" },
+    ]);
   });
 });
 

@@ -598,16 +598,17 @@ export function isUnsafeEgressProbeTarget(ip) {
  * for why that distinction is the whole point. Injectable `spawn` for tests
  * (this machine's tests run on Windows/macOS dev boxes without `getent`).
  *
- * Rejects a loopback/unspecified/link-local result (see
- * isUnsafeEgressProbeTarget) rather than returning it: a hosts-file
- * entry/DNS sinkhole/blocked resolver making a "must be blocked" host
- * resolve to 127.0.0.1 would otherwise let the canary "confirm" a block by
- * probing an address nothing relevant listens on, proving nothing about the
- * real host (2026-09-29 Fable re-review of #43, non-blocking note).
+ * Deliberately does NOT reject a loopback/unspecified/link-local result
+ * itself (2026-09-30 Fable re-review of #45, blocking note: an earlier
+ * version of this fix rejected those addresses here unconditionally, which
+ * broke a legitimate `sandboxEgressAllow` entry pointing at a local model
+ * proxy — e.g. `127.0.0.1:8080` — since this same resolver backs BOTH the
+ * "must be blocked" default hosts and any operator-configured "must be
+ * reachable" allow hosts). See buildEgressProbes: the isUnsafeEgressProbeTarget
+ * check is applied there, scoped to `expect: "deny"` probes only.
  * @param {string} host
  * @param {typeof spawnSync} [spawn]
  * @returns {string|null} an IPv4 dotted-quad, or null if resolution failed
- *   OR resolved to a loopback/unspecified/link-local address
  */
 export function resolveEgressHost(host, spawn = spawnSync) {
   const r = spawn("getent", ["ahostsv4", host], { encoding: "utf8", timeout: 10_000 });
@@ -615,8 +616,7 @@ export function resolveEgressHost(host, spawn = spawnSync) {
   const first = r.stdout.split("\n").find((l) => l.trim());
   if (!first) return null;
   const ip = first.trim().split(/\s+/)[0];
-  if (!ip || isUnsafeEgressProbeTarget(ip)) return null;
-  return ip;
+  return ip || null;
 }
 
 /**
@@ -668,6 +668,22 @@ export function buildEgressProbes({ egress, egressAllow = [], resolveHost = reso
           `hiccup can never masquerade as "egress is blocked". Since the runner could not resolve "${host}", the check is inconclusive and ` +
           `must fail rather than silently report it ${expect === "deny" ? "blocked" : "reachable"} — fix DNS on this host and retry.`,
       );
+    // Only a DENY probe's resolution is checked against isUnsafeEgressProbeTarget
+    // (2026-09-30 Fable re-review of #45, blocking note): a "must be blocked"
+    // default host (github.com etc.) resolving to loopback/unspecified/
+    // link-local means a hosts-file entry or DNS sinkhole hijacked it, and
+    // probing that address would "confirm" a block that proves nothing about
+    // the real host. An ALLOW probe (sandboxEgressAllow) has no such gap — an
+    // operator pointing it at 127.0.0.1 (a local model proxy, say) means
+    // exactly that, and it's a legitimate, intentional target.
+    if (expect === "deny" && isUnsafeEgressProbeTarget(ip)) {
+      throw new Error(
+        `sandbox egress check: "${host}" (for "${hostPort}") resolved to ${ip} — a loopback/unspecified/link-local address. ` +
+          `A hosts-file entry or DNS sinkhole can make a "must be blocked" host resolve to the local machine itself, which would let this ` +
+          `probe "confirm" a block by finding nothing listening there, proving nothing about whether the real "${host}" is actually reachable. ` +
+          "Treating this the same as an unresolvable host: the check is inconclusive and must fail rather than silently report it blocked.",
+      );
+    }
     return { name: `egress: ${hostPort} (${ip}) ${nameSuffix}`, op: "tcp", path: `${ip}:${port}`, kind: "net", expect };
   };
   const probes = [];
