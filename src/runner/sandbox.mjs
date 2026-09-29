@@ -559,15 +559,55 @@ export function buildCanaryProbes({
 }
 
 /**
+ * True iff `ip` is loopback (127.0.0.0/8, ::1), unspecified (0.0.0.0, ::), or
+ * link-local (169.254.0.0/16, fe80::/10) — addresses a canary probe must
+ * never be built against (2026-09-29 Fable re-review of #43, non-blocking
+ * note): a poisoned/blocked resolver, a hosts-file entry, or a sinkhole can
+ * make a "must be blocked" host (github.com etc.) resolve to one of these
+ * instead of erroring out. buildEgressProbes' toIpProbe would then happily
+ * connect to (say) 127.0.0.1 — almost certainly refused, since nothing here
+ * listens there — and record that as "github.com is blocked", when in fact
+ * DNS/hosts resolution for that hostname was silently hijacked and nothing
+ * about the REAL github.com was ever tested. Rejecting these outright forces
+ * resolveEgressHost to report "could not resolve", which buildEgressProbes
+ * already treats as inconclusive-and-fail (see its caller) rather than a
+ * false PASS.
+ * @param {string} ip
+ * @returns {boolean}
+ */
+export function isUnsafeEgressProbeTarget(ip) {
+  if (typeof ip !== "string" || !ip) return true;
+  if (ip === "0.0.0.0" || ip === "::" || ip === "::1") return true;
+  const v4 = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (v4) {
+    const [, a, b] = v4.map(Number);
+    if (a === 127) return true; // 127.0.0.0/8 — loopback
+    if (a === 169 && b === 254) return true; // 169.254.0.0/16 — link-local
+    return false;
+  }
+  // IPv6 link-local: fe80::/10 (first 10 bits of fe80 = 1111 1110 10xx...).
+  if (/^fe[89ab][0-9a-f]:/i.test(ip)) return true;
+  return false;
+}
+
+/**
  * Resolve one hostname to a single IPv4 address via the system resolver
  * (`getent ahostsv4` — the same tool scripts/egress-allowlist.sh uses to pin
  * /etc/hosts). ALWAYS called from the runner itself (unsandboxed), never
  * from inside the Landlock-wrapped canary process — see buildEgressProbes
  * for why that distinction is the whole point. Injectable `spawn` for tests
  * (this machine's tests run on Windows/macOS dev boxes without `getent`).
+ *
+ * Rejects a loopback/unspecified/link-local result (see
+ * isUnsafeEgressProbeTarget) rather than returning it: a hosts-file
+ * entry/DNS sinkhole/blocked resolver making a "must be blocked" host
+ * resolve to 127.0.0.1 would otherwise let the canary "confirm" a block by
+ * probing an address nothing relevant listens on, proving nothing about the
+ * real host (2026-09-29 Fable re-review of #43, non-blocking note).
  * @param {string} host
  * @param {typeof spawnSync} [spawn]
  * @returns {string|null} an IPv4 dotted-quad, or null if resolution failed
+ *   OR resolved to a loopback/unspecified/link-local address
  */
 export function resolveEgressHost(host, spawn = spawnSync) {
   const r = spawn("getent", ["ahostsv4", host], { encoding: "utf8", timeout: 10_000 });
@@ -575,7 +615,8 @@ export function resolveEgressHost(host, spawn = spawnSync) {
   const first = r.stdout.split("\n").find((l) => l.trim());
   if (!first) return null;
   const ip = first.trim().split(/\s+/)[0];
-  return ip || null;
+  if (!ip || isUnsafeEgressProbeTarget(ip)) return null;
+  return ip;
 }
 
 /**

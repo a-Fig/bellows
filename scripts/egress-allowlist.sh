@@ -64,6 +64,28 @@
 #   - DNS resolution of arbitrary hostnames still works for the bench user
 #     (UDP/TCP 53 to the stub resolver is not blocked) — only TCP connect to
 #     an unlisted IP is blocked
+#   - a LOOPBACK proxy (e.g. tailscaled's SOCKS5 listener, a local squid/mitm,
+#     anything bound to 127.0.0.1/::1) is a bypass this script cannot see:
+#     `-o lo -j ACCEPT` above allows ALL loopback traffic unconditionally (it
+#     has to, for DNS — see below), so the bench user can reach any such
+#     listener regardless of the allowlist. `--check` lists loopback TCP
+#     listeners (via `ss -ltnp`) not attributable to the bench user itself and
+#     FAILS unless each is explicitly accepted with `--allow-loopback
+#     host:port` (2026-09-29 Fable re-review of #43, non-blocking note).
+#   - rules do NOT survive a reboot. This script only calls iptables/
+#     ip6tables directly and does not persist them (no iptables-persistent/
+#     netfilter-persistent integration, no systemd unit). Re-run it after
+#     every reboot, or wire that in yourself.
+#   - assumes systemd-resolved is doing DNS for the bench user (see "DNS
+#     still works" below) — on a host WITHOUT it, where /etc/resolv.conf
+#     points straight at an external nameserver IP, the bench user's own
+#     process makes that DNS query itself, as its own uid, over a real
+#     socket rather than to a same-host stub over loopback. That query isn't
+#     covered by any ACCEPT rule here (only --allow host:port pairs are
+#     opened) and gets rejected like everything else: an --allow'd host
+#     still resolves fine (its IP is pinned in /etc/hosts, checked before
+#     DNS), but any OTHER hostname lookup fails outright at the resolver
+#     step instead of connecting-then-being-blocked.
 #
 # See src/runner/sandbox.mjs DEFAULT_EGRESS_BLOCKED_HOSTS for the exact hosts
 # the per-run canary independently checks are blocked (kept in sync below).
@@ -73,6 +95,7 @@ set -euo pipefail
 CHAIN="BENCH_EGRESS"
 BENCH_USER=""
 ALLOW=()
+ALLOW_LOOPBACK=()
 CHECK=false
 
 # Mirrors DEFAULT_EGRESS_BLOCKED_HOSTS in src/runner/sandbox.mjs — the exact
@@ -90,12 +113,21 @@ Usage:
   --user <name>      the bench OS user whose egress is restricted (required)
   --allow host:port   a host:port that must stay reachable (repeatable) —
                        typically the model API and the Agent Trials platform
+  --allow-loopback host:port
+                       (--check only) a loopback (127.x/::1) TCP listener
+                       that is expected/intentional (repeatable) — e.g. a
+                       deliberate local proxy. Without this, --check FAILS on
+                       any loopback listener it can't attribute to the bench
+                       user itself, since loopback is always reachable
+                       regardless of the allowlist (-o lo -j ACCEPT).
   --check             do not touch firewall rules; report whether
                        github.com/raw.githubusercontent.com/pypi.org are
-                       blocked and every --allow host is reachable, probed AS
-                       the bench user (sudo -u). Requires root or
+                       blocked, every --allow host is reachable (probed AS
+                       the bench user via sudo -u, or directly if you already
+                       are that user), and no unexpected loopback listener
+                       exists. Requires root, to already BE --user, or
                        passwordless sudo to --user — exits 2 (not a PASS) if
-                       that can't be confirmed first, rather than silently
+                       none of those can be confirmed, rather than silently
                        reporting everything as "blocked".
 
 Exit codes: 0 PASS, 1 a probe failed or was inconclusive (timeout/error —
@@ -117,6 +149,11 @@ while [ $# -gt 0 ]; do
       ALLOW+=("$2")
       shift 2
       ;;
+    --allow-loopback)
+      [ $# -ge 2 ] || usage
+      ALLOW_LOOPBACK+=("$2")
+      shift 2
+      ;;
     --check)
       CHECK=true
       shift
@@ -131,12 +168,28 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# systemd-resolved's stub resolver is a loopback listener BY DESIGN (see
+# header comment) — always accepted so a normal host doesn't need
+# --allow-loopback just to pass the check that the header itself describes as
+# expected.
+ALLOW_LOOPBACK+=("127.0.0.53:53")
+
 [ -n "$BENCH_USER" ] || usage
 id -u "$BENCH_USER" >/dev/null 2>&1 || {
   echo "egress-allowlist.sh: no such user: $BENCH_USER" >&2
   exit 1
 }
 UID_N="$(id -u "$BENCH_USER")"
+
+# When the invoking user's own uid already IS the bench user's uid, every
+# probe below can run directly — no sudo hop needed, and none of the
+# sudo-specific error paths apply. This is what makes the script's own
+# "Run this check as '$BENCH_USER' directly" suggestion (require_sudo_to_bench_user,
+# probe_tcp below) actually true instead of a stale claim that never worked.
+SELF_IS_BENCH_USER=false
+if [ "$(id -u)" = "$UID_N" ]; then
+  SELF_IS_BENCH_USER=true
+fi
 
 # Refuse --user root outright: uid 0 would put ROOT's own outbound
 # connections behind this chain (every rule below is `-m owner --uid-owner
@@ -170,6 +223,9 @@ resolve_ip() {
 # "ok: ... blocked" lines and a PASS with nothing actually probed (2026-09-29
 # Fable review, bellows #43 note 1).
 require_sudo_to_bench_user() {
+  if $SELF_IS_BENCH_USER; then
+    return 0
+  fi
   if ! command -v sudo >/dev/null 2>&1; then
     echo "egress-allowlist.sh: 'sudo' is not installed (or not on PATH) — --check cannot run probes as '$BENCH_USER' without it. Run this check as '$BENCH_USER' directly, or install sudo." >&2
     return 1
@@ -217,7 +273,23 @@ probe_tcp() {
   # EVERY blocked/refused/timed-out probe is, i.e. the common case — is a
   # plain statement, not part of a conditional, and would kill the whole
   # script right here instead of letting the caller classify the result.
-  out="$(sudo -n -u "$BENCH_USER" timeout 5 bash -c ": < /dev/tcp/${host}/${port}" 2>&1)" && rc=0 || rc=$?
+  #
+  # `env LC_ALL=C` forces the classification below (grep against bash's own
+  # strerror-derived error text) onto the C locale regardless of the
+  # invoking (or bench user's) environment — a localized "Connection
+  # refused" would otherwise silently fail every `grep -qi` match and get
+  # misclassified as inconclusive "error" instead of a confirmed block
+  # (2026-09-29 Fable re-review of #43, non-blocking note).
+  #
+  # When the invoker already IS the bench user (SELF_IS_BENCH_USER), skip
+  # the `sudo -n -u` hop entirely — it would otherwise still require sudo
+  # rights even to run a command as yourself, defeating the "run this check
+  # as $BENCH_USER directly, no sudo needed" path.
+  if $SELF_IS_BENCH_USER; then
+    out="$(env LC_ALL=C timeout 5 bash -c ": < /dev/tcp/${host}/${port}" 2>&1)" && rc=0 || rc=$?
+  else
+    out="$(sudo -n -u "$BENCH_USER" env LC_ALL=C timeout 5 bash -c ": < /dev/tcp/${host}/${port}" 2>&1)" && rc=0 || rc=$?
+  fi
   if [ "$rc" -eq 0 ]; then
     echo open
   elif [ "$rc" -eq 124 ]; then
@@ -229,6 +301,80 @@ probe_tcp() {
   else
     echo "error"
   fi
+}
+
+# Loopback TCP listeners are reachable by the bench user regardless of the
+# allowlist below: `-o lo -j ACCEPT` has to allow ALL loopback traffic
+# unconditionally (DNS to systemd-resolved's stub depends on it), so any
+# other process listening on 127.x/::1/wildcard is a bypass invisible to
+# every iptables rule this script installs (e.g. tailscaled's SOCKS5
+# listener, a forgotten local squid/mitm). Enumerates LISTEN-state sockets
+# via `ss -ltnp`, attributes each to a uid via its pid where the `Process`
+# column is visible, and FAILS on anything not owned by the bench user
+# itself and not explicitly accepted via --allow-loopback (systemd-resolved's
+# own stub is pre-seeded into ALLOW_LOOPBACK above). A socket whose owner
+# can't be determined (ss/ps couldn't attribute it — e.g. no permission to
+# see another user's process) is treated the same as "not the bench user":
+# fails closed, since the whole point is catching a listener the operator
+# doesn't already know about (2026-09-29 Fable re-review of #43, non-blocking
+# note). Degrades to a WARN (not a FAIL) if `ss` isn't installed at all,
+# since this is a bonus check layered on top of the primary probes above,
+# not itself the firewall verification.
+check_loopback_listeners() {
+  if ! command -v ss >/dev/null 2>&1; then
+    echo "  WARN: 'ss' not found — cannot check for loopback listeners (a local proxy bound to 127.x/::1/wildcard would bypass the allowlist undetected)"
+    return 0
+  fi
+  local fail=0 hp pid owner_uid allowed entry
+  while IFS=$'\t' read -r hp pid; do
+    [ -n "$hp" ] || continue
+    allowed=false
+    for entry in "${ALLOW_LOOPBACK[@]}"; do
+      if [ "$entry" = "$hp" ]; then
+        allowed=true
+        break
+      fi
+    done
+    if $allowed; then
+      continue
+    fi
+    owner_uid=""
+    if [ -n "$pid" ]; then
+      # `|| true`: ps exits non-zero once the process is gone or unreadable
+      # (permission denied on another user's /proc entry) — under
+      # `pipefail`, that alone would make this bare assignment statement
+      # fail and, under `set -e`, abort the WHOLE script instead of just
+      # leaving owner_uid empty (treated as "unattributed" below).
+      owner_uid="$(ps -o uid= -p "$pid" 2>/dev/null | tr -d '[:space:]')" || true
+    fi
+    if [ -n "$owner_uid" ] && [ "$owner_uid" = "$UID_N" ]; then
+      continue
+    fi
+    echo "  FAIL: loopback listener $hp (pid ${pid:-unknown}, uid ${owner_uid:-unknown}) is not $BENCH_USER's own process and is not in --allow-loopback — reachable by $BENCH_USER regardless of the allowlist"
+    fail=1
+  done < <(ss -ltnp 2>/dev/null | awk '
+    $1 != "LISTEN" { next }
+    {
+      la = $4
+      if (la ~ /^\[/) {
+        split(la, parts, "]:")
+        host = substr(parts[1], 2)
+        port = parts[2]
+      } else {
+        n = split(la, parts, ":")
+        port = parts[n]
+        host = parts[1]
+        for (i = 2; i < n; i++) host = host ":" parts[i]
+      }
+      sub(/%.*/, "", host)
+      is_loop = (host ~ /^127\./) || host == "::1" || host == "*" || host == "0.0.0.0" || host == "::"
+      if (!is_loop) next
+      pid = ""
+      if (match($0, /pid=[0-9]+/)) pid = substr($0, RSTART + 4, RLENGTH - 4)
+      printf "%s:%s\t%s\n", host, port, pid
+    }
+  ')
+  return "$fail"
 }
 
 do_check() {
@@ -255,6 +401,7 @@ do_check() {
       ok=1
     fi
   done
+  check_loopback_listeners || ok=1
   return "$ok"
 }
 
@@ -279,7 +426,7 @@ if $CHECK; then
 fi
 
 if [ "$(id -u)" != "0" ]; then
-  echo "egress-allowlist.sh: must run as root to modify firewall rules (use --check to only verify, as any user)" >&2
+  echo "egress-allowlist.sh: must run as root to modify firewall rules (use --check instead to only verify — as root, as $BENCH_USER itself, or with passwordless sudo to $BENCH_USER; --check still exits 2, not a PASS, if none of those apply)" >&2
   exit 1
 fi
 
@@ -292,18 +439,38 @@ iptables -C OUTPUT -m owner --uid-owner "$UID_N" -j "$CHAIN" 2>/dev/null ||
 iptables -A "$CHAIN" -o lo -j ACCEPT
 iptables -A "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
+# Counts --allow hosts that failed to resolve so the script can exit non-zero
+# below rather than silently succeeding with one or more hosts never
+# allowlisted (2026-09-29 Fable re-review of #43, non-blocking note) — while
+# still applying every host that DID resolve rather than aborting the whole
+# run over one bad hostname.
+RESOLVE_FAILURES=0
+
 for hp in "${ALLOW[@]}"; do
   host="${hp%:*}"
   port="${hp##*:}"
   ip="$(resolve_ip "$host")"
   if [ -z "$ip" ]; then
     echo "egress-allowlist.sh: could not resolve '$host' — skipping (fix DNS and re-run)" >&2
+    RESOLVE_FAILURES=$((RESOLVE_FAILURES + 1))
     continue
   fi
   # Pin host -> ip in /etc/hosts (update in place if already pinned and the
-  # resolved address drifted; append otherwise).
-  if grep -qE "^[0-9.]+[[:space:]]+${host}\$" /etc/hosts; then
-    sed -i -E "s/^[0-9.]+([[:space:]]+${host})\$/${ip}\1/" /etc/hosts
+  # resolved address drifted; append otherwise). Found via awk's exact
+  # whitespace-token comparison (not a regex against $host) so a literal "."
+  # in the hostname can't match any character the way an unescaped ERE
+  # would, and so the host is found even when it's not the sole/last token
+  # on the line — e.g. other aliases sharing the address, or a trailing
+  # `# comment` — cases the old `^...${host}$`-anchored match missed and
+  # would append a second, ineffective line under (glibc's resolver uses the
+  # FIRST matching /etc/hosts line, so an appended duplicate silently does
+  # nothing) (2026-09-29 Fable re-review of #43, non-blocking note).
+  hosts_line="$(awk -v h="$host" '{
+    line = $0; sub(/#.*/, "", line); n = split(line, toks, /[ \t]+/)
+    for (i = 2; i <= n; i++) if (toks[i] == h) { print NR; exit }
+  }' /etc/hosts)"
+  if [ -n "$hosts_line" ]; then
+    sed -i -E "${hosts_line}s/^[0-9A-Fa-f:.]+/${ip}/" /etc/hosts
   else
     echo "$ip $host" >>/etc/hosts
   fi
@@ -318,3 +485,13 @@ ip6tables -C OUTPUT -m owner --uid-owner "$UID_N" ! -o lo -j REJECT 2>/dev/null 
 
 echo "done. DNS still works for $BENCH_USER (systemd-resolved does the upstream lookup as its own uid, via lo)."
 echo "Verify: $0 --user $BENCH_USER $(printf -- '--allow %s ' "${ALLOW[@]}")--check"
+
+# Every host that DID resolve is now allowlisted and iptables was rebuilt
+# above; but if any --allow host failed to resolve, exit non-zero rather
+# than silently succeeding — the operator asked for that host to stay
+# reachable and it isn't (2026-09-29 Fable re-review of #43, non-blocking
+# note).
+if [ "$RESOLVE_FAILURES" -gt 0 ]; then
+  echo "egress-allowlist.sh: $RESOLVE_FAILURES --allow host(s) could not be resolved and were NOT allowlisted (see warnings above) — fix DNS and re-run" >&2
+  exit 1
+fi

@@ -197,6 +197,28 @@ cannot, prove the allowlist has no other holes):
 - The canary's fixed host list (and `--check`'s) is a spot-check, not a
   firewall audit — it catches "did today's incident's exact hosts get
   re-opened", not "is this allowlist airtight."
+- **A loopback proxy is an unblockable bypass.** The chain has to accept ALL
+  loopback traffic unconditionally (DNS to systemd-resolved's stub depends on
+  it — see below), so anything listening on `127.x`/`::1`/a wildcard address
+  (a forgotten local squid/mitm, tailscaled's SOCKS5 listener, ...) is
+  reachable by the bench user regardless of the allowlist. `--check` lists
+  loopback TCP listeners (`ss -ltnp`) it can't attribute to the bench user
+  itself and fails unless each is explicitly accepted with `--allow-loopback
+  host:port`.
+- **Rules do not survive a reboot.** The script only calls `iptables`/
+  `ip6tables` directly — it does not persist rules (no
+  iptables-persistent/netfilter-persistent integration, no systemd unit).
+  Re-run it after every reboot of a bench host, or wire that persistence in
+  yourself.
+- **Without systemd-resolved doing DNS for the bench user**, the "DNS still
+  works" behavior above doesn't hold: if `/etc/resolv.conf` points straight
+  at an external nameserver IP instead of a local stub, the bench user's own
+  process makes that DNS query itself, as its own uid, over a real socket —
+  not covered by any `ACCEPT` rule here (only `--allow` host:port pairs are
+  opened), so it's rejected like everything else. An `--allow`'d host still
+  resolves fine (its IP is pinned in `/etc/hosts`, checked before DNS), but
+  any *other* hostname lookup fails outright at the resolver step instead of
+  connecting-then-being-blocked.
 
 ## Write a trial
 

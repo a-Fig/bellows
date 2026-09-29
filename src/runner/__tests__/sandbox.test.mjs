@@ -17,6 +17,7 @@ import {
   buildCanaryProbes,
   buildEgressProbes,
   resolveEgressHost,
+  isUnsafeEgressProbeTarget,
   evaluateCanary,
   formatCanaryTable,
   runCanary,
@@ -228,6 +229,37 @@ describe("buildEgressProbes", () => {
     expect(resolveEgressHost("nope.invalid", () => ({ error: new Error("ENOENT: getent not found") }))).toBeNull();
     expect(resolveEgressHost("nope.invalid", () => ({ status: 0, stdout: "" }))).toBeNull();
     expect(resolveEgressHost("nope.invalid", () => ({ status: 0, stdout: "\n\n" }))).toBeNull();
+  });
+
+  // 2026-09-29 Fable re-review of #43, non-blocking note: a hosts-file
+  // block/DNS sinkhole/blocked resolver could make a "must be blocked" host
+  // resolve to loopback, letting the canary "confirm" a block by probing an
+  // address nothing relevant listens on — proving nothing about the real
+  // host. resolveEgressHost must reject these results outright.
+  describe("isUnsafeEgressProbeTarget", () => {
+    it("flags loopback, unspecified, and link-local addresses (v4 and v6)", () => {
+      for (const ip of ["127.0.0.1", "127.1.2.3", "0.0.0.0", "::1", "::", "169.254.1.1", "169.254.255.255", "fe80::1"]) {
+        expect(isUnsafeEgressProbeTarget(ip)).toBe(true);
+      }
+    });
+
+    it("does not flag ordinary public/private addresses", () => {
+      for (const ip of ["93.184.216.34", "10.0.0.5", "192.168.1.1", "8.8.8.8", "169.253.1.1", "126.0.0.1", "128.0.0.1"]) {
+        expect(isUnsafeEgressProbeTarget(ip)).toBe(false);
+      }
+    });
+
+    it("flags empty/non-string input (fail closed)", () => {
+      expect(isUnsafeEgressProbeTarget("")).toBe(true);
+      expect(isUnsafeEgressProbeTarget(null)).toBe(true);
+      expect(isUnsafeEgressProbeTarget(undefined)).toBe(true);
+    });
+  });
+
+  it("resolveEgressHost rejects a getent result that resolves to loopback/unspecified/link-local (never returns it, even though getent itself 'succeeded')", () => {
+    expect(resolveEgressHost("github.com", () => ({ status: 0, stdout: "127.0.0.1   STREAM github.com\n" }))).toBeNull();
+    expect(resolveEgressHost("github.com", () => ({ status: 0, stdout: "0.0.0.0   STREAM github.com\n" }))).toBeNull();
+    expect(resolveEgressHost("github.com", () => ({ status: 0, stdout: "169.254.1.1   STREAM github.com\n" }))).toBeNull();
   });
 });
 
