@@ -1,7 +1,7 @@
 import { esc, fmtNum, fmtUsd, fmtPct, fmtDuration, fmtTs } from "./format.mjs";
 import { turnSparkline, budgetLineChart } from "./svg.mjs";
 import { aggregateGroup, isAborted, scorelessKind } from "./aggregate.mjs";
-import { HARD_FIELDS, SOFT_FIELDS } from "./grouping.mjs";
+import { HARD_FIELDS, SOFT_FIELDS, fpFieldDisplay } from "./grouping.mjs";
 import { REPORT_CSS } from "./css.mjs";
 
 function renderFingerprintTable(fp, softWarnings) {
@@ -9,7 +9,7 @@ function renderFingerprintTable(fp, softWarnings) {
     .filter((f) => f !== "conductorId")
     .map((f) => {
       const warn = softWarnings.has(f);
-      return `<tr><th>${esc(f)}</th><td>${esc(fp[f])}${warn ? ` <span class="badge badge-warn">varies</span>` : ""}</td></tr>`;
+      return `<tr><th>${esc(f)}</th><td>${esc(fpFieldDisplay(fp, f))}${warn ? ` <span class="badge badge-warn">varies</span>` : ""}</td></tr>`;
     })
     .join("");
   return `<table class="fp-table">${rows}</table>`;

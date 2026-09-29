@@ -7,6 +7,7 @@ import {
   foldHostTelemetry,
   foldCompletionLog,
   collectCompletionLog,
+  collectHostTelemetry,
   enrichTurnsWithWire,
   computePlanRtt,
 } from "../collect.mjs";
@@ -707,6 +708,16 @@ describe("foldCompletionLog / collectCompletionLog — completions.jsonl side lo
       expect(collectCompletionLog(undefined)).toBeNull();
     });
 
+    it("treats a zero-byte file (pre-created by the sandbox) exactly like a missing one", () => {
+      // A sandboxed run pre-creates completions.jsonl so the extension can be
+      // granted write-only access to it. Folding "" would return all-zero
+      // counts that overwrite the host-summed completeCalls — must be null.
+      dir = mkdtempSync(path.join(tmpdir(), "bellows-completion-log-"));
+      const file = path.join(dir, "completions.jsonl");
+      writeFileSync(file, "", "utf8");
+      expect(collectCompletionLog(file)).toBeNull();
+    });
+
     it("tolerates a file with bad lines mixed with good ones", () => {
       dir = mkdtempSync(path.join(tmpdir(), "bellows-completion-log-"));
       const file = path.join(dir, "completions.jsonl");
@@ -731,5 +742,24 @@ describe("foldHostTelemetry — completions.jsonl field defaults", () => {
     expect(tel.completeInputTokens).toBe(0);
     expect(tel.completeOutputTokens).toBe(0);
     expect(tel.completeCacheReadTokens).toBe(0);
+  });
+});
+
+describe("collectHostTelemetry — zero-byte host.jsonl", () => {
+  it("returns null for a pre-created empty file, same as a missing one", () => {
+    // A sandboxed run pre-creates host.jsonl (so the canary's "cannot read own
+    // host.jsonl" probe has an existing target). A host that never wrote a row
+    // must still collect as "no telemetry", not as an all-zero conductor.
+    const dir = mkdtempSync(path.join(tmpdir(), "bellows-host-empty-"));
+    try {
+      const file = path.join(dir, "host.jsonl");
+      writeFileSync(file, "", "utf8");
+      expect(collectHostTelemetry(file, "keel")).toBeNull();
+      expect(collectHostTelemetry(path.join(dir, "missing.jsonl"), "keel")).toBeNull();
+      writeFileSync(file, `${JSON.stringify({ t: "attach", at: 1, conductor: "keel", budget: 1, protectTokens: 0 })}\n`, "utf8");
+      expect(collectHostTelemetry(file, "keel")).not.toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

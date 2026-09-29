@@ -23,6 +23,7 @@ import { provisionRun, KICKOFF_PROMPT } from "./provision.mjs";
 import { agentSpawnEnv } from "./agentEnv.mjs";
 import { scrubEnv } from "./envScrub.mjs";
 import { PiRpc } from "./rpc.mjs";
+import { resolveSandboxMode, resolveSandboxEgress, assertLandlockAvailable, prepareLandlockRun } from "./sandbox.mjs";
 import {
   findNewestSessionFile,
   collectSession,
@@ -97,6 +98,56 @@ export async function executeRun(args) {
   let armDispatch = arm === "none" ? { type: "in-process", id: "none" } : parseConductorArm(arm);
 
   const fingerprint = { ...sharedFp, conductorId: arm, env: armEnv || {} };
+
+  // A run that fails before anything is spawned: write + return its error
+  // record straight away (no finalize sweep / leaderboard harvest — no agent
+  // ever existed, so there is nothing on the platform to close or harvest).
+  const failEarly = (detail) => {
+    log(`[${label}] ERROR: ${detail}`);
+    const endedAt = new Date();
+    const record = {
+      id: label,
+      label,
+      status: "error",
+      statusDetail: detail,
+      fingerprint,
+      timing: { startedAt: startedAt.toISOString(), endedAt: endedAt.toISOString(), wallClockS: 0 },
+      usage: emptyUsage(),
+      turns: [],
+      conductor: null,
+      platform: null,
+      // This run never got as far as spawning an agent, so neither finalize
+      // path ever had a chance to run.
+      agentFinalized: false,
+      sweepFinalize: null,
+      // hostTelemetryFile is null (not the would-be path): this run never spawned
+      // a host, so the file will never exist — matches schedule.mjs's errorRecord
+      // convention for never-started runs.
+      artifacts: { piSessionFile: "", hostTelemetryFile: null, workspaceDir: runDir, agentDir: runDir },
+    };
+    try {
+      fs.writeFileSync(path.join(runDir, "record.json"), JSON.stringify(record, null, 2));
+    } catch {
+      /* best-effort */
+    }
+    logRunSummary(record, log);
+    return record;
+  };
+
+  // Filesystem sandbox (config/trial `sandbox`, see sandbox.mjs). Resolved and
+  // checked BEFORE anything is provisioned or spawned: a requested sandbox
+  // that can't be enforced here fails the run, never silently runs without it.
+  let sandboxMode;
+  let sandboxEgress;
+  try {
+    sandboxMode = resolveSandboxMode(config, spec);
+    sandboxEgress = resolveSandboxEgress(config, spec);
+    if (sandboxMode === "landlock") assertLandlockAvailable();
+  } catch (e) {
+    return failEarly(e.message);
+  }
+  fingerprint.sandbox = { mode: sandboxMode, egress: sandboxEgress };
+
   // Per-trial accordionRef: resolve to a pinned worktree (the effective accordion
   // repo) WITHOUT touching config.accordionRepo's working tree. Absent => use
   // config.accordionRepo as-is (today's behavior). The resolved SHA overrides the
@@ -118,37 +169,7 @@ export async function executeRun(args) {
     } catch (e) {
       // A bad ref must fail the run cleanly (before spawning anything), not run
       // silently against the wrong (base-checkout) tree.
-      status = "error";
-      statusDetail = `accordionRef "${spec.accordionRef}" resolution failed: ${e.message}`;
-      log(`[${label}] ERROR: ${statusDetail}`);
-      const endedAt = new Date();
-      const record = {
-        id: label,
-        label,
-        status,
-        statusDetail,
-        fingerprint,
-        timing: { startedAt: startedAt.toISOString(), endedAt: endedAt.toISOString(), wallClockS: 0 },
-        usage: emptyUsage(),
-        turns: [],
-        conductor: null,
-        platform: null,
-        // This run never got as far as spawning an agent, so neither finalize
-        // path ever had a chance to run.
-        agentFinalized: false,
-        sweepFinalize: null,
-        // hostTelemetryFile is null (not the would-be path): this run never spawned
-        // a host, so the file will never exist — matches schedule.mjs's errorRecord
-        // convention for never-started runs.
-        artifacts: { piSessionFile: "", hostTelemetryFile: null, workspaceDir: runDir, agentDir: runDir },
-      };
-      try {
-        fs.writeFileSync(path.join(runDir, "record.json"), JSON.stringify(record, null, 2));
-      } catch {
-        /* best-effort */
-      }
-      logRunSummary(record, log);
-      return record;
+      return failEarly(`accordionRef "${spec.accordionRef}" resolution failed: ${e.message}`);
     }
   }
   // Effective-repo-bound config for downstream consumers (provision, host spawn,
@@ -173,6 +194,9 @@ export async function executeRun(args) {
   let externalConductor = null;
   /** @type {import("node:fs").WriteStream | null} */
   let externalConductorLog = null;
+  // Set when the sandbox setup/canary refused to start pi: the agent never
+  // ran, so the post-run platform sweep + harvest are skipped.
+  let sandboxPreflightFailed = false;
 
   try {
     const prov = provisionRun({
@@ -218,7 +242,39 @@ export async function executeRun(args) {
       piEnv,
       agentSpawnEnv({ baseEnv: piEnv, binDir: path.join(runDir, "bin"), log }),
     );
-    pi = new PiRpc({ piCommand: "pi", cwd: workspaceDir, env: piEnv }).start();
+
+    // Landlock: pi (and everything it spawns) runs under bin/landlock-exec.py.
+    // prepareLandlockRun sets piEnv.TMPDIR to <runDir>/tmp (the only env
+    // change), pre-creates the run's harness files, and runs the canary
+    // through the exact wrapper argv pi gets — throwing before pi exists if
+    // any isolation probe escapes or the sandbox can't be applied.
+    let piCommand = "pi";
+    let commandPrefix = [];
+    if (sandboxMode === "landlock") {
+      try {
+        const sbx = prepareLandlockRun({
+          config,
+          runDir,
+          workspaceDir,
+          agentDir,
+          accordionHome,
+          accordionRepo: effConfig.accordionRepo,
+          hostTelemetryFile,
+          completionLogFile: path.join(runDir, "completions.jsonl"),
+          piRpcLogFile: path.join(runDir, "pi-rpc.log"),
+          runsRoot: runsRootFrom(config),
+          piEnv,
+          sandboxEgress,
+          log: (m) => log(`[${label}] ${m}`),
+        });
+        piCommand = sbx.piPath;
+        commandPrefix = sbx.prefix;
+      } catch (e) {
+        sandboxPreflightFailed = true;
+        throw e;
+      }
+    }
+    pi = new PiRpc({ piCommand, commandPrefix, cwd: workspaceDir, env: piEnv }).start();
 
     const piLog = fs.createWriteStream(path.join(runDir, "pi-rpc.log"), { flags: "a" });
     pi.on("stderr", (s) => piLog.write(s));
@@ -436,7 +492,9 @@ export async function executeRun(args) {
     // no-op with a clear log line instead of `spec.room.base` throwing
     // "Cannot read properties of undefined (reading 'base')" out of this block.
     const platformBase = resolvePlatformBase(spec, config);
-    if (!platformBase) {
+    if (sandboxPreflightFailed) {
+      log(`[${label}] finalize sweep skipped: sandbox preflight refused to start pi`);
+    } else if (!platformBase) {
       log(`[${label}] finalize sweep skipped: spec has no room (malformed claim?)`);
     } else {
       sweepFinalize = await finalizeStaleAgent({
@@ -460,7 +518,9 @@ export async function executeRun(args) {
   let platform = null;
   try {
     const platformBase = resolvePlatformBase(spec, config);
-    if (!platformBase) {
+    if (sandboxPreflightFailed) {
+      log(`[${label}] leaderboard harvest skipped: sandbox preflight refused to start pi`);
+    } else if (!platformBase) {
       log(`[${label}] leaderboard harvest skipped: spec has no room (malformed claim?)`);
     } else {
       // Always harvest — even a capped/aborted run leaves a non-final leaderboard

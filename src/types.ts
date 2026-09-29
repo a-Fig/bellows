@@ -38,6 +38,21 @@ export interface TrialSpec {
    * "claude/happy-fermat-8b7485".
    */
   accordionRef?: string;
+  /**
+   * Filesystem sandbox for this trial's agents. "landlock" turns it on even
+   * when bench.config.json leaves it off; "off" is only accepted when the
+   * config doesn't enforce "landlock" (a trial can add the sandbox, never
+   * remove it). Absent => config.sandbox. See src/runner/sandbox.mjs.
+   */
+  sandbox?: "off" | "landlock";
+  /**
+   * Per-trial egress check (BenchConfig.sandboxEgress). "blocked" turns it on
+   * even when bench.config.json leaves it "unchecked"; "unchecked" is only
+   * accepted when the config doesn't enforce "blocked" (a trial can only
+   * tighten, never loosen). Absent => config.sandboxEgress. See
+   * src/runner/sandbox.mjs resolveSandboxEgress.
+   */
+  sandboxEgress?: "unchecked" | "blocked";
   /** Accordion token budget the conductor folds down to. */
   budget: number;
   /** Protected working-tail tokens (accordion protectTokens). */
@@ -180,6 +195,17 @@ export interface Fingerprint {
    * see src/runner/run.mjs where this is filled in alongside conductorId.
    */
   env: Record<string, string>;
+  /**
+   * Whether pi ran under the Landlock filesystem sandbox, and (since the
+   * sandboxEgress feature) whether the egress canary checked for open
+   * internet access. Absent on records written before the sandbox existed
+   * (reports treat that as "off"). Records written before sandboxEgress
+   * existed carry the plain `"off" | "landlock"` string form (no `egress`
+   * key); reports treat those as `egress: "unchecked"` (see
+   * src/report/grouping.mjs) — both forms are valid on disk, so keep reading
+   * old runs/*.json working when changing this shape.
+   */
+  sandbox?: "off" | "landlock" | { mode: "off" | "landlock"; egress: "unchecked" | "blocked" };
 }
 
 export interface UsageTotals {
@@ -421,6 +447,35 @@ export interface BenchConfig {
    * scrubPiEnv is false/absent.
    */
   piEnvPassthrough?: string[];
+  /**
+   * "landlock": run pi (and everything it spawns: bash tool, python, the
+   * Accordion extension, WS conductor runners) under a Landlock filesystem
+   * sandbox that only reaches the run's workspace/agent/accordion-home/tmp
+   * dirs plus system and runtime code — not other runs, the trial dir, this
+   * run's harness logs, the bellows checkout or the rest of $HOME. Linux only;
+   * a run fails fast (never runs unsandboxed) when Landlock is unavailable,
+   * and a canary must pass before pi starts. Network is not restricted.
+   * Default "off". See src/runner/sandbox.mjs and `bellows sandbox-check`.
+   */
+  sandbox?: "off" | "landlock";
+  /** Extra absolute paths to grant inside the sandbox (ro = read, rx = read +
+   *  execute, rw = full access), e.g. a probe venv. Ignored when sandbox is off. */
+  sandboxAllow?: { ro?: string[]; rx?: string[]; rw?: string[] };
+  /**
+   * "blocked": the sandbox canary also verifies (does not itself enforce —
+   * bellows runs unprivileged and cannot set firewall rules) that the agent
+   * CANNOT reach the open internet: TCP connects to a fixed list of hosts
+   * (github.com, raw.githubusercontent.com, pypi.org — see
+   * DEFAULT_EGRESS_BLOCKED_HOSTS) must fail, run through the same
+   * Landlock-wrapped canary process as the filesystem probes. Requires
+   * `sandbox: "landlock"`. Default "unchecked" (current behavior: egress is
+   * never checked). See src/runner/sandbox.mjs and TUTORIAL.md — "Verifying
+   * egress is blocked".
+   */
+  sandboxEgress?: "unchecked" | "blocked";
+  /** "host:port" entries (e.g. the model API host) the egress canary must
+   *  confirm ARE reachable. Ignored when sandboxEgress is "unchecked". */
+  sandboxEgressAllow?: string[];
 }
 
 export interface WorkerConfig {
