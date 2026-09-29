@@ -216,13 +216,25 @@ script every time DNS changes), allows that pinned IP on the given port, and
 rejects everything else for the bench user (TCP reset, plus a full IPv6
 block). Re-running is safe — it rebuilds its chain from scratch each time, so
 adding a host or refreshing a rotated IP is just running it again: the
-resolution step always queries DNS directly (`getent -s dns`, bypassing
-`/etc/hosts`), so a re-run genuinely picks up a new edge IP instead of
-re-reading back the pin it wrote last time (2026-10-01 Fable re-review of
-#45, blocking note 2 — the earlier `getent ahostsv4` form checked
-`/etc/hosts` first per `nsswitch.conf`'s default order, so a re-run
-silently re-confirmed the stale pinned IP forever and this "refreshing a
-rotated IP" claim was false until fixed). Verify a
+resolution step always queries DNS directly, so a re-run genuinely picks up
+a new edge IP instead of re-reading back the pin it wrote last time
+(2026-10-01 Fable re-review of #45, blocking note 2 — the earlier `getent
+ahostsv4` form checked `/etc/hosts` first per `nsswitch.conf`'s default
+order, so a re-run silently re-confirmed the stale pinned IP forever and
+this "refreshing a rotated IP" claim was false until fixed). On a host
+running systemd-resolved (the real bench VMs' setup), plain `getent -s dns`
+turned out NOT to be enough either — resolved synthesizes an /etc/hosts
+answer itself, upstream of both getent's NSS ordering and resolved's own
+query cache, so `getent -s dns`, `dig @127.0.0.53`, and even `resolvectl
+query --cache=no` all still returned the stale pin in testing. Only
+`resolvectl query --synthesize=no` (which the script now uses whenever
+resolved is the active resolver, falling back to `getent -s dns` only when
+resolved ISN'T active — 2026-10-02 Fable re-review of #45 round 3, blocking
+note 1) tells resolved to skip its own synthesis and actually reach out to
+DNS. When resolved IS active but its answer is empty, the script reports the
+host as unresolvable rather than falling back to `getent -s dns`: that
+fallback would just read back the exact same poisoned `/etc/hosts` pin this
+fix exists to bypass (2026-10-03 Fable re-review of #46, cheap note). Verify a
 sealed host without touching firewall rules — this probes AS the bench user
 (`sudo -u`), the same direction the per-run canary checks:
 
@@ -249,9 +261,38 @@ cannot, prove the allowlist has no other holes):
   resolves there and sends a different SNI. This is a real, known limitation
   of IP+port allowlisting against any shared CDN edge, not specific to any
   one provider.
-- **DNS still resolves.** The allowlist doesn't block UDP/TCP 53, so the
-  agent can still resolve arbitrary hostnames to IPs — it just (mostly)
-  can't *connect* to what it resolves, except via the gap above.
+- **DNS still resolves, and remains a theoretical tunnel channel.** The
+  allowlist doesn't block UDP/TCP 53, so the agent can still resolve
+  arbitrary hostnames to IPs — it just (mostly) can't *connect* to what it
+  resolves, except via the gap above. `--check` auto-allows systemd-resolved's
+  own stub listeners on `127.0.0.53:53` and `127.0.0.54:53` (resolved 255 on
+  stock Ubuntu 24.04 binds both — `DNSStubListenerExtra`) so a normal,
+  unmodified bench VM doesn't FAIL the loopback-listener check just for
+  running its own DNS stub (2026-10-03 Fable re-review of #46, cheap note) —
+  but only when the listening socket's own uid matches `id -u
+  systemd-resolve`. Address:port alone used to be enough, which meant a
+  rogue listener bound to the exact same stub address — root-owned or
+  otherwise — got waved through too; there is no excuse for trusting the
+  address alone once uid attribution is possible, and a same-address
+  listener with a mismatched (or undeterminable) owning uid now FAILs
+  (2026-10-04 Fable re-review of #46, blocker 2). The re-review's suggested
+  source for that uid — `ss -ltne`'s own `uid:` field — turned out not to
+  work: reproduced directly against a throwaway stock `ubuntu:24.04`
+  container (the real iproute2-6.1.0 that image ships), neither `ss -ltne`
+  nor `ss -ltnpe` ever printed a `uid:` token at all, for any socket, root's
+  own included, run as root. `ss`'s `-p` process attribution genuinely does
+  need elevated access to another uid's process (that part of the original
+  concern was real) — but the uid itself now comes from `/proc/net/tcp` and
+  `/proc/net/tcp6` directly instead: one flat, world-readable file per
+  family whose uid column the kernel populates from the socket's own owning
+  credentials, joined to each listener ss reports by its socket inode (`ss
+  -e`'s `ino:NNN`, which — unlike `uid:` — IS reliably present regardless of
+  privilege). This accepts, rather than overlooks, that arbitrary data can in
+  principle be smuggled out through query names to a cooperating
+  attacker-controlled nameserver — it cannot fetch actual repo contents or
+  reach an arbitrary TCP service without a cooperating server on the other
+  end, unlike the open-egress class of incident this script exists to
+  prevent.
 - The canary's fixed host list (and `--check`'s) is a spot-check, not a
   firewall audit — it catches "did today's incident's exact hosts get
   re-opened", not "is this allowlist airtight."
@@ -262,7 +303,9 @@ cannot, prove the allowlist has no other holes):
   listener (a forgotten local squid/mitm, tailscaled's SOCKS5 listener if it
   happens to bind to loopback, ...) — is reachable by the bench user
   regardless of the allowlist. `--check` lists loopback TCP listeners (`ss
-  -ltnp`) it can't attribute to the bench user itself and fails unless each
+  -ltnpe`, `-e` for each socket's inode, joined against /proc/net/tcp[6]'s
+  own uid column for its owner — see above) it can't attribute to
+  the bench user itself and fails unless each
   is explicitly accepted with `--allow-loopback host:port` (bracketed for
   IPv6 forms, e.g. `--allow-loopback [::]:22` for stock sshd's IPv6 listener
   alongside `--allow-loopback 0.0.0.0:22` for its IPv4 one). IPv6 itself gets
@@ -275,7 +318,35 @@ cannot, prove the allowlist has no other holes):
   -j ACCEPT` with no destination match, which is broader than "loopback":
   Linux routes a packet addressed to any of the host's own configured
   addresses over `lo`, not just `127.0.0.0/8`, so the old rule also admitted
-  traffic to the host's real eth0/Tailscale/docker0 addresses).
+  traffic to the host's real eth0/Tailscale/docker0 addresses). `--check`
+  verifies IPv6 is actually blocked separately from the loopback-listener
+  scan above: as root, structurally, via `ip6tables -C OUTPUT ... -j
+  REJECT` — note `-C` only checks that the rule is *present*, not where it
+  sits relative to any other rule already in `OUTPUT` (i.e. not precedence);
+  when not root, behaviorally instead, via a throwaway `[::1]` listener
+  (needs `node`) the bench user must fail to reach (2026-10-02 Fable
+  re-review of #45 round 3, blocking note 3) — that guard used to be gated on
+  `ip6tables` being on `PATH` even for the non-root case, so a non-root
+  invoker with a stripped PATH (cron's default, and Ubuntu's `login.defs`
+  `ENV_PATH`, both omit `/usr/sbin` where `ip6tables` lives) silently skipped
+  the behavioral check entirely and could PASS with IPv6 actually open
+  (reproduced and fixed, 2026-10-03 Fable re-review of #46, BLOCKER). Root
+  itself isn't exempt from that PATH gap either — root's own crontab PATH is
+  the same stripped `/usr/bin:/bin`, so root now tries `/usr/sbin/ip6tables`
+  and `/sbin/ip6tables` explicitly before giving up, and if `ip6tables` truly
+  can't be found anywhere, root falls through to the same behavioral `[::1]`
+  check instead of WARNing and silently PASSing (2026-10-04 Fable re-review
+  of #46, blocker 1). If the throwaway listener can't even bind `[::1]` at
+  all — `EADDRNOTAVAIL`/`EAFNOSUPPORT`/`ENETUNREACH`, the errno family a v6
+  bind gets when the kernel has no v6 addresses on that interface — that
+  alone is NOT enough to confirm IPv6 is blocked: it only proves loopback v6
+  specifically is gone, not that a routable global-scope v6 address doesn't
+  exist on some other interface (Fable reproduced a false PASS via a ULA
+  address elsewhere). The behavioral check now also requires `ip -6 addr
+  show scope global` to come back empty before treating the bind failure as
+  a confirmed block; if a global-scope address exists, or `ip` itself isn't
+  available to check, it's an inconclusive FAIL, not a silent PASS
+  (2026-10-04 Fable re-review of #46, cheap note).
 - **Rules do not survive a reboot.** The script only calls `iptables`/
   `ip6tables` directly — it does not persist rules (no
   iptables-persistent/netfilter-persistent integration, no systemd unit).
