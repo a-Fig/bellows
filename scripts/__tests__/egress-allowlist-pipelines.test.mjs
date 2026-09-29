@@ -79,6 +79,22 @@ const HOSTS_SED_FRAGMENT = extractBetween('sed -i -E "${hosts_line}', '" /etc/ho
 // open/timeout/refused/unreachable/error.
 const PROBE_TCP_CLASSIFY = extractBetween('  if [ "$rc" -eq 0 ]; then', "\n}", "probe_tcp classification if/elif chain");
 
+// resolve_ip()'s `resolvectl query -t A ... | awk '...'` A-record parser —
+// extracted from between `2>/dev/null | awk '` and `')" || true` (2026-10-03
+// Fable re-review of #46, cheap note: parse the address field properly
+// instead of grabbing the first dotted-quad on the whole line, which could
+// land inside a hostname or a CNAME target instead of the actual address).
+const RESOLVECTL_A_PARSER = extractBetween("2>/dev/null | awk '", "')\" || true", "resolve_ip resolvectl A-record parser awk");
+
+// check_ipv6_blocked()'s root-vs-non-root branch, including the `ip6tables`
+// on-PATH guard's placement — extracted from `check_ipv6_blocked() {` to the
+// function's own closing brace (2026-10-03 Fable re-review of #46,
+// BLOCKER: the guard used to run before the root/non-root branch, so a
+// non-root invoker with a PATH lacking /usr/sbin — cron's default, and
+// Ubuntu's login.defs ENV_PATH — never reached the behavioral fallback at
+// all and could silently PASS with IPv6 actually open).
+const CHECK_IPV6_BLOCKED = extractBetween("check_ipv6_blocked() {", "\n}", "check_ipv6_blocked (ip6tables guard placement)");
+
 function runBash(cmd, input) {
   const r = spawnSync("bash", ["-c", cmd], { input, encoding: "utf8" });
   if (r.error) throw r.error;
@@ -236,6 +252,110 @@ describe.skipIf(!HAS_BASH)("egress-allowlist.sh shell pipelines (extracted from 
 
     it("anything else is inconclusive 'error', never silently blocked", () => {
       expect(classify(1, "bash: connect: Operation not permitted", false)).toBe("error");
+    });
+  });
+
+  // 2026-10-03 Fable re-review of #46, cheap note: `resolvectl query -t A`
+  // prints `<name> IN <type> <address>  -- link: <iface>` per matched
+  // record — the owner NAME comes first (and can itself contain digits,
+  // e.g. a numeric subdomain) and a CNAME chain prints its own `IN CNAME
+  // <target>` line(s) ahead of the final `IN A` line(s). Filtering on
+  // `$3 == "A"` (not "the first dotted-quad anywhere in the output") is
+  // required so a CNAME target or a digit-bearing hostname can never be
+  // mistaken for the address.
+  describe("resolve_ip's resolvectl -t A output parser awk", () => {
+    function parse(resolvectlOutput) {
+      const r = runBash(`awk '${RESOLVECTL_A_PARSER}'`, resolvectlOutput);
+      expect(r.status).toBe(0);
+      return r.stdout.trim();
+    }
+
+    it("parses a single A record", () => {
+      expect(parse("example.com IN A 104.20.23.154                              -- link: eth0\n")).toBe("104.20.23.154");
+    });
+
+    it("takes the first A record when there are several", () => {
+      const out = ["example.com IN A 104.20.23.154 -- link: eth0", "example.com IN A 104.20.23.155 -- link: eth0", ""].join("\n");
+      expect(parse(out)).toBe("104.20.23.154");
+    });
+
+    it("skips CNAME line(s) and picks the final A record's address, not text from the CNAME target hostname", () => {
+      const out = ["foo.example.com IN CNAME bar-104.example.net -- link: eth0", "bar-104.example.net IN A 93.184.216.34 -- link: eth0", ""].join("\n");
+      expect(parse(out)).toBe("93.184.216.34");
+    });
+
+    it("does not mistake digits inside the owner hostname for the address", () => {
+      expect(parse("s3.example.com IN A 1.2.3.4 -- link: eth0\n")).toBe("1.2.3.4");
+    });
+
+    it("produces nothing on empty/error output", () => {
+      expect(parse("")).toBe("");
+    });
+  });
+
+  // 2026-10-03 Fable re-review of #46, BLOCKER (reproduced: with the v6
+  // REJECT rule deleted, `--check` as non-root with a PATH lacking
+  // /usr/sbin printed the ip6tables-missing WARN, then PASS, exit 0). The
+  // guard now only applies inside the root branch; non-root must always
+  // reach the behavioral fallback regardless of whether ip6tables happens
+  // to be on PATH.
+  describe("check_ipv6_blocked's root-vs-non-root branch (ip6tables guard placement)", () => {
+    function run({ uid, ip6tablesOnPath, ruleFound, behavioralRc = 0 }) {
+      const script = `
+UID_N=1001
+BENCH_USER=bench
+id() { echo ${uid}; }
+command() {
+  if [ "\${1:-}" = "-v" ] && [ "\${2:-}" = "ip6tables" ]; then
+    ${ip6tablesOnPath ? "return 0" : "return 1"}
+  fi
+  builtin command "$@"
+}
+ip6tables() { ${ruleFound ? "return 0" : "return 1"}; }
+check_ipv6_loopback_behavioral() { echo "BEHAVIORAL_CALLED"; return ${behavioralRc}; }
+check_ipv6_blocked() {
+${CHECK_IPV6_BLOCKED}
+}
+check_ipv6_blocked
+echo "RC:$?"
+`;
+      const r = runBash(script);
+      expect(r.status).toBe(0);
+      return r.stdout;
+    }
+
+    it("root, ip6tables missing from PATH: WARNs and passes (0) WITHOUT ever falling through to the behavioral check", () => {
+      const out = run({ uid: 0, ip6tablesOnPath: false, ruleFound: true });
+      expect(out).toContain("WARN");
+      expect(out).not.toContain("BEHAVIORAL_CALLED");
+      expect(out).toContain("RC:0");
+    });
+
+    it("root, ip6tables present, rule present: ok, RC 0", () => {
+      const out = run({ uid: 0, ip6tablesOnPath: true, ruleFound: true });
+      expect(out).toContain("ok:");
+      expect(out).not.toContain("BEHAVIORAL_CALLED");
+      expect(out).toContain("RC:0");
+    });
+
+    it("root, ip6tables present, rule absent: FAIL, RC 1", () => {
+      const out = run({ uid: 0, ip6tablesOnPath: true, ruleFound: false });
+      expect(out).toContain("FAIL");
+      expect(out).not.toContain("BEHAVIORAL_CALLED");
+      expect(out).toContain("RC:1");
+    });
+
+    it("non-root, ip6tables missing from PATH (the reproduced regression): reaches the behavioral fallback, never WARNs/PASSes on its own", () => {
+      const out = run({ uid: 1001, ip6tablesOnPath: false, ruleFound: true, behavioralRc: 1 });
+      expect(out).toContain("BEHAVIORAL_CALLED");
+      expect(out).not.toContain("WARN");
+      expect(out).toContain("RC:1");
+    });
+
+    it("non-root, ip6tables present on PATH too: still reaches the behavioral fallback (root-ness gates the branch, not tool availability)", () => {
+      const out = run({ uid: 1001, ip6tablesOnPath: true, ruleFound: true, behavioralRc: 0 });
+      expect(out).toContain("BEHAVIORAL_CALLED");
+      expect(out).toContain("RC:0");
     });
   });
 });

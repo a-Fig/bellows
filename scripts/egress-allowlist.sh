@@ -198,16 +198,26 @@ Usage:
                        itself were somehow neutralized) are blocked, every
                        --allow host is reachable (probed AS the bench user
                        via sudo -u, or directly if you already are that
-                       user), no unexpected loopback listener exists, and
-                       that IPv6 is actually blocked for the bench uid: as
-                       root, structurally (`ip6tables -C OUTPUT ... -j
+                       user), no unexpected loopback listener exists (systemd-
+                       resolved's own stub listeners on 127.0.0.53:53 and
+                       127.0.0.54:53 are pre-allowed — DNS itself stays open
+                       for the bench user and remains a theoretical tunnel
+                       channel; it cannot fetch repo contents or reach an
+                       arbitrary TCP service without a cooperating server),
+                       and that IPv6 is actually blocked for the bench uid:
+                       as root, structurally (`ip6tables -C OUTPUT ... -j
                        REJECT` — checks the rule is PRESENT, not where it
                        sits relative to any other OUTPUT rule, i.e. not
-                       precedence); when not root (no access to ip6tables'
-                       own rule set), behaviorally instead, by opening a
-                       throwaway [::1] listener and confirming the bench
-                       user can't reach it (needs `node`) — either way a
-                       FAIL, not a silent PASS, if it can't be confirmed.
+                       precedence); when not root, behaviorally instead
+                       (this branch no longer depends on `ip6tables` being on
+                       PATH at all, which cron's/login.defs' default PATH
+                       omits), by opening a throwaway [::1] listener and
+                       confirming the bench user can't reach it (needs
+                       `node`) — a bind failure on the listener itself with
+                       EADDRNOTAVAIL/EAFNOSUPPORT/ENETUNREACH (no v6 address
+                       available at all, e.g. disable_ipv6=1) also counts as
+                       confirmed-blocked. Either way a FAIL, not a silent
+                       PASS, if it can't be confirmed.
                        Requires root, to already BE --user, or passwordless
                        sudo to --user — exits 2 (not a PASS) if none of those
                        can be confirmed, rather than silently reporting
@@ -254,8 +264,25 @@ done
 # systemd-resolved's stub resolver is a loopback listener BY DESIGN (see
 # header comment) — always accepted so a normal host doesn't need
 # --allow-loopback just to pass the check that the header itself describes as
-# expected.
-ALLOW_LOOPBACK+=("127.0.0.53:53")
+# expected. resolved 255 (stock Ubuntu 24.04) binds BOTH 127.0.0.53:53 (the
+# stub) AND 127.0.0.54:53 (its own DNSStubListenerExtra) — without both
+# pre-seeded, --check FAILs on every unmodified 24.04 VM, which isn't a real
+# egress gap, it's just resolved itself (2026-10-03 Fable re-review of #46,
+# cheap note). Accepted by fixed address, matching the existing 127.0.0.53
+# precedent, not by verifying the listening process's uid actually is
+# systemd-resolve's — `ss -ltnp` run as a non-root bench user (the common
+# --check case) generally can't attribute a PID/uid it doesn't own at all, so
+# an owner-uid gate here would just silently stop matching in exactly the
+# case this fix exists for.
+#
+# Accepting DNS to these two addresses does mean DNS itself remains a
+# theoretical tunnel/exfil channel for the bench user (arbitrary data can be
+# smuggled inside query names to a cooperating attacker-controlled
+# nameserver). That's accepted, not overlooked: it cannot fetch actual repo
+# contents or reach an arbitrary TCP service without a cooperating server on
+# the other end, unlike the open-egress class of incident this script exists
+# to prevent.
+ALLOW_LOOPBACK+=("127.0.0.53:53" "127.0.0.54:53")
 
 [ -n "$BENCH_USER" ] || usage
 id -u "$BENCH_USER" >/dev/null 2>&1 || {
@@ -332,21 +359,41 @@ resolve_ip() {
   # actually running): a poisoned /etc/hosts entry was correctly bypassed by
   # `--synthesize=no` and returned the genuine DNS answer.
   #
-  # Falls back to the round-2 `getent -s dns ahostsv4` form when resolvectl
-  # isn't available or resolved isn't the active resolver (resolved_active
-  # above) — that form is still correct there, since without resolved's own
-  # synthesis layer in the picture, bypassing NSS `files` is sufficient.
-  # `|| true` (and the outer `|| true` on the resolvectl attempt) keeps a
-  # resolution failure from tripping `set -e`/`pipefail` on the caller's
+  # Falls back to the round-2 `getent -s dns ahostsv4` form ONLY when
+  # resolved isn't the active resolver (resolved_active above) — NOT merely
+  # whenever resolvectl's answer is empty (2026-10-03 Fable re-review of #46,
+  # cheap note): when resolved genuinely IS active but returns nothing for
+  # this host, falling through to getent would just read the exact same
+  # poisoned /etc/hosts pin item 1 above exists to bypass — getent's `-s dns`
+  # only reorders NSS `files` vs `dns`, it doesn't touch resolved's own
+  # synthesis layer, so it "succeeds" by returning the poisoned entry right
+  # when we most need it to fail instead. An empty resolvectl answer while
+  # resolved is active is therefore a genuine resolution failure, reported as
+  # such (empty output), not silently papered over by a weaker fallback path.
+  #
+  # Output parsing: `resolvectl query -t A` prints one line per matched
+  # record as `<name> IN <type> <address>  -- link: <iface>` — filtering on
+  # `$3 == "A"` (not "grab the first dotted-quad on the line") is required
+  # because the owner NAME comes first and can itself contain digits (e.g.
+  # `s3.example.com`), and because a CNAME chain prints its own `IN CNAME
+  # <target>` line(s) ahead of the final `IN A` line(s) — taking the first
+  # raw digit-group on the whole blob could match inside a CNAME line's
+  # hostname instead of the actual address. `exit` after the first `A` match
+  # deliberately picks just one address when a host has multiple A records,
+  # consistent with this function's "one hostname -> one pinned IPv4" contract
+  # (see the header comment above this function).
+  #
+  # `|| true` on the resolvectl attempt keeps a resolution failure (rc != 0,
+  # e.g. NXDOMAIN) from tripping `set -e`/`pipefail` on the caller's
   # `ip="$(resolve_ip "$host")"` — the empty-result case is handled
   # explicitly by the caller instead.
   local host="$1" ip=""
   if resolved_active; then
-    ip="$(resolvectl query --synthesize=no --legend=no -t A "$host" 2>/dev/null | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' | head -n1)" || true
+    ip="$(resolvectl query --synthesize=no --legend=no -t A "$host" 2>/dev/null | awk '$3 == "A" { print $4; exit }')" || true
+    printf '%s\n' "$ip"
+    return 0
   fi
-  if [ -z "$ip" ]; then
-    ip="$({ getent -s dns ahostsv4 "$host" 2>/dev/null || true; } | awk '{print $1; exit}')"
-  fi
+  ip="$({ getent -s dns ahostsv4 "$host" 2>/dev/null || true; } | awk '{print $1; exit}')"
   printf '%s\n' "$ip"
 }
 
@@ -624,11 +671,24 @@ check_loopback_listeners() {
 # to act as that listener since bash's own /dev/tcp can only connect, never
 # listen.
 check_ipv6_blocked() {
-  if ! command -v ip6tables >/dev/null 2>&1; then
-    echo "  WARN: 'ip6tables' not found — cannot structurally verify IPv6 is blocked (relying on the literal IPv6 probe above only)"
-    return 0
-  fi
+  # (2026-10-03 Fable re-review of #46, BLOCKER): the `command -v ip6tables`
+  # guard used to run unconditionally, BEFORE the root-vs-non-root branch
+  # below. `ip6tables` normally lives in /usr/sbin, which cron's default PATH
+  # (and Ubuntu's ENV_PATH in /etc/login.defs) does NOT include — so a
+  # non-root invoker with a stripped-down PATH would hit this guard, print
+  # the WARN, and `return 0` before ever reaching
+  # check_ipv6_loopback_behavioral below, silently skipping the behavioral
+  # check entirely. Reproduced: with the v6 REJECT rule deleted, `--check` as
+  # non-root with PATH=/usr/bin:/bin printed the WARN, then PASS, exit 0 —
+  # fail-open on exactly the regression this function exists to catch. The
+  # guard is only relevant to the ROOT (structural) path — the non-root
+  # behavioral fallback never touches ip6tables at all — so it now lives
+  # inside that branch only.
   if [ "$(id -u)" = "0" ]; then
+    if ! command -v ip6tables >/dev/null 2>&1; then
+      echo "  WARN: 'ip6tables' not found — cannot structurally verify IPv6 is blocked (relying on the literal IPv6 probe above only)"
+      return 0
+    fi
     if ip6tables -C OUTPUT -m owner --uid-owner "$UID_N" -j REJECT 2>/dev/null; then
       echo "  ok:   ip6tables OUTPUT REJECT rule for uid $UID_N is present"
       return 0
@@ -653,35 +713,76 @@ check_ipv6_blocked() {
 # verifying IPv6 is blocked is itself one of the two blocking checks from
 # round 2, so silently passing on "couldn't tell" is exactly the fail-open
 # gap this function exists to close.
+#
+# (2026-10-03 Fable re-review of #46, cheap notes):
+#   - The listener used to self-exit after a flat 6s, and "refused" from
+#     probe_tcp is indistinguishable from "nothing is listening at all" — a
+#     slow `sudo -n -u $BENCH_USER` hop (PAM/NSS overhead) could let the
+#     listener tear itself down mid-probe, turning a stale-address
+#     "connection refused" into a false "ok: blocked". The listener now
+#     lives 20s (was 6s) and its pid is `kill -0`-checked both immediately
+#     before AND immediately after probe_tcp runs, so a listener that died
+#     early (rather than the bench uid genuinely being rejected) is a FAIL,
+#     not a silent ok.
+#   - node failing to bind [::1] at all is no longer automatically a FAIL: if
+#     the bind itself fails with EADDRNOTAVAIL/EAFNOSUPPORT/ENETUNREACH — the
+#     errno family a v6 bind gets when the kernel has no v6 addresses at all
+#     (e.g. `net.ipv6.conf.all.disable_ipv6=1`) — that IS a valid,
+#     behaviorally-confirmed "IPv6 is blocked" signal in its own right (there
+#     is categorically no way to reach anything over v6 if nothing can even
+#     bind a v6 socket), matching probe_tcp's own EADDRNOTAVAIL-for-v6
+#     classification above. Any OTHER bind failure (permission, unexpected
+#     errno) still FAILs, since it says nothing about whether v6 is actually
+#     blocked.
 check_ipv6_loopback_behavioral() {
   if ! command -v node >/dev/null 2>&1; then
     echo "  FAIL: not root and 'node' not found — cannot verify IPv6 is blocked for $BENCH_USER either structurally (needs root) or behaviorally (needs node for a throwaway [::1] listener); this is NOT confirmed as blocked"
     return 1
   fi
-  local tmpport port="" waited=0 node_pid result
-  tmpport="$(mktemp)"
+  local tmpfile status="" port="" waited=0 node_pid result
+  tmpfile="$(mktemp)"
   node -e '
     const net = require("net");
     const fs = require("fs");
+    const out = process.argv[1];
+    const write = (s) => { try { fs.writeFileSync(out, s); } catch (e) {} };
     const srv = net.createServer((sock) => sock.destroy());
-    srv.on("error", () => process.exit(1));
-    srv.listen(0, "::1", () => { fs.writeFileSync(process.argv[1], String(srv.address().port)); });
-    setTimeout(() => { try { srv.close(); } catch (e) {} process.exit(0); }, 6000);
-  ' "$tmpport" >/dev/null 2>&1 &
+    srv.on("error", (err) => { write("ERR:" + (err && err.code ? err.code : "UNKNOWN")); process.exit(1); });
+    srv.listen(0, "::1", () => { write("PORT:" + srv.address().port); });
+    setTimeout(() => { try { srv.close(); } catch (e) {} process.exit(0); }, 20000);
+  ' "$tmpfile" >/dev/null 2>&1 &
   node_pid=$!
-  while [ -z "$port" ] && [ "$waited" -lt 30 ]; do
-    port="$(cat "$tmpport" 2>/dev/null)"
-    [ -n "$port" ] && break
+  while [ -z "$status" ] && [ "$waited" -lt 50 ]; do
+    status="$(cat "$tmpfile" 2>/dev/null)"
+    [ -n "$status" ] && break
     sleep 0.1
     waited=$((waited + 1))
   done
-  rm -f "$tmpport"
-  if [ -z "$port" ]; then
-    echo "  FAIL: could not start a throwaway [::1] listener (node failed to bind — possibly IPv6 is disabled system-wide, not just for $BENCH_USER) — cannot verify IPv6 is blocked for $BENCH_USER behaviorally; this is NOT confirmed as blocked"
-    kill "$node_pid" 2>/dev/null || true
+  rm -f "$tmpfile"
+  case "$status" in
+    PORT:*)
+      port="${status#PORT:}"
+      ;;
+    ERR:EADDRNOTAVAIL | ERR:EAFNOSUPPORT | ERR:ENETUNREACH)
+      echo "  ok:   could not bind a [::1] listener ($status) — no v6 address is available to bind at all, which itself confirms IPv6 is blocked (behavioral check; not root, so no structural guarantee)"
+      kill "$node_pid" 2>/dev/null || true
+      return 0
+      ;;
+    *)
+      echo "  FAIL: could not start a throwaway [::1] listener (${status:-node gave no response within timeout}) — cannot verify IPv6 is blocked for $BENCH_USER behaviorally; this is NOT confirmed as blocked"
+      kill "$node_pid" 2>/dev/null || true
+      return 1
+      ;;
+  esac
+  if ! kill -0 "$node_pid" 2>/dev/null; then
+    echo "  FAIL: throwaway [::1]:$port listener (pid $node_pid) was already gone before it could be probed — cannot verify IPv6 is blocked for $BENCH_USER behaviorally; this is NOT confirmed as blocked"
     return 1
   fi
   result="$(probe_tcp "::1" "$port")"
+  if ! kill -0 "$node_pid" 2>/dev/null; then
+    echo "  FAIL: throwaway [::1]:$port listener (pid $node_pid) died during the probe — a 'refused'/'unreachable' result here is indistinguishable from 'nothing was listening' and cannot be trusted as a real block; this is NOT confirmed as blocked"
+    return 1
+  fi
   kill "$node_pid" 2>/dev/null || true
   case "$result" in
     refused | unreachable)

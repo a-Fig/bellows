@@ -228,9 +228,13 @@ answer itself, upstream of both getent's NSS ordering and resolved's own
 query cache, so `getent -s dns`, `dig @127.0.0.53`, and even `resolvectl
 query --cache=no` all still returned the stale pin in testing. Only
 `resolvectl query --synthesize=no` (which the script now uses whenever
-resolved is the active resolver, falling back to `getent -s dns` otherwise —
-2026-10-02 Fable re-review of #45 round 3, blocking note 1) tells resolved
-to skip its own synthesis and actually reach out to DNS. Verify a
+resolved is the active resolver, falling back to `getent -s dns` only when
+resolved ISN'T active — 2026-10-02 Fable re-review of #45 round 3, blocking
+note 1) tells resolved to skip its own synthesis and actually reach out to
+DNS. When resolved IS active but its answer is empty, the script reports the
+host as unresolvable rather than falling back to `getent -s dns`: that
+fallback would just read back the exact same poisoned `/etc/hosts` pin this
+fix exists to bypass (2026-10-03 Fable re-review of #46, cheap note). Verify a
 sealed host without touching firewall rules — this probes AS the bench user
 (`sudo -u`), the same direction the per-run canary checks:
 
@@ -257,9 +261,20 @@ cannot, prove the allowlist has no other holes):
   resolves there and sends a different SNI. This is a real, known limitation
   of IP+port allowlisting against any shared CDN edge, not specific to any
   one provider.
-- **DNS still resolves.** The allowlist doesn't block UDP/TCP 53, so the
-  agent can still resolve arbitrary hostnames to IPs — it just (mostly)
-  can't *connect* to what it resolves, except via the gap above.
+- **DNS still resolves, and remains a theoretical tunnel channel.** The
+  allowlist doesn't block UDP/TCP 53, so the agent can still resolve
+  arbitrary hostnames to IPs — it just (mostly) can't *connect* to what it
+  resolves, except via the gap above. `--check` pre-allows systemd-resolved's
+  own stub listeners on `127.0.0.53:53` and `127.0.0.54:53` (resolved 255 on
+  stock Ubuntu 24.04 binds both — `DNSStubListenerExtra`) by fixed address so
+  a normal, unmodified bench VM doesn't FAIL the loopback-listener check just
+  for running its own DNS stub (2026-10-03 Fable re-review of #46, cheap
+  note). This accepts, rather than overlooks, that arbitrary data can in
+  principle be smuggled out through query names to a cooperating
+  attacker-controlled nameserver — it cannot fetch actual repo contents or
+  reach an arbitrary TCP service without a cooperating server on the other
+  end, unlike the open-egress class of incident this script exists to
+  prevent.
 - The canary's fixed host list (and `--check`'s) is a spot-check, not a
   firewall audit — it catches "did today's incident's exact hosts get
   re-opened", not "is this allowlist airtight."
@@ -290,7 +305,20 @@ cannot, prove the allowlist has no other holes):
   sits relative to any other rule already in `OUTPUT` (i.e. not precedence);
   when not root, behaviorally instead, via a throwaway `[::1]` listener
   (needs `node`) the bench user must fail to reach (2026-10-02 Fable
-  re-review of #45 round 3, blocking note 3).
+  re-review of #45 round 3, blocking note 3) — that guard used to be gated on
+  `ip6tables` being on `PATH` even for the non-root case, so a non-root
+  invoker with a stripped PATH (cron's default, and Ubuntu's `login.defs`
+  `ENV_PATH`, both omit `/usr/sbin` where `ip6tables` lives) silently skipped
+  the behavioral check entirely and could PASS with IPv6 actually open
+  (reproduced and fixed, 2026-10-03 Fable re-review of #46, BLOCKER). If the
+  throwaway listener can't even bind `[::1]` at all — `EADDRNOTAVAIL`/
+  `EAFNOSUPPORT`/`ENETUNREACH`, the errno family a v6 bind gets when the
+  kernel has no v6 addresses (`net.ipv6.conf.all.disable_ipv6=1`) — that
+  itself counts as a confirmed block rather than an inconclusive FAIL: there
+  is no way to reach anything over v6 if nothing can even bind a v6 socket,
+  so a non-root `--check` can now correctly PASS on a host with IPv6 fully
+  disabled at the kernel level, not just one with an ip6tables rule
+  (2026-10-03 Fable re-review of #46, cheap note).
 - **Rules do not survive a reboot.** The script only calls `iptables`/
   `ip6tables` directly — it does not persist rules (no
   iptables-persistent/netfilter-persistent integration, no systemd unit).
