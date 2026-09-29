@@ -264,12 +264,30 @@ cannot, prove the allowlist has no other holes):
 - **DNS still resolves, and remains a theoretical tunnel channel.** The
   allowlist doesn't block UDP/TCP 53, so the agent can still resolve
   arbitrary hostnames to IPs — it just (mostly) can't *connect* to what it
-  resolves, except via the gap above. `--check` pre-allows systemd-resolved's
+  resolves, except via the gap above. `--check` auto-allows systemd-resolved's
   own stub listeners on `127.0.0.53:53` and `127.0.0.54:53` (resolved 255 on
-  stock Ubuntu 24.04 binds both — `DNSStubListenerExtra`) by fixed address so
-  a normal, unmodified bench VM doesn't FAIL the loopback-listener check just
-  for running its own DNS stub (2026-10-03 Fable re-review of #46, cheap
-  note). This accepts, rather than overlooks, that arbitrary data can in
+  stock Ubuntu 24.04 binds both — `DNSStubListenerExtra`) so a normal,
+  unmodified bench VM doesn't FAIL the loopback-listener check just for
+  running its own DNS stub (2026-10-03 Fable re-review of #46, cheap note) —
+  but only when the listening socket's own uid matches `id -u
+  systemd-resolve`. Address:port alone used to be enough, which meant a
+  rogue listener bound to the exact same stub address — root-owned or
+  otherwise — got waved through too; there is no excuse for trusting the
+  address alone once uid attribution is possible, and a same-address
+  listener with a mismatched (or undeterminable) owning uid now FAILs
+  (2026-10-04 Fable re-review of #46, blocker 2). The re-review's suggested
+  source for that uid — `ss -ltne`'s own `uid:` field — turned out not to
+  work: reproduced directly against a throwaway stock `ubuntu:24.04`
+  container (the real iproute2-6.1.0 that image ships), neither `ss -ltne`
+  nor `ss -ltnpe` ever printed a `uid:` token at all, for any socket, root's
+  own included, run as root. `ss`'s `-p` process attribution genuinely does
+  need elevated access to another uid's process (that part of the original
+  concern was real) — but the uid itself now comes from `/proc/net/tcp` and
+  `/proc/net/tcp6` directly instead: one flat, world-readable file per
+  family whose uid column the kernel populates from the socket's own owning
+  credentials, joined to each listener ss reports by its socket inode (`ss
+  -e`'s `ino:NNN`, which — unlike `uid:` — IS reliably present regardless of
+  privilege). This accepts, rather than overlooks, that arbitrary data can in
   principle be smuggled out through query names to a cooperating
   attacker-controlled nameserver — it cannot fetch actual repo contents or
   reach an arbitrary TCP service without a cooperating server on the other
@@ -285,7 +303,9 @@ cannot, prove the allowlist has no other holes):
   listener (a forgotten local squid/mitm, tailscaled's SOCKS5 listener if it
   happens to bind to loopback, ...) — is reachable by the bench user
   regardless of the allowlist. `--check` lists loopback TCP listeners (`ss
-  -ltnp`) it can't attribute to the bench user itself and fails unless each
+  -ltnpe`, `-e` for each socket's inode, joined against /proc/net/tcp[6]'s
+  own uid column for its owner — see above) it can't attribute to
+  the bench user itself and fails unless each
   is explicitly accepted with `--allow-loopback host:port` (bracketed for
   IPv6 forms, e.g. `--allow-loopback [::]:22` for stock sshd's IPv6 listener
   alongside `--allow-loopback 0.0.0.0:22` for its IPv4 one). IPv6 itself gets
@@ -310,15 +330,23 @@ cannot, prove the allowlist has no other holes):
   invoker with a stripped PATH (cron's default, and Ubuntu's `login.defs`
   `ENV_PATH`, both omit `/usr/sbin` where `ip6tables` lives) silently skipped
   the behavioral check entirely and could PASS with IPv6 actually open
-  (reproduced and fixed, 2026-10-03 Fable re-review of #46, BLOCKER). If the
-  throwaway listener can't even bind `[::1]` at all — `EADDRNOTAVAIL`/
-  `EAFNOSUPPORT`/`ENETUNREACH`, the errno family a v6 bind gets when the
-  kernel has no v6 addresses (`net.ipv6.conf.all.disable_ipv6=1`) — that
-  itself counts as a confirmed block rather than an inconclusive FAIL: there
-  is no way to reach anything over v6 if nothing can even bind a v6 socket,
-  so a non-root `--check` can now correctly PASS on a host with IPv6 fully
-  disabled at the kernel level, not just one with an ip6tables rule
-  (2026-10-03 Fable re-review of #46, cheap note).
+  (reproduced and fixed, 2026-10-03 Fable re-review of #46, BLOCKER). Root
+  itself isn't exempt from that PATH gap either — root's own crontab PATH is
+  the same stripped `/usr/bin:/bin`, so root now tries `/usr/sbin/ip6tables`
+  and `/sbin/ip6tables` explicitly before giving up, and if `ip6tables` truly
+  can't be found anywhere, root falls through to the same behavioral `[::1]`
+  check instead of WARNing and silently PASSing (2026-10-04 Fable re-review
+  of #46, blocker 1). If the throwaway listener can't even bind `[::1]` at
+  all — `EADDRNOTAVAIL`/`EAFNOSUPPORT`/`ENETUNREACH`, the errno family a v6
+  bind gets when the kernel has no v6 addresses on that interface — that
+  alone is NOT enough to confirm IPv6 is blocked: it only proves loopback v6
+  specifically is gone, not that a routable global-scope v6 address doesn't
+  exist on some other interface (Fable reproduced a false PASS via a ULA
+  address elsewhere). The behavioral check now also requires `ip -6 addr
+  show scope global` to come back empty before treating the bind failure as
+  a confirmed block; if a global-scope address exists, or `ip` itself isn't
+  available to check, it's an inconclusive FAIL, not a silent PASS
+  (2026-10-04 Fable re-review of #46, cheap note).
 - **Rules do not survive a reboot.** The script only calls `iptables`/
   `ip6tables` directly — it does not persist rules (no
   iptables-persistent/netfilter-persistent integration, no systemd unit).

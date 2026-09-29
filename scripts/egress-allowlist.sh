@@ -201,24 +201,35 @@ Usage:
                        via sudo -u, or directly if you already are that
                        user), no unexpected loopback listener exists (systemd-
                        resolved's own stub listeners on 127.0.0.53:53 and
-                       127.0.0.54:53 are pre-allowed — DNS itself stays open
-                       for the bench user and remains a theoretical tunnel
-                       channel; it cannot fetch repo contents or reach an
-                       arbitrary TCP service without a cooperating server),
-                       and that IPv6 is actually blocked for the bench uid:
-                       as root, structurally (`ip6tables -C OUTPUT ... -j
-                       REJECT` — checks the rule is PRESENT, not where it
-                       sits relative to any other OUTPUT rule, i.e. not
-                       precedence); when not root, behaviorally instead
-                       (this branch no longer depends on `ip6tables` being on
-                       PATH at all, which cron's/login.defs' default PATH
-                       omits), by opening a throwaway [::1] listener and
+                       127.0.0.54:53 are auto-allowed ONLY when the listening
+                       socket's own uid — joined by socket inode against
+                       /proc/net/tcp[6]'s own uid column, world-readable and
+                       confirmed privilege-independent (ss's own uid:/pid=
+                       attribution is NOT trusted here — see check_loopback_
+                       listeners' header comment) — matches `id -u systemd-
+                       resolve`; a same-address rogue listener owned by
+                       anyone else, root included, FAILs; DNS itself
+                       stays open for the bench user and remains a
+                       theoretical tunnel channel; it cannot fetch repo
+                       contents or reach an arbitrary TCP service without a
+                       cooperating server), and that IPv6 is actually blocked
+                       for the bench uid: as root, structurally (`ip6tables
+                       -C OUTPUT ... -j REJECT` — checks the rule is
+                       PRESENT, not where it sits relative to any other
+                       OUTPUT rule, i.e. not precedence; root tries PATH,
+                       then /usr/sbin/ip6tables, then /sbin/ip6tables before
+                       giving up, since cron's/login.defs' default PATH
+                       omits /usr/sbin for root too); when not root, or when
+                       root can't find ip6tables anywhere, behaviorally
+                       instead, by opening a throwaway [::1] listener and
                        confirming the bench user can't reach it (needs
                        `node`) — a bind failure on the listener itself with
-                       EADDRNOTAVAIL/EAFNOSUPPORT/ENETUNREACH (no v6 address
-                       available at all, e.g. disable_ipv6=1) also counts as
-                       confirmed-blocked. Either way a FAIL, not a silent
-                       PASS, if it can't be confirmed.
+                       EADDRNOTAVAIL/EAFNOSUPPORT/ENETUNREACH only counts as
+                       confirmed-blocked if `ip -6 addr show scope global` is
+                       ALSO empty (a bind failure on ::1 alone just proves
+                       loopback v6 is gone, not that a routable v6 address
+                       doesn't exist on some other interface). Either way a
+                       FAIL, not a silent PASS, if it can't be confirmed.
                        Requires root, to already BE --user, or passwordless
                        sudo to --user — exits 2 (not a PASS) if none of those
                        can be confirmed, rather than silently reporting
@@ -280,18 +291,21 @@ while [ $# -gt 0 ]; do
 done
 
 # systemd-resolved's stub resolver is a loopback listener BY DESIGN (see
-# header comment) — always accepted so a normal host doesn't need
-# --allow-loopback just to pass the check that the header itself describes as
-# expected. resolved 255 (stock Ubuntu 24.04) binds BOTH 127.0.0.53:53 (the
-# stub) AND 127.0.0.54:53 (its own DNSStubListenerExtra) — without both
-# pre-seeded, --check FAILs on every unmodified 24.04 VM, which isn't a real
-# egress gap, it's just resolved itself (2026-10-03 Fable re-review of #46,
-# cheap note). Accepted by fixed address, matching the existing 127.0.0.53
-# precedent, not by verifying the listening process's uid actually is
-# systemd-resolve's — `ss -ltnp` run as a non-root bench user (the common
-# --check case) generally can't attribute a PID/uid it doesn't own at all, so
-# an owner-uid gate here would just silently stop matching in exactly the
-# case this fix exists for.
+# header comment) — accepted (when it's genuinely resolved's own process; see
+# check_loopback_listeners's systemd-resolve uid gate) so a normal host
+# doesn't need --allow-loopback just to pass the check that the header itself
+# describes as expected. resolved 255 (stock Ubuntu 24.04) binds BOTH
+# 127.0.0.53:53 (the stub) AND 127.0.0.54:53 (its own DNSStubListenerExtra).
+# NOT pre-seeded into ALLOW_LOOPBACK here — unlike an operator's own
+# --allow-loopback entries, which are trusted by address alone because a
+# human deliberately typed them, these two well-known addresses get their own
+# OWNER-VERIFIED auto-allow in check_loopback_listeners (keyed on
+# `id -u systemd-resolve`, joined by socket inode against /proc/net/tcp[6]'s
+# own uid column — not ss's own uid:/pid= attribution, which a direct
+# reproduction found unreliable; see that function's header comment), since a
+# blind address:port match would let a rogue listener — root-owned, say —
+# bound to the exact same address pass unflagged too (2026-10-04 Fable
+# re-review of #46, blocker 2).
 #
 # Accepting DNS to these two addresses does mean DNS itself remains a
 # theoretical tunnel/exfil channel for the bench user (arbitrary data can be
@@ -300,7 +314,6 @@ done
 # contents or reach an arbitrary TCP service without a cooperating server on
 # the other end, unlike the open-egress class of incident this script exists
 # to prevent.
-ALLOW_LOOPBACK+=("127.0.0.53:53" "127.0.0.54:53")
 
 [ -n "$BENCH_USER" ] || usage
 id -u "$BENCH_USER" >/dev/null 2>&1 || {
@@ -545,25 +558,63 @@ probe_tcp() {
 # on it), so any other process listening on 127.x/wildcard/dual-stack
 # ::ffff:127.x is a bypass invisible to every iptables rule this script
 # installs (e.g. tailscaled's SOCKS5 listener, a forgotten local squid/mitm).
-# Enumerates LISTEN-state sockets via `ss -ltnp`, attributes each to a uid
-# via its pid where the `Process` column is visible, and FAILS on anything
-# not owned by the bench user itself and not explicitly accepted via
-# --allow-loopback (systemd-resolved's own stub is pre-seeded into
-# ALLOW_LOOPBACK above). A socket whose owner can't be determined (ss/ps
-# couldn't attribute it — e.g. no permission to see another user's process)
-# is treated the same as "not the bench user": fails closed, since the whole
-# point is catching a listener the operator doesn't already know about
-# (2026-09-29 Fable re-review of #43, non-blocking note). FAILs (does NOT
-# degrade to a WARN) if `ss` isn't installed at all (2026-10-03 coordinator
-# review, pre-Fable: a skipped listener audit lets a loopback proxy on
-# 127.0.0.1 pass unnoticed — exactly the bypass this audit exists to catch;
-# `ss` ships in iproute2 on every stock Ubuntu, so this never fires on a
-# normal box). `--skip-listener-audit` is the explicit, loud escape hatch for
-# a host that genuinely can't have `ss` installed — anything less explicit
-# would silently reopen the same fail-open gap. Also FAILs (not silently "no
+# Enumerates LISTEN-state sockets via `ss -ltnpe` and FAILS on anything not
+# owned by the bench user itself and not explicitly accepted via
+# --allow-loopback. Owner attribution uses `-e`'s `uid:NNN` field, not a
+# `ps -o uid= -p $pid` round-trip through the pid the `Process` column gives
+# (2026-10-04 Fable re-review of #46, blocker 2 — an earlier version of this
+# comment claimed non-root couldn't attribute another user's socket at all,
+# and Fable's re-review said that was wrong because `ss -ltne`'s `uid:`
+# field is visible to non-root too. Reproduced directly against a throwaway
+# stock `ubuntu:24.04` container (iproute2-6.1.0, the actual version that
+# image ships) before trusting either claim: NEITHER `ss -ltne` NOR
+# `ss -ltnpe` ever printed a `uid:` token at all in that test, for ANY
+# socket — root's own included, run as root — even though the `ss` binary
+# itself contains a `"uid:%u"` format string, so it is not simply absent
+# from this build; something about how this ss gates printing it, on a
+# stock kernel, keeps it from ever firing. `-p`'s pid=/users:(...)
+# attribution DOES genuinely need elevated access to another uid's process
+# (confirmed too: it silently disappears, not just uid:, when a non-root
+# caller inspects another user's socket) — that part of the original
+# concern was real. Since neither ss flag can be trusted to hand back an
+# owning uid, this now reads it from `/proc/net/tcp`/`/proc/net/tcp6`
+# directly instead: one flat file per family, mode `-r--r--r--` (confirmed
+# world-readable, and confirmed to show the SAME uid for another user's
+# socket whether read as root or as a plain non-root user), whose uid column
+# is populated by the kernel from the socket's own owning credentials, not
+# by walking another process's /proc/$pid/. Each loopback listener ss finds
+# is joined to that column by its own socket inode — `ino:NNNNN`, which ss's
+# `-e` DOES reliably print for any socket regardless of privilege — rather
+# than by address:port, since the inode is an exact, unambiguous key for one
+# specific socket (see the inline comment on `build_inode_uid_map` below for
+# the exact field layout). A socket whose owning uid can't be determined at
+# all (no matching inode in either /proc/net/tcp file) is treated the same
+# as "not the bench user": fails closed, since the whole point is catching a
+# listener the operator doesn't already know about (2026-09-29 Fable
+# re-review of #43, non-blocking note). FAILs (does NOT degrade to a WARN)
+# if `ss` isn't installed at all (2026-10-03 coordinator review, pre-Fable: a
+# skipped listener audit lets a loopback proxy on 127.0.0.1 pass unnoticed —
+# exactly the bypass this audit exists to catch; `ss` ships in iproute2 on
+# every stock Ubuntu, so this never fires on a normal box).
+# `--skip-listener-audit` is the explicit, loud escape hatch for a host that
+# genuinely can't have `ss` installed — anything less explicit would
+# silently reopen the same fail-open gap. Also FAILs (not silently "no
 # listeners found") if `ss` IS installed but simply fails when run (wrong
 # permissions in some restricted context, a broken /proc, ...) — 2026-09-30
 # Fable re-review of #45, cheap note.
+#
+# systemd-resolved's stub listeners on 127.0.0.53:53 and 127.0.0.54:53
+# (resolved 255 on stock Ubuntu 24.04 binds both, via DNSStubListenerExtra)
+# get a DEDICATED owner-uid-gated auto-allow below, keyed on
+# `id -u systemd-resolve` — NOT a blind address:port entry in ALLOW_LOOPBACK
+# (2026-10-04 Fable re-review of #46, blocker 2: keying the earlier version
+# of this auto-allow on address:port alone meant a rogue listener — e.g.
+# root-owned — bound to the exact same stub address would pass unflagged and
+# be reachable by the bench user too; reproduced directly, see above). If
+# `systemd-resolve`'s uid can't be determined at all, the stub addresses get
+# NO auto-allow and fall through to the generic --allow-loopback/bench-uid
+# path below (i.e. FAIL unless explicitly --allow-loopback'd) — never
+# silently trusted.
 check_loopback_listeners() {
   if ! command -v ss >/dev/null 2>&1; then
     if $SKIP_LISTENER_AUDIT; then
@@ -574,14 +625,64 @@ check_loopback_listeners() {
     return 1
   fi
   local ss_out ss_status
-  if ! ss_out="$(ss -ltnp 2>/dev/null)"; then
+  if ! ss_out="$(ss -ltnpe 2>/dev/null)"; then
     ss_status=$?
-    echo "  FAIL: 'ss -ltnp' exited $ss_status — could not enumerate loopback listeners (NOT the same as zero listeners found; treating this as a check failure rather than a silent PASS)"
+    echo "  FAIL: 'ss -ltnpe' exited $ss_status — could not enumerate loopback listeners (NOT the same as zero listeners found; treating this as a check failure rather than a silent PASS)"
     return 1
   fi
-  local fail=0 hp pid owner_uid allowed entry
-  while IFS=$'\t' read -r hp pid; do
+  local systemd_resolve_uid
+  systemd_resolve_uid="$(id -u systemd-resolve 2>/dev/null)" || systemd_resolve_uid=""
+  # inode -> owning uid, read straight from /proc/net/tcp{,6}'s own uid
+  # column (2026-10-04 Fable re-review of #46, blocker 2 — see the header
+  # comment above this function for why ss's own uid:/pid= attribution is
+  # NOT used here). $PROC_NET_TCP/$PROC_NET_TCP6 default to the real /proc
+  # paths; overridable only so the in-repo test suite can point this at a
+  # synthetic fixture instead of the real kernel.
+  local -A INODE_UID=()
+  local proc_tcp_file proc_inode proc_uid
+  for proc_tcp_file in "${PROC_NET_TCP:-/proc/net/tcp}" "${PROC_NET_TCP6:-/proc/net/tcp6}"; do
+    [ -r "$proc_tcp_file" ] || continue
+    while read -r proc_inode proc_uid; do
+      [ -n "$proc_inode" ] || continue
+      INODE_UID["$proc_inode"]="$proc_uid"
+    done < <(awk 'NR > 1 { print $10, $8 }' "$proc_tcp_file" 2>/dev/null)
+  done
+  local fail=0 hp pid ino uid allowed entry
+  # `|`, not a tab, delimits the three fields below (2026-10-04 Fable
+  # re-review of #46, blocker 2, round 2 — reproduced directly: bash's
+  # `read` treats a tab as "IFS whitespace" and COLLAPSES a run of them —
+  # including an EMPTY field sitting between two tabs — no matter what
+  # single character IFS is actually set to, since that collapsing is keyed
+  # on the character itself being space/tab/newline, not on IFS's current
+  # value. With `hp\t\t2268472` — pid empty (ss could not attribute a
+  # process for another user's socket), ino non-empty — the empty pid field
+  # vanished and `ino`'s value silently landed in `$pid` instead, `$ino`
+  # itself coming out empty. `|` never appears in any of hp/pid/ino
+  # (host:port, a decimal pid, or a decimal inode) and, being ordinary IFS
+  # non-whitespace, does NOT collapse — confirmed empirically against both
+  # a comma and `|` before picking this.
+  while IFS='|' read -r hp pid ino; do
     [ -n "$hp" ] || continue
+    # An empty $ino (ss's own `ino:NNN` token missing from that line) must
+    # NOT be used as the associative-array subscript directly below --
+    # `${INODE_UID[$ino]}` with an empty $ino expands to the literal,
+    # invalid subscript `INODE_UID[]` and bash aborts the whole script with
+    # "bad array subscript" (reproduced against a real container run: some
+    # loopback lines genuinely lack an ino: token). Treat it the same as any
+    # other "uid could not be determined" case instead of crashing.
+    if [ -n "$ino" ]; then
+      uid="${INODE_UID[$ino]:-}"
+    else
+      uid=""
+    fi
+    if [ "$hp" = "127.0.0.53:53" ] || [ "$hp" = "127.0.0.54:53" ]; then
+      if [ -n "$systemd_resolve_uid" ] && [ -n "$uid" ] && [ "$uid" = "$systemd_resolve_uid" ]; then
+        continue
+      fi
+      echo "  FAIL: loopback listener $hp (pid ${pid:-unknown}, uid ${uid:-unknown}) is NOT owned by systemd-resolve (uid ${systemd_resolve_uid:-unknown}) — a rogue listener on systemd-resolved's own stub address is reachable by $BENCH_USER regardless of the allowlist"
+      fail=1
+      continue
+    fi
     allowed=false
     for entry in "${ALLOW_LOOPBACK[@]}"; do
       if [ "$entry" = "$hp" ]; then
@@ -592,19 +693,10 @@ check_loopback_listeners() {
     if $allowed; then
       continue
     fi
-    owner_uid=""
-    if [ -n "$pid" ]; then
-      # `|| true`: ps exits non-zero once the process is gone or unreadable
-      # (permission denied on another user's /proc entry) — under
-      # `pipefail`, that alone would make this bare assignment statement
-      # fail and, under `set -e`, abort the WHOLE script instead of just
-      # leaving owner_uid empty (treated as "unattributed" below).
-      owner_uid="$(ps -o uid= -p "$pid" 2>/dev/null | tr -d '[:space:]')" || true
-    fi
-    if [ -n "$owner_uid" ] && [ "$owner_uid" = "$UID_N" ]; then
+    if [ -n "$uid" ] && [ "$uid" = "$UID_N" ]; then
       continue
     fi
-    echo "  FAIL: loopback listener $hp (pid ${pid:-unknown}, uid ${owner_uid:-unknown}) is not $BENCH_USER's own process and is not in --allow-loopback — reachable by $BENCH_USER regardless of the allowlist"
+    echo "  FAIL: loopback listener $hp (pid ${pid:-unknown}, uid ${uid:-unknown}) is not $BENCH_USER's own process and is not in --allow-loopback — reachable by $BENCH_USER regardless of the allowlist"
     fail=1
   done < <(awk '
     $1 != "LISTEN" { next }
@@ -648,6 +740,15 @@ check_loopback_listeners() {
       if (!is_loop) next
       pid = ""
       if (match($0, /pid=[0-9]+/)) pid = substr($0, RSTART + 4, RLENGTH - 4)
+      # `-e` (extended socket info) appends an `ino:NNN` token to the line --
+      # this IS reliably present for any socket regardless of privilege
+      # (unlike a `uid:` token, which a direct reproduction against a stock
+      # ubuntu:24.04 container real iproute2 never printed at all, for any
+      # socket, root own included -- see the header comment above this
+      # function). The caller joins this inode against the /proc/net/tcp{,6}
+      # own uid column instead, which IS confirmed privilege-independent.
+      ino = ""
+      if (match($0, /ino:[0-9]+/)) ino = substr($0, RSTART + 4, RLENGTH - 4)
       # Reconstruct bracketed IPv6 notation ("[::]:22", not "::1:22" or a
       # bare "::22") for any host containing a colon, so the printed hp
       # matches the same bracketed host:port form --allow-loopback (and ss
@@ -657,7 +758,12 @@ check_loopback_listeners() {
       # --allow-loopback value (2026-09-30 Fable re-review of #45, cheap
       # note).
       hp = (host ~ /:/) ? "[" host "]:" port : host ":" port
-      printf "%s\t%s\n", hp, pid
+      # Fields below are delimited by a pipe character, not a tab -- see the
+      # comment on the while-read loop that consumes this output, above this
+      # awk pipeline, for why. No literal quote characters appear anywhere
+      # near the delimiter in this comment on purpose: an earlier draft
+      # broke out of this awk program own enclosing single quotes that way.
+      printf "%s|%s|%s\n", hp, pid, ino
     }
   ' <<<"$ss_out")
   return "$fail"
@@ -697,12 +803,12 @@ check_loopback_listeners() {
 # to act as that listener since bash's own /dev/tcp can only connect, never
 # listen.
 check_ipv6_blocked() {
-  # (2026-10-03 Fable re-review of #46, BLOCKER): the `command -v ip6tables`
-  # guard used to run unconditionally, BEFORE the root-vs-non-root branch
-  # below. `ip6tables` normally lives in /usr/sbin, which cron's default PATH
-  # (and Ubuntu's ENV_PATH in /etc/login.defs) does NOT include — so a
-  # non-root invoker with a stripped-down PATH would hit this guard, print
-  # the WARN, and `return 0` before ever reaching
+  # (2026-10-03 Fable re-review of #46, BLOCKER, closed): the
+  # `command -v ip6tables` guard used to run unconditionally, BEFORE the
+  # root-vs-non-root branch below. `ip6tables` normally lives in /usr/sbin,
+  # which cron's default PATH (and Ubuntu's ENV_PATH in /etc/login.defs)
+  # does NOT include — so a non-root invoker with a stripped-down PATH would
+  # hit this guard, print the WARN, and `return 0` before ever reaching
   # check_ipv6_loopback_behavioral below, silently skipping the behavioral
   # check entirely. Reproduced: with the v6 REJECT rule deleted, `--check` as
   # non-root with PATH=/usr/bin:/bin printed the WARN, then PASS, exit 0 —
@@ -710,17 +816,37 @@ check_ipv6_blocked() {
   # guard is only relevant to the ROOT (structural) path — the non-root
   # behavioral fallback never touches ip6tables at all — so it now lives
   # inside that branch only.
+  #
+  # (2026-10-04 Fable re-review of #46, BLOCKER): root's own crontab PATH is
+  # ALSO /usr/bin:/bin by default — the same PATH gap, but hitting the ROOT
+  # branch this time. The fix above only moved the guard, it didn't remove
+  # the underlying "not on PATH != not installed" assumption: `command -v`
+  # still WARNed and `return 0`d (PASS) as root with `[::1]` genuinely
+  # reachable. Root now explicitly tries the two paths ip6tables actually
+  # ships at (/usr/sbin, /sbin — covers Debian/Ubuntu's dpkg-installed
+  # location and the merged-/usr-less legacy one) before giving up, and if
+  # NEITHER is found, falls through to the SAME behavioral [::1] check
+  # non-root uses, instead of WARNing and returning 0 — root must never PASS
+  # this check without either a structural (ip6tables) or behavioral ([::1])
+  # confirmation.
   if [ "$(id -u)" = "0" ]; then
-    if ! command -v ip6tables >/dev/null 2>&1; then
-      echo "  WARN: 'ip6tables' not found — cannot structurally verify IPv6 is blocked (relying on the literal IPv6 probe above only)"
-      return 0
+    local ip6tables_bin=""
+    if command -v ip6tables >/dev/null 2>&1; then
+      ip6tables_bin="ip6tables"
+    elif [ -x /usr/sbin/ip6tables ]; then
+      ip6tables_bin="/usr/sbin/ip6tables"
+    elif [ -x /sbin/ip6tables ]; then
+      ip6tables_bin="/sbin/ip6tables"
     fi
-    if ip6tables -C OUTPUT -m owner --uid-owner "$UID_N" -j REJECT 2>/dev/null; then
-      echo "  ok:   ip6tables OUTPUT REJECT rule for uid $UID_N is present"
-      return 0
+    if [ -n "$ip6tables_bin" ]; then
+      if "$ip6tables_bin" -C OUTPUT -m owner --uid-owner "$UID_N" -j REJECT 2>/dev/null; then
+        echo "  ok:   ip6tables OUTPUT REJECT rule for uid $UID_N is present"
+        return 0
+      fi
+      echo "  FAIL: no ip6tables OUTPUT REJECT rule for uid $UID_N — IPv6 egress is NOT blocked for $BENCH_USER (run this script in apply mode, not just --check, to install it)"
+      return 1
     fi
-    echo "  FAIL: no ip6tables OUTPUT REJECT rule for uid $UID_N — IPv6 egress is NOT blocked for $BENCH_USER (run this script in apply mode, not just --check, to install it)"
-    return 1
+    echo "  WARN: 'ip6tables' not found on PATH, /usr/sbin, or /sbin — falling back to the behavioral [::1] check below instead of trusting it's fine"
   fi
   check_ipv6_loopback_behavioral
 }
@@ -753,16 +879,25 @@ check_ipv6_blocked() {
 #   - node failing to bind [::1] at all is no longer automatically a FAIL: if
 #     the bind itself fails with EADDRNOTAVAIL/EAFNOSUPPORT/ENETUNREACH — the
 #     errno family a v6 bind gets when the kernel has no v6 addresses at all
-#     (e.g. `net.ipv6.conf.all.disable_ipv6=1`) — that IS a valid,
-#     behaviorally-confirmed "IPv6 is blocked" signal in its own right (there
-#     is categorically no way to reach anything over v6 if nothing can even
-#     bind a v6 socket), matching probe_tcp's own EADDRNOTAVAIL-for-v6
-#     classification above. Any OTHER bind failure (permission, unexpected
-#     errno) still FAILs, since it says nothing about whether v6 is actually
-#     blocked.
+#     (e.g. `net.ipv6.conf.all.disable_ipv6=1`) — that CAN be a valid,
+#     behaviorally-confirmed "IPv6 is blocked" signal, matching probe_tcp's
+#     own EADDRNOTAVAIL-for-v6 classification above. Any OTHER bind failure
+#     (permission, unexpected errno) still FAILs, since it says nothing about
+#     whether v6 is actually blocked.
+#
+# (2026-10-04 Fable re-review of #46, cheap note): a bind failure on [::1]
+# SPECIFICALLY only proves loopback IPv6 is unavailable — it does NOT by
+# itself prove IPv6 is off system-wide. Fable reproduced a false PASS with a
+# ULA (or other non-link-local) address configured on a different interface:
+# ::1 can be individually broken/missing while a real routable v6 path still
+# exists elsewhere the bench user could reach. The EADDRNOTAVAIL/etc. branch
+# below now ALSO requires no global-scope IPv6 address exists on ANY
+# interface (`ip -6 addr show scope global` empty) before trusting it as
+# "IPv6 is blocked" — if one does exist (or `ip` itself isn't available to
+# check), this is inconclusive, not confirmed, and FAILs instead.
 check_ipv6_loopback_behavioral() {
   if ! command -v node >/dev/null 2>&1; then
-    echo "  FAIL: not root and 'node' not found — cannot verify IPv6 is blocked for $BENCH_USER either structurally (needs root) or behaviorally (needs node for a throwaway [::1] listener); this is NOT confirmed as blocked"
+    echo "  FAIL: 'node' not found — cannot verify IPv6 is blocked for $BENCH_USER behaviorally (needs node for a throwaway [::1] listener), and no structural (ip6tables) fallback is available either; this is NOT confirmed as blocked"
     return 1
   fi
   local tmpfile status="" port="" waited=0 node_pid result
@@ -790,9 +925,13 @@ check_ipv6_loopback_behavioral() {
       port="${status#PORT:}"
       ;;
     ERR:EADDRNOTAVAIL | ERR:EAFNOSUPPORT | ERR:ENETUNREACH)
-      echo "  ok:   could not bind a [::1] listener ($status) — no v6 address is available to bind at all, which itself confirms IPv6 is blocked (behavioral check; not root, so no structural guarantee)"
       kill "$node_pid" 2>/dev/null || true
-      return 0
+      if command -v ip >/dev/null 2>&1 && [ -z "$(ip -6 addr show scope global 2>/dev/null)" ]; then
+        echo "  ok:   could not bind a [::1] listener ($status), and no global-scope IPv6 address exists on any interface — IPv6 is blocked (behavioral check; not root, so no structural guarantee)"
+        return 0
+      fi
+      echo "  FAIL: could not bind a [::1] listener ($status), but a global-scope IPv6 address exists on some other interface (or 'ip' isn't available to check) — this proves only that ::1/loopback specifically is unavailable, NOT that IPv6 is blocked system-wide; this is NOT confirmed as blocked"
+      return 1
       ;;
     *)
       echo "  FAIL: could not start a throwaway [::1] listener (${status:-node gave no response within timeout}) — cannot verify IPv6 is blocked for $BENCH_USER behaviorally; this is NOT confirmed as blocked"
