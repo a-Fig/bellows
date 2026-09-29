@@ -358,6 +358,29 @@ export interface ConductorTelemetry {
   completeOutputTokens: number;
   /** Summed cacheRead tokens across successful completions.jsonl calls. */
   completeCacheReadTokens: number;
+  /** Summed cacheWrite tokens across successful completions.jsonl calls. */
+  completeCacheWriteTokens: number;
+  /**
+   * Of the successful (non-error) completions folded into completeCostUsd,
+   * how many carried `costUsd: null` (the provider reported no price for that
+   * call) rather than a real number. These are silently treated as $0 in
+   * completeCostUsd today (2026-09-29 Fable review, bellows #38 follow-up
+   * items 3/4) — this count is what lets a caller tell "measured $0" apart
+   * from "some completions' price is simply unknown", the conductor-side
+   * analog of UsageTotals.costEstimated. 0 when every successful completion
+   * carried a real price (or there were none).
+   */
+  completeCostUnknownCount: number;
+  /**
+   * Sorted, deduped "provider:model" tags (from completions.jsonl's own
+   * `provider`/`model` fields) for the completions counted in
+   * completeCostUnknownCount — lets the report name which provider(s) are
+   * zero/unpriced instead of just flagging the run. Empty when
+   * completeCostUnknownCount is 0. Legacy host.jsonl "complete" rows carry no
+   * provider/model, so a null costUsd there is counted in
+   * completeCostUnknownCount but cannot contribute a tag here.
+   */
+  completeCostUnknownProviders: string[];
   errors: string[];
   /** Non-error informational notes (greet/status/disconnect, "died — cleared to raw", ...). */
   infos: string[];

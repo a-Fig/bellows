@@ -1036,4 +1036,40 @@ describe("spawnHost — CLI arg contract for external vs in-process arms", () =>
     await new Promise((r) => setTimeout(r, 500));
     expect(child.killed).toBe(false);
   }, 15_000);
+
+  // Pins the code-level fact the TUTORIAL.md/README.md `scrubPiEnv` +
+  // `sandbox: "landlock"` security claim depends on (2026-09-30 Fable
+  // review): the host is a plain, unwrapped `node` spawn, never routed
+  // through bin/landlock-exec.py — i.e. it always runs OUTSIDE pi's Landlock
+  // domain, regardless of sandboxMode. If this ever changed (the host spawn
+  // started going through the landlock wrapper), Landlock's ptrace
+  // restriction would then also gate the host's OWN ability to read other
+  // processes' /proc/<pid>/environ, which is a materially different security
+  // posture than the docs describe — this test would need updating alongside
+  // the doc claim, not silently drift out of sync with it.
+  it("spawns the host as a plain node child, never through bin/landlock-exec.py (backs the Landlock/scrubPiEnv doc claim)", async () => {
+    // Deliberately no "landlock" substring in the tmp dir name itself — it
+    // would otherwise appear in --accordion-home and false-positive the
+    // spawnargs check below.
+    const runDir = fs.mkdtempSync(path.join(tmpdir(), "bellows-spawnhost-wrap-check-"));
+    dirs.push(runDir);
+    const child = spawnHost({
+      config: {},
+      arm: "external:echo-conductor",
+      armDispatch: { type: "external", id: "echo-conductor" },
+      conductorUrl: "ws://127.0.0.1:1",
+      spec: { ...spec, caps: { minutes: 0.02 } },
+      accordionHome: runDir,
+      hostTelemetryFile: path.join(runDir, "host.jsonl"),
+      runDir,
+      log: () => {},
+    });
+    children.push(child);
+    expect(child.spawnfile).toBe(process.execPath); // node itself, not a wrapper script
+    expect(child.spawnargs.some((a) => /landlock/i.test(a))).toBe(false);
+    // Let the host-stderr.log write stream actually open before afterEach
+    // kills the child and removes runDir out from under it (avoids an
+    // unhandled ENOENT from the stream's async open racing the cleanup).
+    await new Promise((r) => setTimeout(r, 300));
+  });
 });

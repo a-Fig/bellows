@@ -17,18 +17,20 @@ function renderFingerprintTable(fp, softWarnings) {
 
 function renderGroupTable(rows, hasPlanRtt) {
   if (rows.length === 0) return `<p class="section-empty">No runs in this group.</p>`;
-  const best = rows[0]?.conductorId;
+  const best = rows[0]?.armKey;
   const body = rows
     .map((r) => {
-      const winnerClass = r.conductorId === best ? " winner" : "";
+      const winnerClass = r.armKey === best ? " winner" : "";
       return `<tr class="${winnerClass}">
-        <td>${esc(r.conductorId)}</td>
+        <td>${esc(r.conductorId)}${r.envLabel ? ` <span class="badge" title="arm env override">${esc(r.envLabel)}</span>` : ""}</td>
         <td>${fmtNum(r.runsCount)}</td>
         <td>${r.abortedCount > 0 ? `${fmtNum(r.abortedCount)} <span class="badge badge-aborted">aborted</span>` : "0"}</td>
         <td>${fmtPct(r.completionRate)}</td>
         <td>${fmtNum(r.checkpointsSolved, 1)}</td>
         <td>${fmtNum(r.checkpointsAttempted, 1)}</td>
         <td>${fmtUsd(r.costUsd)}</td>
+        <td>${fmtUsd(r.conductorCostUsd)}${r.conductorCostUnknownRuns > 0 ? ` <span class="badge badge-warn" title="${r.conductorCostUnknownRuns} of ${r.runsCount} run(s) had a conductor completion with no reported price (treated as $0 here) — provider(s): ${esc(r.conductorCostUnknownProviders.join(", ") || "unknown")}">unpriced</span>` : ""}</td>
+        <td>${fmtUsd(r.combinedCostUsd)}</td>
         <td>${fmtNum(r.totalTokens)}</td>
         <td>${fmtDuration(r.wallClockS)}</td>
         <td>${fmtPct(r.cacheReadShare)}</td>
@@ -40,7 +42,8 @@ function renderGroupTable(rows, hasPlanRtt) {
     <thead><tr>
       <th>conductor</th><th>runs</th><th>aborted</th><th>completion</th>
       <th>median checkpoints solved</th><th>median attempted</th>
-      <th>median cost</th><th>median tokens</th><th>median wall clock</th><th>cache-read share</th>
+      <th>median cost</th><th>median conductor cost</th><th>median combined cost</th>
+      <th>median tokens</th><th>median wall clock</th><th>cache-read share</th>
       ${hasPlanRtt ? "<th>median plan RTT</th>" : ""}
     </tr></thead>
     <tbody>${body}</tbody>
