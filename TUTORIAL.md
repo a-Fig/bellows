@@ -42,28 +42,47 @@ false positives are the safe failure mode; un-scrub those via
 output isn't fully trusted.** A per-arm `env` (above) is applied after the
 scrub and is never scrubbed itself.
 
-**`scrubPiEnv` alone does not reliably keep secrets from the agent's bash
-tool, and `sandbox: "landlock"` (next section) does not close this gap
-either.** `scrubPiEnv` only shapes the env pi itself is spawned with. The
+**Without `sandbox: "landlock"` (next section), `scrubPiEnv` alone does not
+reliably keep secrets from the agent's bash tool — but combined WITH it, it
+does, for the specific `/proc/<pid>/environ` vector described below**
+(2026-09-30 Fable review — an earlier draft of this section had the Landlock
+mechanism backwards; corrected here against the actual kernel source, not
+memory). `scrubPiEnv` only shapes the env pi itself is spawned with. The
 runner process (and the host it spawns — `spawnHost`'s env is
 `{...process.env, ...hostEnv(config)}`, the full unscrubbed env) still holds
 every secret, and on Linux a same-uid process can generally read another
-process's environment straight off `/proc/<pid>/environ` (gated by a kernel
-ptrace-mode check that's independent of any LSM bellows configures; Yama's
-default ptrace_scope, where present, restricts `PTRACE_ATTACH` more than it
-restricts this read). Landlock **cannot** help here even in principle unless
-its ptrace/signal-scoping feature is turned on (`LANDLOCK_SCOPE_*`, ABI 6+) —
-and `bin/landlock-exec.py` deliberately does not turn it on (see its own
-"Deliberately NOT restricted" note), and separately grants blanket **read**
-access to all of `/proc` for unrelated reasons (letting pi/node/python read
-`/proc/cpuinfo`, `/proc/self/*`, etc.) — so `/proc/<pid>/environ` for other
-processes is not even path-denied. An agent whose bash tool runs
-`cat /proc/$PPID/environ` should be assumed to get the runner's full,
-unscrubbed env back, sandboxed or not. Treat `scrubPiEnv` as reducing the
-blast radius of casual/accidental exposure (a stray `env`/`printenv` call in
-agent output, a crash dump, a debug log) and the risk from the wider set of
-env vars a *scrubbed* env still lacks — not as a hard boundary against a bash
-tool that deliberately goes looking.
+process's environment straight off `/proc/<pid>/environ`: `environ_open` in
+`fs/proc/base.c` opens it via `mm_access(task, PTRACE_MODE_READ | ...)`,
+which goes through the kernel's ptrace-access check
+(`ptrace_may_access`/`security_ptrace_access_check`) — the SAME check
+`PTRACE_ATTACH` goes through, not a separate or weaker one. Without Landlock,
+same-uid plus a dumpable target is all that check requires (Yama's default
+`ptrace_scope`, where present, restricts `PTRACE_ATTACH` more than it
+restricts this read) — so an unsandboxed agent's bash tool running
+`cat /proc/$PPID/environ` gets the runner's full, unscrubbed env back.
+
+`sandbox: "landlock"` changes this for pi and everything pi spawns. pi runs
+inside a Landlock domain (`bin/landlock-exec.py`), and Landlock's ptrace
+restriction makes `hook_ptrace_access_check` return `EPERM` for any target
+process that isn't in the landlocked process's own domain hierarchy — and
+that hook covers `PTRACE_MODE_READ`, so it covers this `environ` read too.
+The runner and the host (`spawnHost` in `run.mjs`) are both spawned OUTSIDE
+pi's domain (plain, unwrapped spawns — see the code), so from inside the
+sandbox `cat /proc/<runner-or-host-pid>/environ` now fails closed. Two things
+that do NOT matter here, despite looking relevant: the blanket **read**
+access `SYSTEM_RO` grants to all of `/proc` (that's a path rule for
+`open()`/`stat()` — it doesn't bypass the separate ptrace gate this read is
+ALSO subject to), and `LANDLOCK_SCOPE_*` (ABI 6's abstract-unix-socket/signal
+scoping, which `bin/landlock-exec.py` indeed doesn't turn on — but it's
+unrelated to ptrace and was never the relevant mechanism). What remains
+readable inside the domain is pi's own (scrubbed) env, and anything the agent
+itself writes to disk or stdout.
+
+So: treat `scrubPiEnv` alone (no Landlock) as reducing the blast radius of
+casual/accidental exposure (a stray `env`/`printenv` call in agent output, a
+crash dump, a debug log) rather than a hard boundary. Combined with
+`sandbox: "landlock"`, it closes the `/proc/<pid>/environ` route specifically
+— run both together for the strongest guarantee this harness can give.
 
 ### Keeping the agent inside its run dir (`sandbox: "landlock"`, Linux)
 
@@ -108,9 +127,10 @@ node bin/bellows.mjs sandbox-check [trials/x.yaml] [--keep]
 ```
 
 Known gaps: the agent can still `stat` paths it cannot open, read other
-processes' command lines AND environment (`/proc/<pid>/cmdline`,
-`/proc/<pid>/environ` — see the `scrubPiEnv` note above; this sandbox does not
-enable Landlock's ptrace/signal-scoping feature) in `/proc`, read its own
+processes' command lines in `/proc` (`/proc/<pid>/cmdline` — unlike
+`/proc/<pid>/environ`, this is not ptrace-gated, so Landlock's ptrace
+restriction doesn't cover it; see the `scrubPiEnv` note above for why
+`environ` itself IS closed under this sandbox), read its own
 `agent/auth.json` (pi needs it in the same process), and connect to loopback
 ports.
 
