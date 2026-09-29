@@ -17,6 +17,7 @@ import {
   buildCanaryProbes,
   buildEgressProbes,
   resolveEgressHost,
+  isUnsafeEgressProbeTarget,
   evaluateCanary,
   formatCanaryTable,
   runCanary,
@@ -25,6 +26,7 @@ import {
   SYSTEM_RX,
   DEV_RW,
   DEFAULT_EGRESS_BLOCKED_HOSTS,
+  DEFAULT_EGRESS_BLOCKED_LITERALS,
 } from "../sandbox.mjs";
 
 describe("resolveSandboxMode", () => {
@@ -177,12 +179,50 @@ describe("buildEgressProbes", () => {
   it("adds a deny probe for every default blocked host, resolved to a literal IP", () => {
     const resolveHost = fakeResolve({ "github.com": "10.0.0.1", "raw.githubusercontent.com": "10.0.0.2", "pypi.org": "10.0.0.3" });
     const probes = buildEgressProbes({ egress: "blocked", resolveHost });
-    expect(probes).toHaveLength(DEFAULT_EGRESS_BLOCKED_HOSTS.length);
+    // Also includes DEFAULT_EGRESS_BLOCKED_LITERALS' deny probes (2026-10-01
+    // Fable re-review of #45, cheap note) — see the dedicated test below.
+    expect(probes).toHaveLength(DEFAULT_EGRESS_BLOCKED_HOSTS.length + DEFAULT_EGRESS_BLOCKED_LITERALS.length);
     for (const p of probes) expect(p).toMatchObject({ op: "tcp", kind: "net", expect: "deny" });
-    expect(probes.map((p) => p.path)).toEqual(["10.0.0.1:443", "10.0.0.2:443", "10.0.0.3:443"]);
+    expect(probes.slice(0, DEFAULT_EGRESS_BLOCKED_HOSTS.length).map((p) => p.path)).toEqual(["10.0.0.1:443", "10.0.0.2:443", "10.0.0.3:443"]);
     // The hostname is still in the name (for a readable canary table) even
     // though the probe itself never resolves it.
     expect(probes[0].name).toBe("egress: github.com:443 (10.0.0.1) must be blocked");
+  });
+
+  // 2026-10-01 Fable re-review of #45, cheap note ("add literal-IP probes to
+  // the canary"), mirroring LITERAL_BLOCKED_PROBES in
+  // scripts/egress-allowlist.sh — these never call resolveHost at all, so a
+  // DNS hiccup can't affect them, and the IPv6 literal proves the canary
+  // itself (not just the host-level firewall script) checks IPv6 is blocked.
+  it("adds a deny probe for every DEFAULT_EGRESS_BLOCKED_LITERALS entry, without resolving anything", () => {
+    const resolveHost = () => {
+      throw new Error("must not be called for literal probes");
+    };
+    // No DEFAULT_EGRESS_BLOCKED_HOSTS entries resolved here on purpose —
+    // isolate the literals by stubbing resolveHost to throw, proving the
+    // literal loop never touches it.
+    expect(() => buildEgressProbes({ egress: "blocked", resolveHost })).toThrow("must not be called for literal probes");
+  });
+
+  it("literal probes have the expected shape (unbracketed IPv6 included)", () => {
+    const resolveHost = fakeResolve({ "github.com": "10.0.0.1", "raw.githubusercontent.com": "10.0.0.2", "pypi.org": "10.0.0.3" });
+    const probes = buildEgressProbes({ egress: "blocked", resolveHost });
+    const literals = probes.slice(DEFAULT_EGRESS_BLOCKED_HOSTS.length);
+    expect(literals).toEqual(
+      DEFAULT_EGRESS_BLOCKED_LITERALS.map((ipPort) => ({
+        name: `egress: literal ${ipPort} (must be blocked)`,
+        op: "tcp",
+        path: ipPort,
+        kind: "net",
+        expect: "deny",
+      })),
+    );
+    // The IPv6 literal must be unbracketed, matching CANARY_PY's
+    // str.rpartition(":") parsing (see DEFAULT_EGRESS_BLOCKED_LITERALS'
+    // doc comment) — a bracketed "[2606:...]:443" would split wrong.
+    const ipv6 = literals.find((p) => p.path.includes("2606"));
+    expect(ipv6.path).toBe("2606:4700:4700::1111:443");
+    expect(ipv6.path.startsWith("[")).toBe(false);
   });
 
   it("adds an allow probe for every sandboxEgressAllow entry, resolved to a literal IP", () => {
@@ -228,6 +268,70 @@ describe("buildEgressProbes", () => {
     expect(resolveEgressHost("nope.invalid", () => ({ error: new Error("ENOENT: getent not found") }))).toBeNull();
     expect(resolveEgressHost("nope.invalid", () => ({ status: 0, stdout: "" }))).toBeNull();
     expect(resolveEgressHost("nope.invalid", () => ({ status: 0, stdout: "\n\n" }))).toBeNull();
+  });
+
+  // 2026-09-29 Fable re-review of #43, non-blocking note: a hosts-file
+  // block/DNS sinkhole/blocked resolver could make a "must be blocked" host
+  // resolve to loopback, letting the canary "confirm" a block by probing an
+  // address nothing relevant listens on — proving nothing about the real
+  // host.
+  describe("isUnsafeEgressProbeTarget", () => {
+    it("flags loopback, unspecified, and link-local addresses (v4 and v6)", () => {
+      for (const ip of ["127.0.0.1", "127.1.2.3", "0.0.0.0", "::1", "::", "169.254.1.1", "169.254.255.255", "fe80::1"]) {
+        expect(isUnsafeEgressProbeTarget(ip)).toBe(true);
+      }
+    });
+
+    it("does not flag ordinary public/private addresses", () => {
+      for (const ip of ["93.184.216.34", "10.0.0.5", "192.168.1.1", "8.8.8.8", "169.253.1.1", "126.0.0.1", "128.0.0.1"]) {
+        expect(isUnsafeEgressProbeTarget(ip)).toBe(false);
+      }
+    });
+
+    it("flags empty/non-string input (fail closed)", () => {
+      expect(isUnsafeEgressProbeTarget("")).toBe(true);
+      expect(isUnsafeEgressProbeTarget(null)).toBe(true);
+      expect(isUnsafeEgressProbeTarget(undefined)).toBe(true);
+    });
+  });
+
+  // 2026-09-30 Fable re-review of #45, blocking note: an earlier version of
+  // this fix rejected an unsafe (loopback/unspecified/link-local) resolution
+  // inside resolveEgressHost itself — which is shared by BOTH the "must be
+  // blocked" default hosts and any operator-configured "must be reachable"
+  // sandboxEgressAllow host, so it also broke a legitimate allow entry
+  // pointing at a local model proxy (e.g. `127.0.0.1:8080`). The rejection
+  // now lives in buildEgressProbes, scoped to expect:"deny" probes only.
+  it("resolveEgressHost itself is a pure resolver — it does NOT reject loopback/unspecified/link-local results", () => {
+    expect(resolveEgressHost("localhost", () => ({ status: 0, stdout: "127.0.0.1   STREAM localhost\n" }))).toBe("127.0.0.1");
+    expect(resolveEgressHost("wildcard.invalid", () => ({ status: 0, stdout: "0.0.0.0   STREAM wildcard.invalid\n" }))).toBe("0.0.0.0");
+  });
+
+  it("a DENY probe (default blocked host) throws when its resolver returns loopback/unspecified/link-local, instead of silently 'confirming' a block", () => {
+    for (const stdout of ["127.0.0.1   STREAM github.com\n", "0.0.0.0   STREAM github.com\n", "169.254.1.1   STREAM github.com\n"]) {
+      const resolveHost = fakeResolve({
+        "github.com": stdout.trim().split(/\s+/)[0],
+        "raw.githubusercontent.com": "10.0.0.2",
+        "pypi.org": "10.0.0.3",
+      });
+      expect(() => buildEgressProbes({ egress: "blocked", resolveHost })).toThrow(
+        /resolved to .* loopback\/unspecified\/link-local.*inconclusive and must fail/s,
+      );
+    }
+  });
+
+  it("an ALLOW probe (sandboxEgressAllow) permits a loopback resolution — a local model proxy is a legitimate target", () => {
+    const resolveHost = fakeResolve({
+      "github.com": "10.0.0.1",
+      "raw.githubusercontent.com": "10.0.0.2",
+      "pypi.org": "10.0.0.3",
+      "local-proxy.invalid": "127.0.0.1",
+    });
+    const probes = buildEgressProbes({ egress: "blocked", egressAllow: ["local-proxy.invalid:8080"], resolveHost });
+    const allow = probes.filter((p) => p.expect === "allow");
+    expect(allow).toEqual([
+      { name: "egress: local-proxy.invalid:8080 (127.0.0.1) must be reachable (sandboxEgressAllow)", op: "tcp", path: "127.0.0.1:8080", kind: "net", expect: "allow" },
+    ]);
   });
 });
 

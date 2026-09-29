@@ -215,7 +215,14 @@ IPs rotate — pinning keeps the allowlist valid without re-running the
 script every time DNS changes), allows that pinned IP on the given port, and
 rejects everything else for the bench user (TCP reset, plus a full IPv6
 block). Re-running is safe — it rebuilds its chain from scratch each time, so
-adding a host or refreshing a rotated IP is just running it again. Verify a
+adding a host or refreshing a rotated IP is just running it again: the
+resolution step always queries DNS directly (`getent -s dns`, bypassing
+`/etc/hosts`), so a re-run genuinely picks up a new edge IP instead of
+re-reading back the pin it wrote last time (2026-10-01 Fable re-review of
+#45, blocking note 2 — the earlier `getent ahostsv4` form checked
+`/etc/hosts` first per `nsswitch.conf`'s default order, so a re-run
+silently re-confirmed the stale pinned IP forever and this "refreshing a
+rotated IP" claim was false until fixed). Verify a
 sealed host without touching firewall rules — this probes AS the bench user
 (`sudo -u`), the same direction the per-run canary checks:
 
@@ -248,6 +255,52 @@ cannot, prove the allowlist has no other holes):
 - The canary's fixed host list (and `--check`'s) is a spot-check, not a
   firewall audit — it catches "did today's incident's exact hosts get
   re-opened", not "is this allowlist airtight."
+- **A loopback proxy on 127.0.0.0/8 is an unblockable bypass.** The chain has
+  to accept all TCP to `127.0.0.0/8` over loopback unconditionally (DNS to
+  systemd-resolved's stub depends on it — see below), so anything listening
+  there — `127.x`, a wildcard `0.0.0.0`, or a dual-stack `::ffff:127.x`
+  listener (a forgotten local squid/mitm, tailscaled's SOCKS5 listener if it
+  happens to bind to loopback, ...) — is reachable by the bench user
+  regardless of the allowlist. `--check` lists loopback TCP listeners (`ss
+  -ltnp`) it can't attribute to the bench user itself and fails unless each
+  is explicitly accepted with `--allow-loopback host:port` (bracketed for
+  IPv6 forms, e.g. `--allow-loopback [::]:22` for stock sshd's IPv6 listener
+  alongside `--allow-loopback 0.0.0.0:22` for its IPv4 one). IPv6 itself gets
+  no such carve-out: it's rejected outright for the bench user, loopback
+  included, since nothing in this codebase binds a loopback listener to
+  anything but IPv4 `127.0.0.1` — so a wildcard listener (`0.0.0.0:PORT` or
+  dual-stack `[::]:PORT`) ends up reachable by the bench user only via
+  `127.0.0.0/8`, never via the host's other addresses, and never over IPv6 at
+  all (2026-09-30 Fable re-review of #45 — the rule used to be a bare `-o lo
+  -j ACCEPT` with no destination match, which is broader than "loopback":
+  Linux routes a packet addressed to any of the host's own configured
+  addresses over `lo`, not just `127.0.0.0/8`, so the old rule also admitted
+  traffic to the host's real eth0/Tailscale/docker0 addresses).
+- **Rules do not survive a reboot.** The script only calls `iptables`/
+  `ip6tables` directly — it does not persist rules (no
+  iptables-persistent/netfilter-persistent integration, no systemd unit).
+  Re-run it after every reboot of a bench host, or wire that persistence in
+  yourself.
+- **Without systemd-resolved doing DNS for the bench user**, the "DNS still
+  works" behavior above doesn't hold: if `/etc/resolv.conf` points straight
+  at an external nameserver IP instead of a local stub, the bench user's own
+  process makes that DNS query itself, as its own uid, over a real socket —
+  not covered by any `ACCEPT` rule here (only `--allow` host:port pairs are
+  opened), so it's rejected like everything else. An `--allow`'d host still
+  resolves fine (its IP is pinned in `/etc/hosts`, checked before DNS), but
+  any *other* hostname lookup fails outright at the resolver step instead of
+  connecting-then-being-blocked.
+- **Re-applying to an already-sealed host has a brief open window.**
+  (2026-10-01 Fable re-review of #45, cheap note — left as is, documented
+  rather than fixed.) The script flushes the existing chain before rebuilding
+  it; the chain is still linked into `OUTPUT` from the previous run, so
+  between the flush and the first `REJECT` rule going back in (a handful of
+  `iptables` calls later), the bench user's egress briefly falls through to
+  `OUTPUT`'s own default policy (commonly `ACCEPT`) instead of being
+  rejected. This is much narrower than the whole-`--allow`-loop-wide
+  fail-open bug the ordering fixes above close, but it isn't zero — don't
+  re-run this script on a host with a benchmark actively running as the bench
+  user.
 
 ## Write a trial
 

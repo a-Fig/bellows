@@ -52,8 +52,10 @@ verifies a machine. Landlock cannot restrict the network, so `sandboxEgress` def
 `"blocked"` whenever the sandbox is `"landlock"` — the same canary independently verifies
 a host-level egress block is actually in place (bellows can only verify this, never
 enforce it) and fails the run before pi starts if it isn't. Seal a bench host once with
-`sudo scripts/egress-allowlist.sh --user <bench-user> --allow <model-api-host:443>` — see
-TUTORIAL.md → *Verifying egress is blocked* / *Sealing a bench host*.
+`sudo scripts/egress-allowlist.sh --user <bench-user> --allow <model-api-host:443> --allow
+<platform-host:443>` (the platform host too, alongside the model API — a run also needs to
+reach Agent Trials itself) — see TUTORIAL.md → *Verifying egress is blocked* / *Sealing a
+bench host*.
 
 ## Usage
 

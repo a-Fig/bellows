@@ -400,24 +400,44 @@ function clearInstallFailure(dir) {
  * reaped the run at its 180s no-heartbeat deadline and failed it, for every
  * arm in the run, not just conductors that needed a ws install. Using
  * spawnSafe (async) here lets the event loop — and the heartbeat — keep
- * running while npm does its I/O; opts.timeout is enforced by hand via
- * killTree instead of relying on spawn's own `timeout`/`killSignal` options
- * (2026-09-30 Fable re-review of #44, cheap note: spawn DOES have a built-in
- * timeout, unlike the earlier claim here — but it only signals the direct
- * child, not the whole process tree a hung `npm` can leave behind, which is
- * exactly what killTree is for), mirroring src/worker/selfUpdate.mjs's
- * defaultRunNpmCi.
+ * running while npm does its I/O; opts.timeout is enforced entirely by hand
+ * via killTree. `timeout`/`killSignal` are deliberately stripped out of the
+ * options object actually handed to spawnFn below — never forwarded to the
+ * real spawn() call — so Node's own built-in spawn timeout is never armed
+ * (2026-10-01 coordinator follow-up to #44's cheap note: spawn DOES honor
+ * `options.timeout` itself, and this function used to forward the whole
+ * `opts` object as-is, including `timeout` — arming Node's own timeout AND
+ * the manual one below at the identical deadline. That's a race, not a
+ * safety net: whichever fired first won, and if spawn's own timeout won, it
+ * killed only the direct child and drove this promise to resolve via the
+ * ordinary child.on("close", ...) path below with `error: null` — silently
+ * swallowing the "timed out after Nms — killed the child" diagnostic
+ * downstream code classifies on, e.g. selfUpdate's "npm ci failed" logging,
+ * and skipping killTree's whole-process-tree cleanup a hung `npm` can need).
+ * Mirrors src/worker/selfUpdate.mjs's defaultRunNpmCi, which never forwarded
+ * `timeout` to spawnFn's options in the first place.
+ *
+ * Exported (test seam only — not part of the module's real call graph
+ * outside this file, same convention as acquireLock below) so a test can
+ * assert directly on the options object handed to an injected spawnFn,
+ * confirming `timeout`/`killSignal` never reach it.
  * @param {string} cmd
  * @param {string[]} args
  * @param {import("node:child_process").SpawnOptions & {timeout?: number}} opts
  * @param {typeof spawnSafe} [spawnFn]  test seam: substitute a fake async/sync spawn
  * @returns {Promise<{status: number|null, stderr: string, error: Error|null}>}
  */
-function spawnAwaited(cmd, args, opts, spawnFn = spawnSafe) {
+export function spawnAwaited(cmd, args, opts, spawnFn = spawnSafe) {
   return new Promise((resolve) => {
     let child;
+    // Strip `timeout`/`killSignal` before handing options to spawnFn (see
+    // doc comment above) — `timeoutMs` below still reads them off the
+    // ORIGINAL `opts`, so the manual killTree-based enforcement is
+    // unaffected; only the double-arming of Node's own built-in spawn
+    // timeout is removed.
+    const { timeout: _timeout, killSignal: _killSignal, ...spawnOpts } = opts || {};
     try {
-      child = spawnFn(cmd, args, opts);
+      child = spawnFn(cmd, args, spawnOpts);
     } catch (error) {
       resolve({ status: null, stderr: "", error });
       return;
