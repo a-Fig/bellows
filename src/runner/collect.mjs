@@ -195,6 +195,7 @@ export function foldHostTelemetry(text, fallbackConductorId = "") {
   let totalFoldOps = 0;
   let heldPlanReplies = 0;
   let completeCostUsd = 0;
+  let completeCostUnknownCount = 0;
   const latencies = [];
   /** @type {Array<[number,number,number]>} */
   const budgetSeries = [];
@@ -246,7 +247,14 @@ export function foldHostTelemetry(text, fallbackConductorId = "") {
         totalFoldOps += n(e.ops);
         break;
       case "complete":
+        // e.costUsd is `number | null` (see HostEvent in types.ts) — null means
+        // the relayed complete() call carried no usable price, not that it cost
+        // $0. Silently adding 0 for it would make "not measured" indistinguishable
+        // from "measured zero" (2026-09-29 Fable review, bellows #38 follow-up
+        // item 4); count it instead. Legacy host.jsonl rows carry no
+        // provider/model, so unlike foldCompletionLog below there's no tag to add.
         if (typeof e.costUsd === "number") completeCostUsd += e.costUsd;
+        else completeCostUnknownCount++;
         break;
       case "error":
         if (e.message) errors.push(String(e.message));
@@ -312,6 +320,7 @@ export function foldHostTelemetry(text, fallbackConductorId = "") {
     conductLatencyMs: { p50: percentile(latencies, 50), max: latencies.length ? Math.max(...latencies) : 0 },
     heldPlanReplies,
     completeCostUsd: round6(completeCostUsd),
+    completeCostUnknownCount,
     // Defaults for the completions.jsonl side-log fields (see foldCompletionLog
     // below) — always present so ConductorTelemetry has a stable shape even
     // when the caller never merges a completion log in (e.g. this function's
@@ -323,6 +332,8 @@ export function foldHostTelemetry(text, fallbackConductorId = "") {
     completeInputTokens: 0,
     completeOutputTokens: 0,
     completeCacheReadTokens: 0,
+    completeCacheWriteTokens: 0,
+    completeCostUnknownProviders: [],
     errors,
     infos,
     lastStatusText,
@@ -434,7 +445,8 @@ export function collectHostTelemetry(hostFile, fallbackConductorId = "") {
  *
  * @param {string} text  raw JSONL
  * @returns {{completeCostUsd:number, completeCalls:number, completeErrors:number,
- *            completeInputTokens:number, completeOutputTokens:number, completeCacheReadTokens:number}}
+ *            completeInputTokens:number, completeOutputTokens:number, completeCacheReadTokens:number,
+ *            completeCacheWriteTokens:number, completeCostUnknownCount:number, completeCostUnknownProviders:string[]}}
  */
 export function foldCompletionLog(text) {
   let completeCostUsd = 0;
@@ -443,6 +455,9 @@ export function foldCompletionLog(text) {
   let completeInputTokens = 0;
   let completeOutputTokens = 0;
   let completeCacheReadTokens = 0;
+  let completeCacheWriteTokens = 0;
+  let completeCostUnknownCount = 0;
+  const unknownProviders = new Set();
   for (const rec of parseJsonl(text)) {
     if (!rec || rec.t !== "complete") continue;
     completeCalls++;
@@ -450,10 +465,25 @@ export function foldCompletionLog(text) {
       completeErrors++;
       continue;
     }
-    if (typeof rec.costUsd === "number") completeCostUsd += rec.costUsd;
+    // rec.costUsd is `number | null` (extension/accordion.ts runCompletion) —
+    // null means the provider reported no usable price for this call, not
+    // that it cost $0. Silently adding 0 for it would make "not measured"
+    // indistinguishable from "measured zero" (2026-09-29 Fable review, bellows
+    // #38 follow-up items 3/4 — "zero-priced providers produce
+    // completeCostUsd: 0 with no flag"). Count and tag it instead.
+    if (typeof rec.costUsd === "number") {
+      completeCostUsd += rec.costUsd;
+    } else {
+      completeCostUnknownCount++;
+      unknownProviders.add(`${typeof rec.provider === "string" && rec.provider ? rec.provider : "?"}:${typeof rec.model === "string" && rec.model ? rec.model : "?"}`);
+    }
     completeInputTokens += n(rec.input);
     completeOutputTokens += n(rec.output);
     completeCacheReadTokens += n(rec.cacheRead);
+    // Was dropped from the fold entirely before (2026-09-29 Fable review,
+    // bellows #38 follow-up item 3 minor note) despite the line shape above
+    // carrying it.
+    completeCacheWriteTokens += n(rec.cacheWrite);
   }
   return {
     completeCostUsd: round6(completeCostUsd),
@@ -462,6 +492,9 @@ export function foldCompletionLog(text) {
     completeInputTokens,
     completeOutputTokens,
     completeCacheReadTokens,
+    completeCacheWriteTokens,
+    completeCostUnknownCount,
+    completeCostUnknownProviders: [...unknownProviders].sort(),
   };
 }
 

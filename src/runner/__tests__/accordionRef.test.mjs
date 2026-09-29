@@ -181,6 +181,27 @@ describe.skipIf(!GIT_OK)("worktree create/reuse/mismatch (scratch git repo)", ()
     expect(fs.existsSync(marker)).toBe(true); // untouched => reused, not recreated
   });
 
+  it("ensureWorktree re-attempts provisioning on reuse when the worktree matches but was never marked provisioned (bellows #39 follow-up)", () => {
+    const wt = ensureWorktree({ accordionRepo: srcRepo, sha: shaB, runsDir });
+    const marker = path.join(wt, ".bellows-provisioned");
+    expect(fs.existsSync(marker)).toBe(true); // provisioned by the call above (no conductors/ws dir -> trivial success)
+
+    // Simulate a worktree that matches the pinned sha but whose provisioning
+    // never completed (e.g. a prior run's conductor-deps install failed after
+    // the worktree was created, so the marker was never written). Before this
+    // fix, ensureWorktree's fast path returned such a worktree unconditionally
+    // and provisionWorktree was never called again — this worktree would stay
+    // "stuck" forever.
+    fs.rmSync(marker, { force: true });
+    expect(fs.existsSync(marker)).toBe(false);
+
+    const wt2 = ensureWorktree({ accordionRepo: srcRepo, sha: shaB, runsDir });
+    expect(wt2).toBe(wt);
+    // Provisioning was retried (real installConductorWsDeps: no conductors/ws
+    // dir here, so it trivially succeeds) and the marker is back.
+    expect(fs.existsSync(marker)).toBe(true);
+  });
+
   it("ensureWorktree RECREATES when the dir exists but HEAD mismatches", () => {
     const wt = worktreePath(runsDir, shaB);
     // Corrupt: force the existing worktree's HEAD to the WRONG commit.
@@ -264,11 +285,16 @@ describe("installConductorWsDeps", () => {
     return dir;
   }
 
-  it("no conductors/ws dir at all -> no-op, spawnFn never called, never throws", () => {
+  it("no conductors/ws dir at all -> no-op, spawnFn never called, never throws, returns true", () => {
     const worktree = mkWorktree();
     const calls = [];
-    expect(() => installConductorWsDeps(worktree, () => {}, makeSpawnFn(calls))).not.toThrow();
+    let result;
+    expect(() => (result = installConductorWsDeps(worktree, () => {}, makeSpawnFn(calls)))).not.toThrow();
     expect(calls).toHaveLength(0);
+    // A no-op ("nothing needed installing") is a SUCCESS, not a failure —
+    // provisionWorktree relies on this to still mark a worktree with no
+    // conductors/ws dir as provisioned (bellows #39 follow-up).
+    expect(result).toBe(true);
   });
 
   it("package.json + package-lock.json, no node_modules -> runs `npm ci --no-audit --no-fund` in that dir", () => {
@@ -280,19 +306,26 @@ describe("installConductorWsDeps", () => {
 
     expect(calls).toHaveLength(1);
     expect(calls[0].cmd).toBe("npm");
-    expect(calls[0].args).toEqual(["ci", "--no-audit", "--no-fund"]);
+    expect(calls[0].args).toEqual(["ci", "--no-audit", "--no-fund", "--ignore-scripts"]);
     expect(calls[0].opts.cwd).toBe(dir);
     expect(logs).toContain("[accordionRef] installed deps in conductors/ws/triptych");
   });
 
-  it("package.json with NO package-lock.json -> falls back to `npm install --no-audit --no-fund`", () => {
+  it("returns true when every needed install succeeds", () => {
+    const worktree = mkWorktree();
+    makeWsConductor(worktree, "triptych", { lockfile: true });
+    const result = installConductorWsDeps(worktree, () => {}, makeSpawnFn([]));
+    expect(result).toBe(true);
+  });
+
+  it("package.json with NO package-lock.json -> falls back to `npm install --no-audit --no-fund --ignore-scripts`", () => {
     const worktree = mkWorktree();
     makeWsConductor(worktree, "thermocline", { lockfile: false });
     const calls = [];
     installConductorWsDeps(worktree, () => {}, makeSpawnFn(calls));
 
     expect(calls).toHaveLength(1);
-    expect(calls[0].args).toEqual(["install", "--no-audit", "--no-fund"]);
+    expect(calls[0].args).toEqual(["install", "--no-audit", "--no-fund", "--ignore-scripts"]);
   });
 
   it("node_modules already present -> skipped, spawnFn never called for that dir (idempotent)", () => {
@@ -326,8 +359,8 @@ describe("installConductorWsDeps", () => {
 
     expect(calls).toHaveLength(2);
     const byDir = Object.fromEntries(calls.map((c) => [path.basename(c.opts.cwd), c.args]));
-    expect(byDir["triptych"]).toEqual(["ci", "--no-audit", "--no-fund"]);
-    expect(byDir["thermocline"]).toEqual(["install", "--no-audit", "--no-fund"]);
+    expect(byDir["triptych"]).toEqual(["ci", "--no-audit", "--no-fund", "--ignore-scripts"]);
+    expect(byDir["thermocline"]).toEqual(["install", "--no-audit", "--no-fund", "--ignore-scripts"]);
     expect(byDir["already-done"]).toBeUndefined();
     expect(logs).toContain("[accordionRef] installed deps in conductors/ws/triptych");
     expect(logs).toContain("[accordionRef] installed deps in conductors/ws/thermocline");
@@ -348,6 +381,14 @@ describe("installConductorWsDeps", () => {
     expect(logs[0]).toContain("npm ERR! network timeout");
   });
 
+  it("returns false when an install exits nonzero (bellows #39: signals provisionWorktree to not mark success)", () => {
+    const worktree = mkWorktree();
+    makeWsConductor(worktree, "triptych", { lockfile: true });
+    const spawnFn = makeSpawnFn([], { status: 1, stderr: "npm ERR! network timeout\n" });
+    const result = installConductorWsDeps(worktree, () => {}, spawnFn);
+    expect(result).toBe(false);
+  });
+
   it("spawn error (e.g. ENOENT — npm not on PATH) -> logs a WARN, does NOT throw", () => {
     const worktree = mkWorktree();
     makeWsConductor(worktree, "triptych", { lockfile: true });
@@ -359,6 +400,13 @@ describe("installConductorWsDeps", () => {
     expect(logs).toHaveLength(1);
     expect(logs[0]).toMatch(/WARN/);
     expect(logs[0]).toContain("ENOENT");
+  });
+
+  it("returns false on a spawn error", () => {
+    const worktree = mkWorktree();
+    makeWsConductor(worktree, "triptych", { lockfile: true });
+    const spawnFn = makeSpawnFn([], { error: Object.assign(new Error("spawnSync npm ENOENT"), { code: "ENOENT" }) });
+    expect(installConductorWsDeps(worktree, () => {}, spawnFn)).toBe(false);
   });
 
   it("a spawnFn that itself throws -> caught, logged as a WARN, does NOT throw or abort remaining dirs", () => {
@@ -375,6 +423,26 @@ describe("installConductorWsDeps", () => {
 
     expect(calls).toBe(2); // both dirs attempted despite the first throwing
     expect(logs.filter((m) => m.includes("WARN") && m.includes("boom"))).toHaveLength(2);
+  });
+
+  it("returns false when a throwing spawnFn fails every dir", () => {
+    const worktree = mkWorktree();
+    makeWsConductor(worktree, "triptych", { lockfile: true });
+    const throwingSpawnFn = () => {
+      throw new Error("boom");
+    };
+    expect(installConductorWsDeps(worktree, () => {}, throwingSpawnFn)).toBe(false);
+  });
+
+  it("returns false overall when only ONE of several conductors fails (a partial failure is still a failure)", () => {
+    const worktree = mkWorktree();
+    makeWsConductor(worktree, "triptych", { lockfile: true }); // will succeed
+    makeWsConductor(worktree, "thermocline", { lockfile: false }); // will fail
+    const spawnFn = (cmd, args, opts) => {
+      if (path.basename(opts.cwd) === "thermocline") return { status: 1, stderr: "boom" };
+      return { status: 0, stderr: "" };
+    };
+    expect(installConductorWsDeps(worktree, () => {}, spawnFn)).toBe(false);
   });
 });
 
@@ -423,6 +491,44 @@ describe("provisionWorktree — conductor deps wiring", () => {
     const accordionRepo = mkWorktree();
     // No injected installDeps: exercises the real default wiring end-to-end.
     expect(() => provisionWorktree({ accordionRepo, worktree, log: () => {} })).not.toThrow();
+    expect(fs.existsSync(path.join(worktree, ".bellows-provisioned"))).toBe(true);
+  });
+
+  // bellows #39 follow-up: "the install marker should ideally only be written
+  // on success" — a failed installDeps must NOT leave .bellows-provisioned
+  // behind, or a broken worktree looks permanently "done" to every later run.
+  it("does NOT write the marker when installDeps returns false (failed install)", () => {
+    const worktree = mkWorktree();
+    const accordionRepo = mkWorktree();
+    const installDeps = vi.fn(() => false);
+    const logs = [];
+    provisionWorktree({ accordionRepo, worktree, log: (m) => logs.push(m), installDeps });
+
+    expect(fs.existsSync(path.join(worktree, ".bellows-provisioned"))).toBe(false);
+    expect(logs.some((m) => m.includes("WARN") && m.includes("did not fully succeed"))).toBe(true);
+  });
+
+  it("retries installDeps on a later call after a failed install left no marker", () => {
+    const worktree = mkWorktree();
+    const accordionRepo = mkWorktree();
+    const installDeps = vi.fn().mockReturnValueOnce(false).mockReturnValueOnce(true);
+
+    provisionWorktree({ accordionRepo, worktree, log: () => {}, installDeps }); // fails, no marker
+    expect(fs.existsSync(path.join(worktree, ".bellows-provisioned"))).toBe(false);
+
+    provisionWorktree({ accordionRepo, worktree, log: () => {}, installDeps }); // retried, succeeds
+    expect(installDeps).toHaveBeenCalledTimes(2);
+    expect(fs.existsSync(path.join(worktree, ".bellows-provisioned"))).toBe(true);
+  });
+
+  it("a bare vi.fn() (returns undefined) still counts as success and writes the marker", () => {
+    // Guards the exact compatibility case the marker-gating logic must not
+    // break: callers/tests that pass installDeps without bothering to return
+    // anything must be treated as success, only an explicit `false` is failure.
+    const worktree = mkWorktree();
+    const accordionRepo = mkWorktree();
+    const installDeps = vi.fn();
+    provisionWorktree({ accordionRepo, worktree, log: () => {}, installDeps });
     expect(fs.existsSync(path.join(worktree, ".bellows-provisioned"))).toBe(true);
   });
 });

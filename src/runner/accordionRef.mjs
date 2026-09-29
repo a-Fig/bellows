@@ -170,37 +170,55 @@ export function ensureWorktree({ accordionRepo, sha, runsDir, log = () => {} }) 
   const anchorDir = path.join(runsDir, "_accordion");
   fs.mkdirSync(anchorDir, { recursive: true });
 
-  // Fast path: already present and matching. Check before taking the lock so the
-  // common reuse case is lock-free.
-  if (worktreeMatches(wt, sha)) return wt;
+  // Fast path: already present, matching, AND fully provisioned. Checked before
+  // taking the lock so the common (steady-state) reuse case is lock-free.
+  //
+  // Deliberately NOT just worktreeMatches: a worktree can match the pinned sha
+  // while never having finished provisioning (a prior run's conductor-deps
+  // install failed or was interrupted — provisionWorktree now only writes
+  // .bellows-provisioned on SUCCESS, see below). Before this check existed,
+  // once worktreeMatches was true nothing ever called provisionWorktree again,
+  // so a single failed install would wedge every later run pinning this sha
+  // against missing node_modules until someone manually deleted the worktree
+  // (bellows #39 follow-up). Falling through to the locked path lets such a
+  // worktree get a real retry instead.
+  if (worktreeMatches(wt, sha) && isFullyProvisioned(wt)) return wt;
 
-  // Serialize creation across concurrent runs with a lockfile (atomic O_EXCL).
+  // Serialize creation (and re-provisioning attempts) across concurrent runs
+  // with a lockfile (atomic O_EXCL).
   const lockPath = wt + ".lock";
   const release = acquireLock(lockPath, log);
   try {
-    // Re-check under the lock — a concurrent run may have finished it while we waited.
-    if (worktreeMatches(wt, sha)) return wt;
-
-    // The dir exists but is broken/mismatched (or a stale worktree registration
-    // lingers). Tear it down before recreating.
-    if (fs.existsSync(wt)) {
-      log(`[accordionRef] worktree ${wt} exists but does not match ${shortSha(sha)} — recreating`);
-      removeWorktree(accordionRepo, wt, log);
-    }
-    // Prune any stale registration pointing at this path (e.g. the dir was
-    // deleted out from under git) so `worktree add` doesn't refuse.
-    gitTry(accordionRepo, ["worktree", "prune"]);
-
-    const add = gitTry(accordionRepo, ["worktree", "add", "--detach", wt, sha]);
-    if (!add.ok) {
-      // A racing run may have created it between our check and our add (EEXIST-ish).
-      if (worktreeMatches(wt, sha)) return wt;
-      throw new Error(`accordionRef: git worktree add --detach ${wt} ${shortSha(sha)} failed: ${add.err}`);
-    }
-    log(`[accordionRef] created worktree ${wt} @ ${shortSha(sha)}`);
     if (!worktreeMatches(wt, sha)) {
-      throw new Error(`accordionRef: worktree ${wt} did not check out ${shortSha(sha)} after add`);
+      // The dir exists but is broken/mismatched (or a stale worktree registration
+      // lingers). Tear it down before recreating.
+      if (fs.existsSync(wt)) {
+        log(`[accordionRef] worktree ${wt} exists but does not match ${shortSha(sha)} — recreating`);
+        removeWorktree(accordionRepo, wt, log);
+      }
+      // Prune any stale registration pointing at this path (e.g. the dir was
+      // deleted out from under git) so `worktree add` doesn't refuse.
+      gitTry(accordionRepo, ["worktree", "prune"]);
+
+      const add = gitTry(accordionRepo, ["worktree", "add", "--detach", wt, sha]);
+      if (!add.ok && !worktreeMatches(wt, sha)) {
+        // Not a race (worktreeMatches would be true if a concurrent run just
+        // finished creating it while we were adding) — a genuine failure.
+        throw new Error(`accordionRef: git worktree add --detach ${wt} ${shortSha(sha)} failed: ${add.err}`);
+      }
+      if (add.ok) {
+        log(`[accordionRef] created worktree ${wt} @ ${shortSha(sha)}`);
+        if (!worktreeMatches(wt, sha)) {
+          throw new Error(`accordionRef: worktree ${wt} did not check out ${shortSha(sha)} after add`);
+        }
+      }
     }
+    // Reached whenever the worktree is present & matching under the lock —
+    // whether it already matched (steady-state reuse, possibly retrying a
+    // previously-failed provision), was just created, or was created by a
+    // racing run while we waited for the lock. provisionWorktree is itself
+    // marker-gated and only marks success, so this is a cheap no-op once truly
+    // provisioned and a real retry otherwise (bellows #39 follow-up).
     provisionWorktree({ accordionRepo, worktree: wt, log });
     return wt;
   } finally {
@@ -234,8 +252,10 @@ export function ensureWorktree({ accordionRepo, sha, runsDir, log = () => {} }) 
  * @param {string} args.accordionRepo
  * @param {string} args.worktree
  * @param {(m:string)=>void} [args.log]
- * @param {(worktree:string, log:(m:string)=>void)=>void} [args.installDeps]
- *   test seam — replaces installConductorWsDeps
+ * @param {(worktree:string, log:(m:string)=>void)=>(boolean|void)} [args.installDeps]
+ *   test seam — replaces installConductorWsDeps. Returning `false` means
+ *   provisioning did NOT fully succeed; anything else (including a bare
+ *   `vi.fn()` test double returning `undefined`) counts as success.
  */
 export function provisionWorktree({ accordionRepo, worktree, log = () => {}, installDeps = installConductorWsDeps }) {
   const marker = path.join(worktree, ".bellows-provisioned");
@@ -255,7 +275,21 @@ export function provisionWorktree({ accordionRepo, worktree, log = () => {}, ins
       log(`[accordionRef] provisioned ${dst} (minimal stub — base checkout had none)`);
     }
   }
-  installDeps(worktree, log);
+  // The marker is written ONLY when installDeps signals success (anything but
+  // an explicit `false`). Previously it was written unconditionally, so a
+  // failed conductor-deps install still got remembered as "provisioned" —
+  // combined with ensureWorktree's old lock-free fast path never re-checking
+  // provisioning status at all, that meant a single failed install wedged
+  // every later run against missing node_modules until someone manually
+  // deleted the worktree (bellows #39 follow-up: "the install marker should
+  // ideally only be written on success"). See ensureWorktree for the other
+  // half of this fix — the marker alone isn't sufficient, since something also
+  // has to call provisionWorktree again on reuse for a retry to ever happen.
+  const installed = installDeps(worktree, log);
+  if (installed === false) {
+    log(`[accordionRef] WARN: provisioning ${worktree} did not fully succeed — leaving .bellows-provisioned unwritten so a later run retries`);
+    return;
+  }
   try {
     fs.writeFileSync(marker, new Date().toISOString());
   } catch {
@@ -285,11 +319,26 @@ const NPM_INSTALL_TIMEOUT_MS = 5 * 60_000;
  * other's installs. A failure here is logged as a WARN and does NOT throw —
  * the conductor's own attach-time error ("Tree-sitter dependencies required
  * for code skeletonization are not installed...") remains the loud signal for
- * an operator; this function only tries to avoid ever producing it.
+ * an operator; this function only tries to avoid ever producing it. It DOES
+ * report success/failure via its return value (see below) so provisionWorktree
+ * can decide whether to mark the worktree provisioned.
+ *
+ * `--ignore-scripts` (bellows #39 follow-up): verified empirically against the
+ * current conductor workspaces rather than assumed — triptych's full resolved
+ * dependency tree (itself + web-tree-sitter + tree-sitter-wasms, 3 packages
+ * total per its package-lock.json) has zero preinstall/install/postinstall/
+ * prepare/prepublish scripts anywhere in it, and thermocline has no
+ * dependencies at all. So skipping lifecycle scripts here is safe today and
+ * closes off arbitrary code execution during an unattended provisioning step.
+ * If a future conductor dependency legitimately needs an install script, this
+ * needs revisiting (e.g. scoped per-conductor), not silently dropped again.
  *
  * @param {string} worktree
  * @param {(m:string)=>void} [log]
  * @param {typeof spawnSafeSync} [spawnFn]  test seam: substitute a fake sync spawn
+ * @returns {boolean} true if every conductor that needed installing succeeded
+ *   (including the trivial "nothing to install" cases); false if at least one
+ *   install failed.
  */
 export function installConductorWsDeps(worktree, log = () => {}, spawnFn = spawnSafeSync) {
   const wsDir = path.join(worktree, "conductors", "ws");
@@ -297,15 +346,16 @@ export function installConductorWsDeps(worktree, log = () => {}, spawnFn = spawn
   try {
     entries = fs.readdirSync(wsDir, { withFileTypes: true });
   } catch {
-    return; // no conductors/ws dir in this checkout (older ref, or none) — nothing to do
+    return true; // no conductors/ws dir in this checkout (older ref, or none) — nothing to do
   }
+  let ok = true;
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const dir = path.join(wsDir, entry.name);
     if (!fs.existsSync(path.join(dir, "package.json"))) continue;
     if (fs.existsSync(path.join(dir, "node_modules"))) continue; // already installed
     const hasLockfile = fs.existsSync(path.join(dir, "package-lock.json"));
-    const args = hasLockfile ? ["ci", "--no-audit", "--no-fund"] : ["install", "--no-audit", "--no-fund"];
+    const args = hasLockfile ? ["ci", "--no-audit", "--no-fund", "--ignore-scripts"] : ["install", "--no-audit", "--no-fund", "--ignore-scripts"];
     let result;
     try {
       result = spawnFn("npm", args, {
@@ -317,10 +367,12 @@ export function installConductorWsDeps(worktree, log = () => {}, spawnFn = spawn
       });
     } catch (e) {
       log(`[accordionRef] WARN: npm ${args[0]} failed in conductors/ws/${entry.name}: ${e && e.message ? e.message : e}`);
+      ok = false;
       continue;
     }
     if (result.error) {
       log(`[accordionRef] WARN: npm ${args[0]} failed in conductors/ws/${entry.name}: ${result.error.message}`);
+      ok = false;
       continue;
     }
     if (result.status !== 0) {
@@ -330,10 +382,12 @@ export function installConductorWsDeps(worktree, log = () => {}, spawnFn = spawn
         .filter(Boolean);
       const reason = stderrLines.length ? stderrLines[stderrLines.length - 1] : `exited ${result.status}`;
       log(`[accordionRef] WARN: npm ${args[0]} failed in conductors/ws/${entry.name} (exit ${result.status}): ${reason}`);
+      ok = false;
       continue;
     }
     log(`[accordionRef] installed deps in conductors/ws/${entry.name}`);
   }
+  return ok;
 }
 
 /**
@@ -364,6 +418,11 @@ function worktreeMatches(wt, sha) {
   if (!fs.existsSync(wt)) return false;
   const r = gitTry(wt, ["rev-parse", "HEAD"]);
   return r.ok && r.out === sha;
+}
+
+/** True iff `wt` was already successfully provisioned (see provisionWorktree). */
+function isFullyProvisioned(wt) {
+  return fs.existsSync(path.join(wt, ".bellows-provisioned"));
 }
 
 /** Remove a worktree (force), tolerating an already-broken registration. */

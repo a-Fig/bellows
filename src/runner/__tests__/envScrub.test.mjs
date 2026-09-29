@@ -50,4 +50,30 @@ describe("scrubEnv", () => {
     expect(SECRET_ENV_NAME_RE.test("PATH")).toBe(false);
     expect(SECRET_ENV_NAME_RE.test("HOME")).toBe(false);
   });
+
+  // 2026-09-29 Fable review, bellows #37 blocking follow-up: the regex missed
+  // a bare "*_KEY" (no "API" in the name), *_DSN connection strings, cookies,
+  // and session values.
+  it("SECRET_ENV_NAME_RE now also matches bare *_KEY, DSN, COOKIE, and SESSION shapes", () => {
+    for (const name of ["OPENROUTER_KEY", "DEEPSEEK_KEY", "SSH_KEY", "KEY", "SENTRY_DSN", "DATABASE_DSN", "SESSION_COOKIE", "MY_SESSION", "COOKIE"]) {
+      expect(SECRET_ENV_NAME_RE.test(name)).toBe(true);
+    }
+  });
+
+  it("the bare-KEY pattern does not false-positive on KEY appearing mid-word", () => {
+    expect(SECRET_ENV_NAME_RE.test("KEYBOARD_LAYOUT")).toBe(false);
+    expect(SECRET_ENV_NAME_RE.test("MONKEY")).toBe(false);
+  });
+
+  it("scrubEnv drops the newly-covered shapes end to end", () => {
+    const { env, scrubbed } = scrubEnv({
+      PATH: "/usr/bin",
+      OPENROUTER_KEY: "sk-1",
+      SENTRY_DSN: "https://x:y@sentry.example/1",
+      SESSION_ID: "abc123",
+      AUTH_COOKIE: "abc123",
+    });
+    expect(env).toEqual({ PATH: "/usr/bin" });
+    expect(scrubbed).toEqual(["AUTH_COOKIE", "OPENROUTER_KEY", "SENTRY_DSN", "SESSION_ID"].sort());
+  });
 });

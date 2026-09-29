@@ -32,8 +32,13 @@ set AGENT_TRIALS_API_KEY=at_...                   # your platform account key
 Requires: a local Accordion checkout, pi on PATH, provider keys in `~/.pi/agent/auth.json`.
 
 Set `"scrubPiEnv": true` in `bench.config.json` (recommended) to keep secrets like the
-platform API key out of the benchmarked agent's own bash tool — see TUTORIAL.md →
-*Keeping secrets out of the agent's env*.
+platform API key out of the agent's spawned **env**. This is not a hard guarantee against
+the agent's bash tool: the runner's process itself (and anything it spawns, e.g. the
+host) still holds the full unscrubbed env, and a same-uid process can generally read
+another process's env off `/proc/<pid>/environ` — `"sandbox": "landlock"` (below) does
+**not** close this off either (it grants blanket read access to `/proc` and doesn't
+enable Landlock's separate ptrace-scoping feature). See TUTORIAL.md → *Keeping secrets
+out of the agent's env*.
 
 On Linux, `"sandbox": "landlock"` additionally confines pi and everything it spawns to
 its own run dir (no reading other arms' solutions, harness logs or `$HOME`) — see

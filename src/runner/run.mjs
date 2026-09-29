@@ -452,6 +452,12 @@ export async function executeRun(args) {
         conductor.completeInputTokens = completionLog.completeInputTokens;
         conductor.completeOutputTokens = completionLog.completeOutputTokens;
         conductor.completeCacheReadTokens = completionLog.completeCacheReadTokens;
+        conductor.completeCacheWriteTokens = completionLog.completeCacheWriteTokens;
+        // Additive with any legacy host.jsonl "complete" rows already folded in
+        // by foldHostTelemetry above — both sources can independently see a
+        // null-priced completion (bellows #38 follow-up items 3/4).
+        conductor.completeCostUnknownCount += completionLog.completeCostUnknownCount;
+        conductor.completeCostUnknownProviders = completionLog.completeCostUnknownProviders;
       }
     } catch (e) {
       log(`[${label}] completion log collect error: ${e.message}`);

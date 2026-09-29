@@ -18,11 +18,19 @@
 #   - handoff           in-process, devmain-only
 #   - doorman           in-process, devmain-only (new on devmain, no main equivalent)
 #   - thermocline       spawn/out-of-process, devmain-only
-# triptych is DELIBERATELY EXCLUDED: it declares requiredModules
-# ["web-tree-sitter", "tree-sitter-wasms/package.json"] and reports readiness
-# "unavailable" in a bellows worktree, because bellows worktree provisioning
-# deliberately never runs `npm install`. Including it would just be a
-# guaranteed-unavailable arm burning a room slot for no data.
+# triptych is DELIBERATELY EXCLUDED from this lineup (still true as of this
+# writing, but NOT for the reason this comment used to give — that reason is
+# stale as of bellows #39). Provisioning is NO LONGER "never runs npm
+# install": installConductorWsDeps now runs `npm ci --ignore-scripts` for any
+# conductors/ws/* package that has a package.json + lockfile and no
+# node_modules yet, and this SHA's conductors/ws/triptych qualifies (it has
+# both). So triptych's requiredModules (web-tree-sitter, tree-sitter-wasms —
+# ordinary npm deps with zero install-time lifecycle scripts, verified
+# empirically) would now get installed during provisioning. Whether
+# triptych's preflight/readiness actually passes end-to-end after that install
+# has NOT been verified here, so it stays excluded to avoid burning a room
+# slot on an unconfirmed arm — revisit once that's checked, rather than
+# assuming either outcome.
 #
 # Bare conductor ids (not "external:<id>") throughout: this is a devmain
 # (non-legacy, protocol.ts-shaped) checkout, so run.mjs's

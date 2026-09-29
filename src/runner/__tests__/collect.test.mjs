@@ -307,6 +307,28 @@ describe("foldHostTelemetry", () => {
     expect(tel.lastStatusText).toBeNull();
     expect(tel.statusCount).toBe(0);
   });
+  it("completeCostUnknownCount is 0 when every 'complete' row carried a real costUsd", () => {
+    expect(tel.completeCostUnknownCount).toBe(0);
+    expect(tel.completeCostUnknownProviders).toEqual([]);
+  });
+});
+
+// 2026-09-29 Fable review, bellows #38 follow-up items 3/4: a "complete" row's
+// costUsd is `number | null` (see HostEvent in types.ts) — a null must be
+// counted, not silently folded into completeCostUsd as an indistinguishable $0.
+describe("foldHostTelemetry — null costUsd on a 'complete' row (not measured, not $0)", () => {
+  it("counts a null-costUsd complete row without adding to completeCostUsd", () => {
+    const fixture = [
+      JSON.stringify({ t: "attach", at: 100, conductor: "keel", budget: 40000 }),
+      JSON.stringify({ t: "complete", at: 200, costUsd: 0.02, latencyMs: 100 }),
+      JSON.stringify({ t: "complete", at: 300, costUsd: null, latencyMs: 150 }),
+    ].join("\n");
+    const tel = foldHostTelemetry(fixture, "keel");
+    expect(tel.completeCostUsd).toBeCloseTo(0.02, 9);
+    expect(tel.completeCostUnknownCount).toBe(1);
+    // Legacy host.jsonl "complete" rows carry no provider/model to tag.
+    expect(tel.completeCostUnknownProviders).toEqual([]);
+  });
 });
 
 // Mid-task addition: Accordion protocol v22's conductorStatus broadcast (a conductor
@@ -654,6 +676,11 @@ describe("foldCompletionLog / collectCompletionLog — completions.jsonl side lo
       completeInputTokens: 350, // 100 + 200 + 50 (error line contributes 0)
       completeOutputTokens: 65, // 20 + 40 + 5
       completeCacheReadTokens: 15, // 5 + 10 + 0
+      completeCacheWriteTokens: 0,
+      // The costUsd:null line (2026-09-29 Fable review, bellows #38 follow-up
+      // items 3/4): counted and tagged, NOT silently folded into completeCostUsd as $0.
+      completeCostUnknownCount: 1,
+      completeCostUnknownProviders: ["anthropic:claude-x"],
     });
   });
 
@@ -671,6 +698,9 @@ describe("foldCompletionLog / collectCompletionLog — completions.jsonl side lo
       completeInputTokens: 1,
       completeOutputTokens: 1,
       completeCacheReadTokens: 0,
+      completeCacheWriteTokens: 0,
+      completeCostUnknownCount: 0,
+      completeCostUnknownProviders: [],
     });
   });
 
@@ -682,6 +712,9 @@ describe("foldCompletionLog / collectCompletionLog — completions.jsonl side lo
       completeInputTokens: 0,
       completeOutputTokens: 0,
       completeCacheReadTokens: 0,
+      completeCacheWriteTokens: 0,
+      completeCostUnknownCount: 0,
+      completeCostUnknownProviders: [],
     });
   });
 
@@ -729,19 +762,24 @@ describe("foldCompletionLog / collectCompletionLog — completions.jsonl side lo
         completeInputTokens: 1,
         completeOutputTokens: 1,
         completeCacheReadTokens: 1,
+        completeCacheWriteTokens: 0,
+        completeCostUnknownCount: 0,
+        completeCostUnknownProviders: [],
       });
     });
   });
 });
 
 describe("foldHostTelemetry — completions.jsonl field defaults", () => {
-  it("seeds completeCalls/completeErrors/completeInputTokens/completeOutputTokens/completeCacheReadTokens at 0", () => {
+  it("seeds completeCalls/completeErrors/completeInputTokens/completeOutputTokens/completeCacheReadTokens/completeCacheWriteTokens/completeCostUnknownProviders at 0/[]", () => {
     const tel = foldHostTelemetry(HOST_FIXTURE, "fallback");
     expect(tel.completeCalls).toBe(0);
     expect(tel.completeErrors).toBe(0);
     expect(tel.completeInputTokens).toBe(0);
     expect(tel.completeOutputTokens).toBe(0);
     expect(tel.completeCacheReadTokens).toBe(0);
+    expect(tel.completeCacheWriteTokens).toBe(0);
+    expect(tel.completeCostUnknownProviders).toEqual([]);
   });
 });
 

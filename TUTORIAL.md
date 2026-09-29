@@ -31,11 +31,39 @@ benchmarked agent's own bash tool. Add to `bench.config.json`:
 
 `scrubPiEnv: true` (default `false`, for backward compat) strips every env var
 whose **name** matches `/(API_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|
-PRIVATE_?KEY|AUTH)/i` before spawning pi, except names listed in
-`piEnvPassthrough`. Only variable *names* are ever logged (one line at run
-start listing what was scrubbed) — values never are. **Recommended for any
-bench run where the agent's tool output isn't fully trusted.** A per-arm
-`env` (above) is applied after the scrub and is never scrubbed itself.
+PRIVATE_?KEY|AUTH|(^|_)KEY(_|$)|DSN|COOKIE|SESSION)/i` before spawning pi, except
+names listed in `piEnvPassthrough`. Only variable *names* are ever logged (one
+line at run start listing what was scrubbed) — values never are. It's a
+NAME-only heuristic: it can't tell a real secret from an innocuous var whose
+name happens to match, and it can't catch a secret embedded in a value whose
+name doesn't (an unscrubbed `*_URL` with a baked-in password, for example) —
+false positives are the safe failure mode; un-scrub those via
+`piEnvPassthrough`. **Recommended for any bench run where the agent's tool
+output isn't fully trusted.** A per-arm `env` (above) is applied after the
+scrub and is never scrubbed itself.
+
+**`scrubPiEnv` alone does not reliably keep secrets from the agent's bash
+tool, and `sandbox: "landlock"` (next section) does not close this gap
+either.** `scrubPiEnv` only shapes the env pi itself is spawned with. The
+runner process (and the host it spawns — `spawnHost`'s env is
+`{...process.env, ...hostEnv(config)}`, the full unscrubbed env) still holds
+every secret, and on Linux a same-uid process can generally read another
+process's environment straight off `/proc/<pid>/environ` (gated by a kernel
+ptrace-mode check that's independent of any LSM bellows configures; Yama's
+default ptrace_scope, where present, restricts `PTRACE_ATTACH` more than it
+restricts this read). Landlock **cannot** help here even in principle unless
+its ptrace/signal-scoping feature is turned on (`LANDLOCK_SCOPE_*`, ABI 6+) —
+and `bin/landlock-exec.py` deliberately does not turn it on (see its own
+"Deliberately NOT restricted" note), and separately grants blanket **read**
+access to all of `/proc` for unrelated reasons (letting pi/node/python read
+`/proc/cpuinfo`, `/proc/self/*`, etc.) — so `/proc/<pid>/environ` for other
+processes is not even path-denied. An agent whose bash tool runs
+`cat /proc/$PPID/environ` should be assumed to get the runner's full,
+unscrubbed env back, sandboxed or not. Treat `scrubPiEnv` as reducing the
+blast radius of casual/accidental exposure (a stray `env`/`printenv` call in
+agent output, a crash dump, a debug log) and the risk from the wider set of
+env vars a *scrubbed* env still lacks — not as a hard boundary against a bash
+tool that deliberately goes looking.
 
 ### Keeping the agent inside its run dir (`sandbox: "landlock"`, Linux)
 
@@ -80,8 +108,11 @@ node bin/bellows.mjs sandbox-check [trials/x.yaml] [--keep]
 ```
 
 Known gaps: the agent can still `stat` paths it cannot open, read other
-processes' command lines in `/proc`, read its own `agent/auth.json` (pi needs
-it in the same process), and connect to loopback ports.
+processes' command lines AND environment (`/proc/<pid>/cmdline`,
+`/proc/<pid>/environ` — see the `scrubPiEnv` note above; this sandbox does not
+enable Landlock's ptrace/signal-scoping feature) in `/proc`, read its own
+`agent/auth.json` (pi needs it in the same process), and connect to loopback
+ports.
 
 ### Verifying egress is blocked (`sandboxEgress: "blocked"`)
 
@@ -231,9 +262,14 @@ for both `bellows run` and claimed worker runs):
   `PI_CODING_AGENT_SESSION_DIR`, `ACCORDION_HOME`, `PATH`, `HOME`) is rejected.
 - `env` is applied to pi's spawn env **after** `scrubPiEnv` (below) — arm env is
   explicit, authored config, and is never itself scrubbed.
-- `env` is part of the run's fingerprint, so two arms sharing a conductor but
-  differing only in `env` are never silently treated as the same condition in
-  the report/comparison.
+- `env` is part of the run's fingerprint, and the report's per-arm aggregation
+  (`aggregateGroup`, `src/report/aggregate.mjs`) buckets rows by conductor id
+  **and** `env` together, so two arms sharing a conductor but differing only in
+  `env` get separate rows (with the differing `env` shown as a badge next to
+  the conductor id) instead of being silently pooled into one
+  (2026-09-29 Fable review, bellows #37 blocking follow-up — this was a real
+  bug before that fix: `compaction-naive` and the `naive-t075` example above
+  collapsed into a single row).
 
 ### Bench a specific Accordion branch/PR (`accordionRef`)
 

@@ -3,7 +3,7 @@ import { mkdir, writeFile, rm, readFile, mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import generateReport from "./index.mjs";
-import { aggregateGroup, isAborted, scorelessKind } from "./aggregate.mjs";
+import { aggregateGroup, isAborted, scorelessKind, envKeyOf, envLabelOf } from "./aggregate.mjs";
 
 const SHARED_FP = {
   model: "token-router:deepseek/deepseek-v4-flash",
@@ -368,6 +368,160 @@ describe("generateReport — plan RTT column + stat block gating (Accordion issu
     expect(rttHtml).toContain("example/keel/1");
     // fmtNum defaults to 0 fraction digits: 123.45 -> "123".
     expect(rttHtml).toContain("123ms / 400ms");
+  });
+});
+
+// Fable review, bellows #37 blocking follow-up: two arms dispatching the same
+// conductor with different env overrides (TUTORIAL's own example:
+// compaction-naive vs a compaction-naive arm with
+// ACCORDION_SUMMARY_TRIGGER: "0.75") were silently pooled into one row,
+// contradicting TUTORIAL's claim that arms differentiated by env are "never
+// silently treated as the same condition".
+describe("aggregateGroup keeps same-conductor arms with different env separate (bellows #37)", () => {
+  it("produces two rows for the same conductorId when env overrides differ", () => {
+    const runs = [
+      makeRun({ id: "x/compaction-naive/1", conductorId: "compaction-naive", seed: 1 }),
+      makeRun({ id: "x/compaction-naive/2", conductorId: "compaction-naive", seed: 2 }),
+      makeRun({
+        id: "x/naive-t075/1",
+        conductorId: "compaction-naive",
+        seed: 1,
+        fingerprintOverrides: { env: { ACCORDION_SUMMARY_TRIGGER: "0.75" } },
+      }),
+      makeRun({
+        id: "x/naive-t075/2",
+        conductorId: "compaction-naive",
+        seed: 2,
+        fingerprintOverrides: { env: { ACCORDION_SUMMARY_TRIGGER: "0.75" } },
+      }),
+    ];
+    const rows = aggregateGroup({ runs });
+    expect(rows).toHaveLength(2);
+    const baseline = rows.find((r) => r.envLabel === "");
+    const variant = rows.find((r) => r.envLabel === "ACCORDION_SUMMARY_TRIGGER=0.75");
+    expect(baseline).toBeDefined();
+    expect(variant).toBeDefined();
+    expect(baseline.runsCount).toBe(2);
+    expect(variant.runsCount).toBe(2);
+    expect(baseline.armKey).not.toBe(variant.armKey);
+  });
+
+  it("still pools runs sharing the same conductorId and the same env (or both absent)", () => {
+    const runs = [
+      makeRun({ id: "x/keel/1", conductorId: "keel", seed: 1 }),
+      makeRun({ id: "x/keel/2", conductorId: "keel", seed: 2 }),
+    ];
+    const rows = aggregateGroup({ runs });
+    expect(rows).toHaveLength(1);
+    expect(rows[0].runsCount).toBe(2);
+  });
+
+  it("envKeyOf/envLabelOf are order-independent over env object key order", () => {
+    const a = { fingerprint: { env: { B: "2", A: "1" } } };
+    const b = { fingerprint: { env: { A: "1", B: "2" } } };
+    expect(envKeyOf(a)).toBe(envKeyOf(b));
+    expect(envLabelOf(a)).toBe(envLabelOf(b));
+    expect(envLabelOf(a)).toBe("A=1, B=2");
+  });
+
+  it("envKeyOf/envLabelOf return '' for absent or empty env", () => {
+    expect(envKeyOf({ fingerprint: {} })).toBe("");
+    expect(envKeyOf({ fingerprint: { env: {} } })).toBe("");
+    expect(envLabelOf({ fingerprint: {} })).toBe("");
+  });
+
+  it("renders both arms' env as a distinguishing badge in the HTML report", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "bellows-report-envsplit-"));
+    const runsDir = path.join(dir, "runs");
+    const outFile = path.join(dir, "out", "report.html");
+    await mkdir(path.join(runsDir, "example"), { recursive: true });
+    const runs = [
+      makeRun({ id: "example/compaction-naive/1", conductorId: "compaction-naive", seed: 1 }),
+      makeRun({
+        id: "example/naive-t075/1",
+        conductorId: "compaction-naive",
+        seed: 1,
+        fingerprintOverrides: { env: { ACCORDION_SUMMARY_TRIGGER: "0.75" } },
+      }),
+    ];
+    for (const run of runs) {
+      const safeName = run.id.replace(/\//g, "_");
+      await writeFile(path.join(runsDir, "example", `${safeName}.json`), JSON.stringify(run, null, 2), "utf8");
+    }
+    await generateReport(runsDir, outFile);
+    const html = await readFile(outFile, "utf8");
+    expect(html).toContain("ACCORDION_SUMMARY_TRIGGER=0.75");
+    await rm(dir, { recursive: true, force: true });
+  });
+});
+
+// 2026-09-29 Fable review, bellows #38 follow-up: conductor spend
+// (completeCostUsd) was entirely absent from the report's aggregates — a run
+// costing agent $0.276 + conductor $0.162 reported as just $0.276, understating
+// the arm by ~37%.
+describe("aggregateGroup includes conductor cost (bellows #38 follow-up item 2)", () => {
+  const withConductor = (run, completeCostUsd, extra = {}) => ({
+    ...run,
+    conductor: { ...run.conductor, completeCostUsd, completeCostUnknownCount: 0, completeCostUnknownProviders: [], ...extra },
+  });
+
+  it("adds a conductorCostUsd column (median) alongside the agent-only costUsd", () => {
+    const runs = [
+      withConductor(makeRun({ id: "x/keel/1", conductorId: "keel", seed: 1, costUsd: 0.276 }), 0.162),
+      withConductor(makeRun({ id: "x/keel/2", conductorId: "keel", seed: 2, costUsd: 0.3 }), 0.2),
+    ];
+    const [row] = aggregateGroup({ runs });
+    expect(row.costUsd).toBeCloseTo(0.288, 6); // median agent cost, unchanged
+    expect(row.conductorCostUsd).toBeCloseTo(0.181, 6); // median conductor cost
+    // Combined is computed per-run then medianed: median(0.276+0.162, 0.3+0.2).
+    expect(row.combinedCostUsd).toBeCloseTo(0.469, 6);
+  });
+
+  it("excludes runs with no conductor at all (arm 'none') from conductorCostUsd's median, not counts them as 0", () => {
+    const runs = [makeRun({ id: "x/none/1", conductorId: "none", seed: 1, costUsd: 0.1 })];
+    runs[0].conductor = null;
+    const [row] = aggregateGroup({ runs });
+    expect(row.conductorCostUsd).toBeNull();
+    // combinedCostUsd still reflects the real agent spend rather than dropping it.
+    expect(row.combinedCostUsd).toBeCloseTo(0.1, 6);
+  });
+
+  it("flags runs whose conductor had an unknown-priced completion, naming the provider(s)", () => {
+    const runs = [
+      withConductor(makeRun({ id: "x/keel/1", conductorId: "keel", seed: 1 }), 0, { completeCostUnknownCount: 1, completeCostUnknownProviders: ["free-tier:model-a"] }),
+      withConductor(makeRun({ id: "x/keel/2", conductorId: "keel", seed: 2 }), 0.05),
+    ];
+    const [row] = aggregateGroup({ runs });
+    expect(row.conductorCostUnknownRuns).toBe(1);
+    expect(row.conductorCostUnknownProviders).toEqual(["free-tier:model-a"]);
+  });
+
+  it("conductorCostUnknownRuns is 0 and conductorCostUnknownProviders is [] when every completion was priced", () => {
+    const runs = [withConductor(makeRun({ id: "x/keel/1", conductorId: "keel", seed: 1 }), 0.05)];
+    const [row] = aggregateGroup({ runs });
+    expect(row.conductorCostUnknownRuns).toBe(0);
+    expect(row.conductorCostUnknownProviders).toEqual([]);
+  });
+
+  it("renders the conductor cost columns and an unpriced badge in the HTML report", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "bellows-report-conductorcost-"));
+    const runsDir = path.join(dir, "runs");
+    const outFile = path.join(dir, "out", "report.html");
+    await mkdir(path.join(runsDir, "example"), { recursive: true });
+    const runs = [
+      withConductor(makeRun({ id: "example/keel/1", conductorId: "keel", seed: 1, costUsd: 0.276 }), 0, { completeCostUnknownCount: 1, completeCostUnknownProviders: ["free-tier:model-a"] }),
+    ];
+    for (const run of runs) {
+      const safeName = run.id.replace(/\//g, "_");
+      await writeFile(path.join(runsDir, "example", `${safeName}.json`), JSON.stringify(run, null, 2), "utf8");
+    }
+    await generateReport(runsDir, outFile);
+    const html = await readFile(outFile, "utf8");
+    expect(html).toContain("median conductor cost");
+    expect(html).toContain("median combined cost");
+    expect(html).toContain("unpriced");
+    expect(html).toContain("free-tier:model-a");
+    await rm(dir, { recursive: true, force: true });
   });
 });
 
