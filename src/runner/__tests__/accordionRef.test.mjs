@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync, spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import {
   validateAccordionRef,
   ACCORDION_REF_RE,
@@ -14,6 +15,7 @@ import {
   resolveEffectiveAccordionRepo,
   provisionWorktree,
   installConductorWsDeps,
+  spawnAwaited,
   NPM_INSTALL_TIMEOUT_MS,
   LOCK_TIMEOUT_MS,
   LOCK_STALE_MS,
@@ -397,6 +399,61 @@ describe("acquireLock cross-process contention (real event-loop reproduction)", 
       expect(elapsed).toBeGreaterThanOrEqual(holdMs * 0.8);
     },
     15_000,
+  );
+});
+
+describe("spawnAwaited (timeout option forwarding)", () => {
+  // A minimal stand-in for a ChildProcess: EventEmitter-based (spawnAwaited
+  // only ever calls .on(...) and, via killTree, .kill()), with a .stderr
+  // sub-emitter and pid/exitCode fields killTree's own guard checks.
+  function makeFakeChild() {
+    const child = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.pid = 999999; // unlikely to collide with a real PID
+    child.exitCode = null;
+    child.kill = vi.fn();
+    return child;
+  }
+
+  it(
+    "strips timeout/killSignal before calling spawnFn, so Node's own built-in spawn timeout is never double-armed alongside the manual killTree one (coordinator follow-up to #44's cheap note)",
+    async () => {
+      vi.useFakeTimers();
+      try {
+        let receivedOpts;
+        const fakeChild = makeFakeChild();
+        const spawnFn = vi.fn((_cmd, _args, opts) => {
+          receivedOpts = opts;
+          return fakeChild;
+        });
+
+        const resultPromise = spawnAwaited(
+          "npm",
+          ["ci"],
+          { cwd: "/tmp/x", timeout: 5000, killSignal: "SIGKILL", windowsHide: true },
+          spawnFn,
+        );
+
+        // spawnFn runs synchronously inside the Promise executor above.
+        expect(spawnFn).toHaveBeenCalledTimes(1);
+        expect(receivedOpts).not.toHaveProperty("timeout");
+        expect(receivedOpts).not.toHaveProperty("killSignal");
+        // Everything else opts carried is passed through unchanged.
+        expect(receivedOpts).toMatchObject({ cwd: "/tmp/x", windowsHide: true });
+
+        // The manual mechanism (reading `timeout` off the ORIGINAL opts, not
+        // the stripped one handed to spawnFn) must still fire and resolve
+        // with the diagnostic error — proving the strip didn't disable
+        // timeout enforcement, just Node's redundant, racy built-in copy of
+        // it.
+        await vi.advanceTimersByTimeAsync(5000);
+        const result = await resultPromise;
+        expect(result.status).toBe(null);
+        expect(result.error?.message).toMatch(/timed out after 5000ms — killed the child/);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
   );
 });
 
