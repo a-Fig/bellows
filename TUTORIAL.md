@@ -31,11 +31,58 @@ benchmarked agent's own bash tool. Add to `bench.config.json`:
 
 `scrubPiEnv: true` (default `false`, for backward compat) strips every env var
 whose **name** matches `/(API_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|
-PRIVATE_?KEY|AUTH)/i` before spawning pi, except names listed in
-`piEnvPassthrough`. Only variable *names* are ever logged (one line at run
-start listing what was scrubbed) — values never are. **Recommended for any
-bench run where the agent's tool output isn't fully trusted.** A per-arm
-`env` (above) is applied after the scrub and is never scrubbed itself.
+PRIVATE_?KEY|AUTH|(^|_)KEY(_|$)|DSN|COOKIE|SESSION)/i` before spawning pi, except
+names listed in `piEnvPassthrough`. Only variable *names* are ever logged (one
+line at run start listing what was scrubbed) — values never are. It's a
+NAME-only heuristic: it can't tell a real secret from an innocuous var whose
+name happens to match, and it can't catch a secret embedded in a value whose
+name doesn't (an unscrubbed `*_URL` with a baked-in password, for example) —
+false positives are the safe failure mode; un-scrub those via
+`piEnvPassthrough`. **Recommended for any bench run where the agent's tool
+output isn't fully trusted.** A per-arm `env` (above) is applied after the
+scrub and is never scrubbed itself.
+
+**Without `sandbox: "landlock"` (next section), `scrubPiEnv` alone does not
+reliably keep secrets from the agent's bash tool — but combined WITH it, it
+does, for the specific `/proc/<pid>/environ` vector described below**
+(2026-09-30 Fable review — an earlier draft of this section had the Landlock
+mechanism backwards; corrected here against the actual kernel source, not
+memory). `scrubPiEnv` only shapes the env pi itself is spawned with. The
+runner process (and the host it spawns — `spawnHost`'s env is
+`{...process.env, ...hostEnv(config)}`, the full unscrubbed env) still holds
+every secret, and on Linux a same-uid process can generally read another
+process's environment straight off `/proc/<pid>/environ`: `environ_open` in
+`fs/proc/base.c` opens it via `mm_access(task, PTRACE_MODE_READ | ...)`,
+which goes through the kernel's ptrace-access check
+(`ptrace_may_access`/`security_ptrace_access_check`) — the SAME check
+`PTRACE_ATTACH` goes through, not a separate or weaker one. Without Landlock,
+same-uid plus a dumpable target is all that check requires (Yama's default
+`ptrace_scope`, where present, restricts `PTRACE_ATTACH` more than it
+restricts this read) — so an unsandboxed agent's bash tool running
+`cat /proc/$PPID/environ` gets the runner's full, unscrubbed env back.
+
+`sandbox: "landlock"` changes this for pi and everything pi spawns. pi runs
+inside a Landlock domain (`bin/landlock-exec.py`), and Landlock's ptrace
+restriction makes `hook_ptrace_access_check` return `EPERM` for any target
+process that isn't in the landlocked process's own domain hierarchy — and
+that hook covers `PTRACE_MODE_READ`, so it covers this `environ` read too.
+The runner and the host (`spawnHost` in `run.mjs`) are both spawned OUTSIDE
+pi's domain (plain, unwrapped spawns — see the code), so from inside the
+sandbox `cat /proc/<runner-or-host-pid>/environ` now fails closed. Two things
+that do NOT matter here, despite looking relevant: the blanket **read**
+access `SYSTEM_RO` grants to all of `/proc` (that's a path rule for
+`open()`/`stat()` — it doesn't bypass the separate ptrace gate this read is
+ALSO subject to), and `LANDLOCK_SCOPE_*` (ABI 6's abstract-unix-socket/signal
+scoping, which `bin/landlock-exec.py` indeed doesn't turn on — but it's
+unrelated to ptrace and was never the relevant mechanism). What remains
+readable inside the domain is pi's own (scrubbed) env, and anything the agent
+itself writes to disk or stdout.
+
+So: treat `scrubPiEnv` alone (no Landlock) as reducing the blast radius of
+casual/accidental exposure (a stray `env`/`printenv` call in agent output, a
+crash dump, a debug log) rather than a hard boundary. Combined with
+`sandbox: "landlock"`, it closes the `/proc/<pid>/environ` route specifically
+— run both together for the strongest guarantee this harness can give.
 
 ### Keeping the agent inside its run dir (`sandbox: "landlock"`, Linux)
 
@@ -80,8 +127,12 @@ node bin/bellows.mjs sandbox-check [trials/x.yaml] [--keep]
 ```
 
 Known gaps: the agent can still `stat` paths it cannot open, read other
-processes' command lines in `/proc`, read its own `agent/auth.json` (pi needs
-it in the same process), and connect to loopback ports.
+processes' command lines in `/proc` (`/proc/<pid>/cmdline` — unlike
+`/proc/<pid>/environ`, this is not ptrace-gated, so Landlock's ptrace
+restriction doesn't cover it; see the `scrubPiEnv` note above for why
+`environ` itself IS closed under this sandbox), read its own
+`agent/auth.json` (pi needs it in the same process), and connect to loopback
+ports.
 
 ### Verifying egress is blocked (`sandboxEgress: "blocked"`)
 
@@ -261,9 +312,14 @@ for both `bellows run` and claimed worker runs):
   `PI_CODING_AGENT_SESSION_DIR`, `ACCORDION_HOME`, `PATH`, `HOME`) is rejected.
 - `env` is applied to pi's spawn env **after** `scrubPiEnv` (below) — arm env is
   explicit, authored config, and is never itself scrubbed.
-- `env` is part of the run's fingerprint, so two arms sharing a conductor but
-  differing only in `env` are never silently treated as the same condition in
-  the report/comparison.
+- `env` is part of the run's fingerprint, and the report's per-arm aggregation
+  (`aggregateGroup`, `src/report/aggregate.mjs`) buckets rows by conductor id
+  **and** `env` together, so two arms sharing a conductor but differing only in
+  `env` get separate rows (with the differing `env` shown as a badge next to
+  the conductor id) instead of being silently pooled into one
+  (2026-09-29 Fable review, bellows #37 blocking follow-up — this was a real
+  bug before that fix: `compaction-naive` and the `naive-t075` example above
+  collapsed into a single row).
 
 ### Bench a specific Accordion branch/PR (`accordionRef`)
 

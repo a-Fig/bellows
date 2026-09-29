@@ -5,11 +5,18 @@
 # resolveRefToSha re-resolves a branch ref at run time and would silently
 # make two runs a week apart non-comparable under the same trial name.
 #
-# NOT COMPARABLE to devmain-conductors-xjq-100k, even though both are v22 and
-# the budget/protectTokens/minutes shape matches: main and devmain have
-# DIVERGED (main is 21 commits devmain lacks; devmain is 119 commits ahead of
-# main) — same protocol version, different tree. Compare this trial only
-# against other trials pinned to this exact accordionRef.
+# Re: comparability to devmain-conductors-xjq-100k — this comment previously
+# claimed main and devmain "have DIVERGED ... same protocol version, different
+# tree" and were therefore NOT COMPARABLE to that trial. That claim was
+# checked directly and is FALSE (2026-09-29, bellows #36 follow-up): `git
+# rev-parse <sha>^{tree}` for BOTH this SHA (39667c8558b9...) and
+# devmain-conductors-xjq-100k's SHA (368498a63fef...) resolves to the exact
+# same tree, 36b9941c78d77afc0949a76d6b217bd13692d2c1. Despite differing
+# commit history/branch lineage (however many commits each is "ahead" of the
+# other), the checked-out file contents at these two pins are byte-identical
+# — same conductor registry, same everything provisioning touches. The two
+# trials ARE comparable at the source level; only the recorded
+# fingerprint.accordionCommit metadata differs.
 #
 # Arms are every conductor id in core/conductor/registry.ts ENTRIES on main
 # except one:
@@ -22,12 +29,19 @@
 # exist on this SHA — see builtin-vs-naive-xjq-100k-v3.yaml / keel-vs-sliding-
 # xjq-100k.yaml for the pre-divergence lineup they belonged to.
 #
-# triptych is DELIBERATELY EXCLUDED: it declares requiredModules
-# ["web-tree-sitter", "tree-sitter-wasms/package.json"] and reports readiness
-# "unavailable" in a bellows worktree, because bellows worktree provisioning
-# (src/runner/accordionRef.mjs) deliberately never runs `npm install`.
-# Including it would just be a guaranteed-unavailable arm burning a room slot
-# for no data.
+# triptych is DELIBERATELY EXCLUDED from this lineup (still true as of this
+# writing, but NOT for the reason this comment used to give — that reason is
+# stale as of bellows #39). Provisioning (src/runner/accordionRef.mjs) is NO
+# LONGER "never runs npm install": installConductorWsDeps now runs `npm ci
+# --ignore-scripts` for any conductors/ws/* package that has a package.json +
+# lockfile and no node_modules yet, and this SHA's conductors/ws/triptych
+# qualifies (it has both). So triptych's requiredModules (web-tree-sitter,
+# tree-sitter-wasms — ordinary npm deps with zero install-time lifecycle
+# scripts, verified empirically) would now get installed during provisioning.
+# Whether triptych's preflight/readiness actually passes end-to-end after that
+# install has NOT been verified here, so it stays excluded to avoid burning a
+# room slot on an unconfirmed arm — revisit once that's checked, rather than
+# assuming either outcome.
 #
 # Bare conductor ids (not "external:<id>") throughout: this is a devmain-
 # shaped (non-legacy, protocol.ts-present) checkout, so run.mjs's

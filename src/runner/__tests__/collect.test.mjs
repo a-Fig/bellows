@@ -308,6 +308,54 @@ describe("foldHostTelemetry", () => {
     expect(tel.lastStatusText).toBeNull();
     expect(tel.statusCount).toBe(0);
   });
+  it("completeCostUnknownCount is 0 when every 'complete' row carried a real costUsd", () => {
+    expect(tel.completeCostUnknownCount).toBe(0);
+    expect(tel.completeCostUnknownProviders).toEqual([]);
+  });
+});
+
+// 2026-09-29 Fable review, bellows #38 follow-up items 3/4: a "complete" row's
+// costUsd is `number | null` (see HostEvent in types.ts) — a null must be
+// counted, not silently folded into completeCostUsd as an indistinguishable $0.
+describe("foldHostTelemetry — null costUsd on a 'complete' row (not measured, not $0)", () => {
+  it("counts a null-costUsd complete row without adding to completeCostUsd", () => {
+    const fixture = [
+      JSON.stringify({ t: "attach", at: 100, conductor: "keel", budget: 40000 }),
+      JSON.stringify({ t: "complete", at: 200, costUsd: 0.02, latencyMs: 100 }),
+      JSON.stringify({ t: "complete", at: 300, costUsd: null, latencyMs: 150 }),
+    ].join("\n");
+    const tel = foldHostTelemetry(fixture, "keel");
+    expect(tel.completeCostUsd).toBeCloseTo(0.02, 9);
+    expect(tel.completeCostUnknownCount).toBe(1);
+    // Legacy host.jsonl "complete" rows carry no provider/model to tag.
+    expect(tel.completeCostUnknownProviders).toEqual([]);
+  });
+
+  // 2026-09-30 Fable re-review of #44: #43 (cost-cap integrity, merged first)
+  // and #44 (null-vs-zero, this branch) both touched this accumulation and
+  // needed reconciling on merge — a forged negative/NaN row (the file is
+  // agent-writable) must clamp to 0 (#43), and that is a DIFFERENT case from
+  // a genuinely unmeasured (null) row, which must not become 0 at all (#44).
+  // Mixing all three in one fixture pins the merged behavior.
+  it("clamps a forged negative/NaN costUsd to 0 (measured, not unknown) while a null row is counted unknown (not $0)", () => {
+    const fixture = [
+      JSON.stringify({ t: "attach", at: 100, conductor: "keel", budget: 40000 }),
+      JSON.stringify({ t: "complete", at: 200, costUsd: 0.02, latencyMs: 100 }),
+      JSON.stringify({ t: "complete", at: 250, costUsd: -999, latencyMs: 100 }), // forged negative
+      // JSON has no NaN literal (JSON.stringify(NaN) itself collapses to "null",
+      // which would test the wrong branch) — `1e999` is valid JSON text that
+      // JSON.parse overflows to Infinity, a non-finite value that's still
+      // typeof "number", exercising the same positiveCost clamp path a forged
+      // NaN would.
+      '{"t":"complete","at":260,"costUsd":1e999,"latencyMs":100}',
+      JSON.stringify({ t: "complete", at: 300, costUsd: null, latencyMs: 150 }), // genuinely unmeasured
+    ].join("\n");
+    const tel = foldHostTelemetry(fixture, "keel");
+    // Only the real $0.02 contributes; the forged rows clamp to 0, not -999 or Infinity.
+    expect(tel.completeCostUsd).toBeCloseTo(0.02, 9);
+    // Only the null row counts as unknown — the forged rows are "measured" (just clamped).
+    expect(tel.completeCostUnknownCount).toBe(1);
+  });
 });
 
 // Mid-task addition: Accordion protocol v22's conductorStatus broadcast (a conductor
@@ -655,7 +703,32 @@ describe("foldCompletionLog / collectCompletionLog — completions.jsonl side lo
       completeInputTokens: 350, // 100 + 200 + 50 (error line contributes 0)
       completeOutputTokens: 65, // 20 + 40 + 5
       completeCacheReadTokens: 15, // 5 + 10 + 0
+      completeCacheWriteTokens: 0,
+      // The costUsd:null line (2026-09-29 Fable review, bellows #38 follow-up
+      // items 3/4): counted and tagged, NOT silently folded into completeCostUsd as $0.
+      completeCostUnknownCount: 1,
+      completeCostUnknownProviders: ["anthropic:claude-x"],
     });
+  });
+
+  // 2026-09-30 Fable re-review of #44: reconciles #43 (positiveCost clamp,
+  // merged first) with #44 (null-vs-unknown distinction, this branch) — a
+  // forged negative/non-finite costUsd must clamp to 0 and NOT be counted as
+  // unknown (it IS "measured", just an integrity violation), while a genuine
+  // null must be counted unknown and NOT clamped into the cost sum.
+  it("clamps a forged negative/non-finite costUsd to 0 (measured, not unknown) while a null row is tagged unknown", () => {
+    const text = [
+      JSON.stringify({ t: "complete", at: 1, conductor: "triptych", provider: "p", model: "m", input: 1, output: 1, cacheRead: 0, cacheWrite: 0, costUsd: 0.01, ms: 1 }),
+      JSON.stringify({ t: "complete", at: 2, conductor: "triptych", provider: "p", model: "m", input: 1, output: 1, cacheRead: 0, cacheWrite: 0, costUsd: -50, ms: 1 }),
+      // JSON has no NaN literal; `1e999` is valid JSON text that overflows to
+      // Infinity on parse — still typeof "number", exercising the same clamp.
+      '{"t":"complete","at":3,"conductor":"triptych","provider":"p","model":"m","input":1,"output":1,"cacheRead":0,"cacheWrite":0,"costUsd":1e999,"ms":1}',
+      JSON.stringify({ t: "complete", at: 4, conductor: "triptych", provider: "q", model: "n", input: 1, output: 1, cacheRead: 0, cacheWrite: 0, costUsd: null, ms: 1 }),
+    ].join("\n");
+    const folded = foldCompletionLog(text);
+    expect(folded.completeCostUsd).toBeCloseTo(0.01, 9); // forged rows contribute 0, not -50 or Infinity
+    expect(folded.completeCostUnknownCount).toBe(1); // only the genuinely-null row
+    expect(folded.completeCostUnknownProviders).toEqual(["q:n"]);
   });
 
   it("ignores non-complete lines, blank lines, and malformed JSON", () => {
@@ -672,6 +745,9 @@ describe("foldCompletionLog / collectCompletionLog — completions.jsonl side lo
       completeInputTokens: 1,
       completeOutputTokens: 1,
       completeCacheReadTokens: 0,
+      completeCacheWriteTokens: 0,
+      completeCostUnknownCount: 0,
+      completeCostUnknownProviders: [],
     });
   });
 
@@ -683,6 +759,9 @@ describe("foldCompletionLog / collectCompletionLog — completions.jsonl side lo
       completeInputTokens: 0,
       completeOutputTokens: 0,
       completeCacheReadTokens: 0,
+      completeCacheWriteTokens: 0,
+      completeCostUnknownCount: 0,
+      completeCostUnknownProviders: [],
     });
   });
 
@@ -730,6 +809,9 @@ describe("foldCompletionLog / collectCompletionLog — completions.jsonl side lo
         completeInputTokens: 1,
         completeOutputTokens: 1,
         completeCacheReadTokens: 1,
+        completeCacheWriteTokens: 0,
+        completeCostUnknownCount: 0,
+        completeCostUnknownProviders: [],
       });
     });
   });
@@ -844,13 +926,15 @@ describe("liveConductorCostUsd — mid-run conductor spend for caps.costUsd (bel
 });
 
 describe("foldHostTelemetry — completions.jsonl field defaults", () => {
-  it("seeds completeCalls/completeErrors/completeInputTokens/completeOutputTokens/completeCacheReadTokens at 0", () => {
+  it("seeds completeCalls/completeErrors/completeInputTokens/completeOutputTokens/completeCacheReadTokens/completeCacheWriteTokens/completeCostUnknownProviders at 0/[]", () => {
     const tel = foldHostTelemetry(HOST_FIXTURE, "fallback");
     expect(tel.completeCalls).toBe(0);
     expect(tel.completeErrors).toBe(0);
     expect(tel.completeInputTokens).toBe(0);
     expect(tel.completeOutputTokens).toBe(0);
     expect(tel.completeCacheReadTokens).toBe(0);
+    expect(tel.completeCacheWriteTokens).toBe(0);
+    expect(tel.completeCostUnknownProviders).toEqual([]);
   });
 });
 

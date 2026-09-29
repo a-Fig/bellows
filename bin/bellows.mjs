@@ -50,7 +50,7 @@ async function cmdSandboxCheck(args) {
   let ok = false;
   try {
     const out = (s) => process.stdout.write(`${s}\n`);
-    ok = sandboxCheck({ config, spec, keep: args.includes("--keep"), log, out });
+    ok = await sandboxCheck({ config, spec, keep: args.includes("--keep"), log, out });
   } catch (e) {
     log(`error: ${e.message}`);
   }

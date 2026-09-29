@@ -20,9 +20,9 @@ import { assertLandlockAvailable, resolveSandboxEgress, prepareLandlockRun } fro
  * @param {boolean} [a.keep]  keep the throwaway run dir for inspection
  * @param {(m:string)=>void} a.log
  * @param {(s:string)=>void} a.out
- * @returns {boolean} true when every probe passed
+ * @returns {Promise<boolean>} true when every probe passed
  */
-export function sandboxCheck({ config, spec, keep = false, log, out }) {
+export async function sandboxCheck({ config, spec, keep = false, log, out }) {
   const abi = assertLandlockAvailable();
   out(`Landlock ABI ${abi} on ${process.platform}`);
   const sandboxEgress = resolveSandboxEgress(config, spec);
@@ -31,12 +31,12 @@ export function sandboxCheck({ config, spec, keep = false, log, out }) {
   const runsRoot = resolveRunsRoot(config);
   let accordionRepo = config.accordionRepo;
   if (spec?.accordionRef) {
-    accordionRepo = resolveEffectiveAccordionRepo({
+    accordionRepo = (await resolveEffectiveAccordionRepo({
       accordionRepo: config.accordionRepo,
       accordionRef: spec.accordionRef,
       runsDir: runsRoot,
       log,
-    }).repo;
+    })).repo;
   }
 
   const runDir = path.join(runsRoot, "_sandbox_check", `check-${Date.now()}-${process.pid}`);
