@@ -417,9 +417,9 @@ describe("sandbox config (Landlock opt-in)", () => {
 });
 
 describe("sandboxEgress config (egress verification opt-in)", () => {
-  it("defaults to sandboxEgress: unchecked with no sandboxEgressAllow", () => {
+  it("leaves sandboxEgress absent (not a flat default) when unset — resolveSandboxEgress picks the default from the effective sandbox mode", () => {
     const cfg = normalizeBenchConfig({ ...rawBenchConfigBase });
-    expect(cfg.sandboxEgress).toBe("unchecked");
+    expect(cfg.sandboxEgress).toBeUndefined();
     expect(cfg.sandboxEgressAllow).toBeUndefined();
   });
 

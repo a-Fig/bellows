@@ -94,6 +94,53 @@ describe("resolveSandboxEgress", () => {
   it("unchecked never requires landlock", () => {
     expect(resolveSandboxEgress({}, { sandboxEgress: "unchecked" })).toBe("unchecked");
   });
+
+  // Owner decision, 2026-09-28 ("dont let them have internet"): sandboxEgress
+  // defaults to "blocked" whenever the sandbox is "landlock", and "unchecked"
+  // is only available when the sandbox is "off".
+  describe("mode-based default (2026-09-28 decision)", () => {
+    it('defaults to "blocked" when sandbox resolves to landlock via config, with neither side saying anything about egress', () => {
+      expect(resolveSandboxEgress(landlock, {})).toBe("blocked");
+      expect(resolveSandboxEgress(landlock, undefined)).toBe("blocked");
+    });
+
+    it('defaults to "blocked" when a TRIAL turns sandbox landlock on, with neither side saying anything about egress', () => {
+      expect(resolveSandboxEgress({}, { sandbox: "landlock" })).toBe("blocked");
+      expect(resolveSandboxEgress({ sandbox: "off" }, { sandbox: "landlock" })).toBe("blocked");
+    });
+
+    it('still defaults to "unchecked" when the effective sandbox is off', () => {
+      expect(resolveSandboxEgress({}, {})).toBe("unchecked");
+      expect(resolveSandboxEgress({ sandbox: "off" }, undefined)).toBe("unchecked");
+    });
+
+    it('rejects an explicit config-level "unchecked" once sandbox resolves to landlock (config sandbox: landlock)', () => {
+      expect(() => resolveSandboxEgress({ ...landlock, sandboxEgress: "unchecked" }, {})).toThrow(
+        /"unchecked" is not allowed together with sandbox: "landlock"/,
+      );
+    });
+
+    it('rejects an explicit trial-level "unchecked" once sandbox resolves to landlock', () => {
+      expect(() => resolveSandboxEgress(landlock, { sandboxEgress: "unchecked" })).toThrow(
+        /"unchecked" is not allowed together with sandbox: "landlock"/,
+      );
+    });
+
+    it('rejects a stale config-level "unchecked" (written when the default was flat) when a TRIAL turns landlock on per-trial', () => {
+      // This is the exact footgun the mode-based default guards against: a
+      // config author set sandboxEgress: "unchecked" back when "off" was the
+      // only sandbox mode in play, then later a trial adds sandbox: "landlock"
+      // without touching sandboxEgress. Silently keeping "unchecked" here would
+      // defeat the whole point of the 2026-09-28 fix, so this throws instead.
+      expect(() => resolveSandboxEgress({ sandboxEgress: "unchecked" }, { sandbox: "landlock" })).toThrow(
+        /"unchecked" is not allowed together with sandbox: "landlock"/,
+      );
+    });
+
+    it('an explicit "blocked" still wins over an explicit "unchecked" on the other side (tighten-only, no throw)', () => {
+      expect(resolveSandboxEgress({ ...landlock, sandboxEgress: "unchecked" }, { sandboxEgress: "blocked" })).toBe("blocked");
+    });
+  });
 });
 
 describe("validateSandboxEgressAllow", () => {

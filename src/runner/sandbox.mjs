@@ -27,6 +27,9 @@
  * 2026-09-28 (fetched SlopCode's hidden tests + reference solutions from
  * GitHub) until that host-level allowlist was added — this canary exists so
  * that gap fails loudly instead of silently contaminating scores again.
+ * `sandboxEgress` defaults to "blocked" whenever the sandbox is "landlock"
+ * (see resolveSandboxEgress) — provision the host-level allowlist with
+ * scripts/egress-allowlist.sh before running sandboxed trials for real.
  *
  * Nothing here ever runs the agent unsandboxed when the sandbox was asked for:
  * an unsupported platform/kernel, a policy path that doesn't exist, a wrapper
@@ -99,26 +102,45 @@ export const SANDBOX_EGRESS_VALUES = new Set(["unchecked", "blocked"]);
 export const DEFAULT_EGRESS_BLOCKED_HOSTS = ["github.com:443", "raw.githubusercontent.com:443", "pypi.org:443"];
 
 /**
- * Effective sandboxEgress for a run, mirroring resolveSandboxMode: the bench
- * config sets the default (`sandboxEgress`, "unchecked" when absent); a trial
- * may only TIGHTEN it (unchecked -> blocked), never loosen a config that
- * enforces "blocked". Throws on unknown values (a platform-claimed spec never
+ * Effective sandboxEgress for a run. Owner decision, 2026-09-28 ("dont let
+ * them have internet"), after a Landlock-sandboxed agent still reached the
+ * open internet: the DEFAULT depends on the effective sandbox mode
+ * (resolveSandboxMode) rather than being a flat "unchecked" —
+ *
+ *   - mode "landlock" -> defaults to "blocked" when neither config nor trial
+ *     says anything.
+ *   - mode "off"       -> defaults to "unchecked" (there is no sandboxed
+ *     canary process to run egress probes in — see the "blocked requires
+ *     landlock" check below).
+ *
+ * Either side may still say "blocked" explicitly (still honored, still only
+ * ever TIGHTENS — a trial can never loosen a config that enforces "blocked",
+ * same as resolveSandboxMode), but an EXPLICIT "unchecked" is only valid when
+ * the resolved mode is "off": once landlock is in effect, egress is always
+ * checked and "unchecked" is not an available override. This keeps a stale
+ * config-level `sandboxEgress: "unchecked"` (written back when the default
+ * was flat) from silently defeating the check for a trial that turns
+ * landlock on per-trial — it throws instead, same "fail loudly rather than
+ * silently run more permissively than asked" posture as everything else in
+ * this file. Throws on unknown values too (a platform-claimed spec never
  * went through validateTrialSpec).
  *
- * Also requires the filesystem sandbox itself to resolve to "landlock":
- * egress probes run through the exact same Landlock-wrapped canary process as
- * the filesystem probes (prepareLandlockRun), so there is nothing to run them
- * in when the filesystem sandbox is off — silently skipping the check there
- * would defeat the entire point of this verification. Never returns
- * "unchecked" when "blocked" was actually requested; it throws instead.
+ * Also requires the filesystem sandbox itself to resolve to "landlock" when
+ * the result is "blocked": egress probes run through the exact same
+ * Landlock-wrapped canary process as the filesystem probes
+ * (prepareLandlockRun), so there is nothing to run them in when the
+ * filesystem sandbox is off — silently skipping the check there would defeat
+ * the entire point of this verification. Never returns "unchecked" when
+ * "blocked" was actually requested (or defaulted); it throws instead.
  * @param {{sandbox?: string, sandboxEgress?: string}} config
  * @param {{sandbox?: string, sandboxEgress?: string} | null | undefined} spec
  * @returns {"unchecked"|"blocked"}
  */
 export function resolveSandboxEgress(config, spec) {
-  const fromConfig = config?.sandboxEgress ?? "unchecked";
+  const fromConfig = config?.sandboxEgress;
   const fromTrial = spec?.sandboxEgress;
-  if (!SANDBOX_EGRESS_VALUES.has(fromConfig)) throw new Error(`sandboxEgress: "${fromConfig}" in bench config is not one of unchecked, blocked`);
+  if (fromConfig !== undefined && !SANDBOX_EGRESS_VALUES.has(fromConfig))
+    throw new Error(`sandboxEgress: "${fromConfig}" in bench config is not one of unchecked, blocked`);
   if (fromTrial !== undefined && !SANDBOX_EGRESS_VALUES.has(fromTrial))
     throw new Error(`sandboxEgress: "${fromTrial}" in trial spec is not one of unchecked, blocked`);
   if (fromConfig === "blocked" && fromTrial === "unchecked")
@@ -126,8 +148,20 @@ export function resolveSandboxEgress(config, spec) {
       'trial sets sandboxEgress: "unchecked" but bench.config.json enforces sandboxEgress: "blocked" — a trial can only tighten egress ' +
         "checking, never loosen it",
     );
-  const egress = fromConfig === "blocked" || fromTrial === "blocked" ? "blocked" : "unchecked";
-  if (egress === "blocked" && resolveSandboxMode(config, spec) !== "landlock")
+
+  const mode = resolveSandboxMode(config, spec);
+  const requested =
+    fromConfig === "blocked" || fromTrial === "blocked" ? "blocked" : fromConfig === "unchecked" || fromTrial === "unchecked" ? "unchecked" : undefined;
+
+  if (requested === "unchecked" && mode === "landlock")
+    throw new Error(
+      'sandboxEgress: "unchecked" is not allowed together with sandbox: "landlock" — once the filesystem sandbox is on, egress is ' +
+        'checked by default ("blocked"); "unchecked" is only available when the effective sandbox is "off". Remove the explicit ' +
+        'sandboxEgress: "unchecked" (the "blocked" default will apply) or set sandbox: "off" to run without egress checking.',
+    );
+
+  const egress = requested ?? (mode === "landlock" ? "blocked" : "unchecked");
+  if (egress === "blocked" && mode !== "landlock")
     throw new Error(
       'sandboxEgress: "blocked" requires sandbox: "landlock" — egress probes run inside the same Landlock-wrapped canary process as the ' +
         "filesystem probes, so there is no sandboxed process to run them in when the filesystem sandbox is off.",

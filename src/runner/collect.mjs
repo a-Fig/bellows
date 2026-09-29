@@ -474,6 +474,47 @@ export function collectCompletionLog(file) {
 }
 
 /**
+ * Conductor spend so far THIS RUN, read live off whatever host.jsonl /
+ * completions.jsonl already have on disk — both are append-only for the
+ * duration of the run (see foldHostTelemetry's "complete" events and
+ * foldCompletionLog / ACCORDION_COMPLETION_LOG). Mirrors the additive merge
+ * executeRun does post-run for the final record's `conductor.completeCostUsd`
+ * (host.jsonl's own "complete" rows, from legacy hosts that report cost that
+ * way, PLUS completions.jsonl — see run.mjs) so a mid-run cap check compares
+ * against the SAME total the finished record will report, not just a subset
+ * of it.
+ *
+ * Used by driveUntilDone to fold conductor spend into `caps.costUsd`
+ * enforcement (bellows #38 added this telemetry but didn't cap on it — LLM
+ * conductors' own summary calls are 29-43% of their total spend). Best-effort
+ * and read-tolerant: a file that doesn't exist yet (arm "none", no conductor
+ * completion this run yet) contributes 0, and a read racing a partial
+ * trailing write is fine — parseJsonl silently skips an incomplete/malformed
+ * line, and a transient read error is swallowed (never lets a filesystem
+ * hiccup abort a run the cap itself wouldn't have caught).
+ * @param {{hostTelemetryFile?: string | null, completionLogFile?: string | null}} a
+ * @returns {number}
+ */
+export function liveConductorCostUsd({ hostTelemetryFile, completionLogFile } = {}) {
+  let total = 0;
+  if (hostTelemetryFile && !isAbsentOrEmpty(hostTelemetryFile)) {
+    try {
+      total += foldHostTelemetry(fs.readFileSync(hostTelemetryFile, "utf8")).completeCostUsd;
+    } catch {
+      /* best-effort mid-run read — a transient error just costs this one poll */
+    }
+  }
+  if (completionLogFile && !isAbsentOrEmpty(completionLogFile)) {
+    try {
+      total += foldCompletionLog(fs.readFileSync(completionLogFile, "utf8")).completeCostUsd;
+    } catch {
+      /* best-effort mid-run read */
+    }
+  }
+  return round6(total);
+}
+
+/**
  * True when `file` is missing OR zero bytes. A sandboxed run (sandbox.mjs)
  * pre-creates host.jsonl/completions.jsonl empty before pi starts, so "empty"
  * must read exactly like "never written" — otherwise an empty completion log
