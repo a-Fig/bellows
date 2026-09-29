@@ -11,7 +11,7 @@ import { buildPiEnv } from "./run.mjs";
 import { agentSpawnEnv } from "./agentEnv.mjs";
 import { resolveEffectiveAccordionRepo } from "./accordionRef.mjs";
 import { resolveRunsRoot } from "./schedule.mjs";
-import { assertLandlockAvailable, prepareLandlockRun } from "./sandbox.mjs";
+import { assertLandlockAvailable, resolveSandboxEgress, prepareLandlockRun } from "./sandbox.mjs";
 
 /**
  * @param {object} a
@@ -25,6 +25,8 @@ import { assertLandlockAvailable, prepareLandlockRun } from "./sandbox.mjs";
 export function sandboxCheck({ config, spec, keep = false, log, out }) {
   const abi = assertLandlockAvailable();
   out(`Landlock ABI ${abi} on ${process.platform}`);
+  const sandboxEgress = resolveSandboxEgress(config, spec);
+  out(`sandboxEgress: ${sandboxEgress}`);
 
   const runsRoot = resolveRunsRoot(config);
   let accordionRepo = config.accordionRepo;
@@ -69,6 +71,7 @@ export function sandboxCheck({ config, spec, keep = false, log, out }) {
       piRpcLogFile: path.join(runDir, "pi-rpc.log"),
       runsRoot,
       piEnv,
+      sandboxEgress,
       log: out, // prints the canary table, pass or fail
     });
     out(`\ngrants (${sbx.rules.length}; everything else is denied):`);

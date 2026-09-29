@@ -7,6 +7,7 @@
   "scrubPiEnv": true,
   "piEnvPassthrough": [],
   "sandbox": "off",
+  "sandboxEgress": "unchecked",
   "worker": {
     "platformUrl": "https://your-agent-trials-instance.example.com",
     "name": "worker-1",

@@ -5,14 +5,17 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import {
   resolveSandboxMode,
+  resolveSandboxEgress,
   assertLandlockAvailable,
   landlockAbi,
   buildLandlockPolicy,
   resolvePiInstallRoot,
   validateSandboxAllow,
+  validateSandboxEgressAllow,
   rulesToArgs,
   landlockArgvPrefix,
   buildCanaryProbes,
+  buildEgressProbes,
   evaluateCanary,
   formatCanaryTable,
   runCanary,
@@ -20,6 +23,7 @@ import {
   LANDLOCK_EXEC,
   SYSTEM_RX,
   DEV_RW,
+  DEFAULT_EGRESS_BLOCKED_HOSTS,
 } from "../sandbox.mjs";
 
 describe("resolveSandboxMode", () => {
@@ -45,6 +49,87 @@ describe("resolveSandboxMode", () => {
   it("rejects unknown values from either side (platform-claimed specs are unvalidated)", () => {
     expect(() => resolveSandboxMode({ sandbox: "docker" }, {})).toThrow(/bench config is not one of off, landlock/);
     expect(() => resolveSandboxMode({}, { sandbox: true })).toThrow(/trial spec is not one of off, landlock/);
+  });
+});
+
+describe("resolveSandboxEgress", () => {
+  const landlock = { sandbox: "landlock" };
+
+  it("defaults to unchecked when neither config nor trial says anything", () => {
+    expect(resolveSandboxEgress({}, {})).toBe("unchecked");
+    expect(resolveSandboxEgress({ sandboxEgress: "unchecked" }, undefined)).toBe("unchecked");
+  });
+
+  it("config blocked applies to every trial (given sandbox: landlock)", () => {
+    expect(resolveSandboxEgress({ ...landlock, sandboxEgress: "blocked" }, {})).toBe("blocked");
+    expect(resolveSandboxEgress({ ...landlock, sandboxEgress: "blocked" }, { sandboxEgress: "blocked" })).toBe("blocked");
+  });
+
+  it("a trial can turn egress checking ON over a config that leaves it unchecked", () => {
+    expect(resolveSandboxEgress({ ...landlock, sandboxEgress: "unchecked" }, { sandboxEgress: "blocked" })).toBe("blocked");
+    expect(resolveSandboxEgress(landlock, { sandboxEgress: "blocked" })).toBe("blocked");
+  });
+
+  it("a trial can NEVER turn off egress checking the config enforces", () => {
+    expect(() => resolveSandboxEgress({ ...landlock, sandboxEgress: "blocked" }, { sandboxEgress: "unchecked" })).toThrow(
+      /can only tighten egress checking, never loosen it/,
+    );
+  });
+
+  it("rejects unknown values from either side", () => {
+    expect(() => resolveSandboxEgress({ sandboxEgress: "open" }, {})).toThrow(/bench config is not one of unchecked, blocked/);
+    expect(() => resolveSandboxEgress({}, { sandboxEgress: true })).toThrow(/trial spec is not one of unchecked, blocked/);
+  });
+
+  it('requires sandbox: "landlock" when egress resolves to blocked — never silently skips the check', () => {
+    expect(() => resolveSandboxEgress({ sandboxEgress: "blocked" }, {})).toThrow(/requires sandbox: "landlock"/);
+    expect(() => resolveSandboxEgress({}, { sandboxEgress: "blocked" })).toThrow(/requires sandbox: "landlock"/);
+    // A trial requesting sandbox:"off" while a config enforces landlock already throws
+    // earlier (resolveSandboxMode) — resolveSandboxEgress surfaces that same error.
+    expect(() => resolveSandboxEgress(landlock, { sandbox: "off", sandboxEgress: "blocked" })).toThrow(
+      /can only enable the sandbox, never disable it/,
+    );
+  });
+
+  it("unchecked never requires landlock", () => {
+    expect(resolveSandboxEgress({}, { sandboxEgress: "unchecked" })).toBe("unchecked");
+  });
+});
+
+describe("validateSandboxEgressAllow", () => {
+  it("accepts absent and well-formed host:port entries", () => {
+    expect(validateSandboxEgressAllow(undefined)).toEqual([]);
+    expect(validateSandboxEgressAllow(["api.deepseek.com:443", "10.0.0.1:8080"])).toEqual([]);
+  });
+  it("flags malformed entries", () => {
+    expect(validateSandboxEgressAllow("api.deepseek.com:443")).toEqual([
+      'sandboxEgressAllow: must be a string[] of "host:port" entries if present',
+    ]);
+    expect(validateSandboxEgressAllow(["no-port"])).toEqual(['sandboxEgressAllow: "no-port" must look like "host:port" (e.g. "api.deepseek.com:443")']);
+    expect(validateSandboxEgressAllow(["host:99999"])).toEqual(['sandboxEgressAllow: "host:99999" port must be 1-65535']);
+    expect(validateSandboxEgressAllow(["host:0"])).toEqual(['sandboxEgressAllow: "host:0" port must be 1-65535']);
+  });
+});
+
+describe("buildEgressProbes", () => {
+  it("returns nothing when egress is unchecked", () => {
+    expect(buildEgressProbes({ egress: "unchecked" })).toEqual([]);
+    expect(buildEgressProbes({ egress: "unchecked", egressAllow: ["api.deepseek.com:443"] })).toEqual([]);
+  });
+
+  it("adds a deny probe for every default blocked host, kind net", () => {
+    const probes = buildEgressProbes({ egress: "blocked" });
+    expect(probes).toHaveLength(DEFAULT_EGRESS_BLOCKED_HOSTS.length);
+    for (const p of probes) expect(p).toMatchObject({ op: "tcp", kind: "net", expect: "deny" });
+    expect(probes.map((p) => p.path)).toEqual(DEFAULT_EGRESS_BLOCKED_HOSTS);
+  });
+
+  it("adds an allow probe for every sandboxEgressAllow entry", () => {
+    const probes = buildEgressProbes({ egress: "blocked", egressAllow: ["api.deepseek.com:443"] });
+    const allow = probes.filter((p) => p.expect === "allow");
+    expect(allow).toEqual([
+      { name: "egress: api.deepseek.com:443 must be reachable (sandboxEgressAllow)", op: "tcp", path: "api.deepseek.com:443", kind: "net", expect: "allow" },
+    ]);
   });
 });
 
@@ -368,6 +453,34 @@ describe("evaluateCanary", () => {
     expect(evaluateCanary(probes, [{ name: "a", ok: false, errno: 13 }]).ok).toBe(false);
     expect(evaluateCanary([], []).ok).toBe(false);
   });
+
+  describe("net probes (sandboxEgress, kind: 'net')", () => {
+    const netProbes = [
+      { name: "blocked-host", op: "tcp", path: "github.com:443", kind: "net", expect: "deny" },
+      { name: "allowed-host", op: "tcp", path: "api.deepseek.com:443", kind: "net", expect: "allow" },
+    ];
+    it("a blocked-expected probe passes on ANY failure (refused/reset/timeout/DNS all count as blocked)", () => {
+      for (const errno of [111, 110, null, -2]) {
+        const ev = evaluateCanary(netProbes, [
+          { name: "blocked-host", ok: false, errno, detail: "whatever" },
+          { name: "allowed-host", ok: true },
+        ]);
+        expect(ev.ok, `errno=${errno}`).toBe(true);
+        expect(ev.rows[0]).toMatchObject({ got: "denied", pass: true });
+      }
+    });
+    it("a blocked-expected probe that connects is an ESCAPE, same as a filesystem escape", () => {
+      const ev = evaluateCanary(netProbes, [{ name: "blocked-host", ok: true }, { name: "allowed-host", ok: true }]);
+      expect(ev).toMatchObject({ ok: false, escaped: true });
+      expect(ev.rows[0]).toMatchObject({ got: "allowed", pass: false });
+      expect(formatCanaryTable(ev.rows)).toMatch(/blocked-host\s+deny\s+allowed\s+ESCAPE/);
+    });
+    it("an allow-expected probe (sandboxEgressAllow) fails if the connection could not be made", () => {
+      const ev = evaluateCanary(netProbes, [{ name: "blocked-host", ok: false, errno: 111 }, { name: "allowed-host", ok: false, errno: 110 }]);
+      expect(ev.ok).toBe(false);
+      expect(ev.rows[1]).toMatchObject({ expect: "allow", got: "denied", pass: false });
+    });
+  });
 });
 
 describe("runCanary", () => {
@@ -392,6 +505,28 @@ describe("runCanary", () => {
     const res = runCanary({ prefix: ["p", "--"], probes, env: {}, cwd: "/", python: "py", spawn });
     expect(res.ok).toBe(false);
     expect(res.error).toMatch(/exited 125: landlock-exec: Landlock is unavailable/);
+  });
+
+  it("runs fs + egress probes in ONE spawn (same process context) and judges each by its own rule", () => {
+    // No real network call happens here — spawn is mocked, exactly like the
+    // filesystem-only test above. This only proves the wiring: buildEgressProbes'
+    // output flows through the exact same runCanary/evaluateCanary path.
+    const mixed = [
+      { name: "fs-deny", op: "read", path: "/other/run", expect: "deny" },
+      { name: "egress: github.com:443 must be blocked", op: "tcp", path: "github.com:443", kind: "net", expect: "deny" },
+    ];
+    const spawn = () => ({
+      status: 0,
+      stdout: JSON.stringify([
+        { name: "fs-deny", ok: false, errno: 13, detail: "Permission denied" },
+        { name: "egress: github.com:443 must be blocked", ok: false, errno: null, detail: "timed out" },
+      ]),
+      stderr: "",
+    });
+    const res = runCanary({ prefix: ["py", "-I", "-S", LANDLOCK_EXEC, "--"], probes: mixed, env: {}, cwd: "/r/workspace", python: "py", spawn });
+    expect(res.ok).toBe(true);
+    expect(res.table).toMatch(/fs-deny\s+deny\s+denied\s+PASS/);
+    expect(res.table).toMatch(/egress: github\.com:443 must be blocked\s+deny\s+denied\s+PASS/);
   });
 });
 

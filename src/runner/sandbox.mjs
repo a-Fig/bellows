@@ -17,12 +17,21 @@
  *
  * Only filesystem access is restricted. Network (the agent must reach the
  * Agent Trials platform over HTTPS and its conductor over loopback) and
- * Landlock scopes are left alone by construction (see landlock-exec.py).
+ * Landlock scopes are left alone by construction (see landlock-exec.py) —
+ * Landlock cannot restrict the network at all, and bellows runs unprivileged
+ * so it cannot set its own firewall rules either. `sandboxEgress: "blocked"`
+ * does NOT close the network; it only VERIFIES (via the same canary, with
+ * network probes added — see buildEgressProbes) that something else, e.g. a
+ * host-level iptables egress allowlist (see TUTORIAL.md), already did. A
+ * sandboxed agent still reached the public internet over plain HTTPS on
+ * 2026-09-28 (fetched SlopCode's hidden tests + reference solutions from
+ * GitHub) until that host-level allowlist was added — this canary exists so
+ * that gap fails loudly instead of silently contaminating scores again.
  *
  * Nothing here ever runs the agent unsandboxed when the sandbox was asked for:
  * an unsupported platform/kernel, a policy path that doesn't exist, a wrapper
- * setup failure or a canary probe that escapes all fail the run before pi is
- * spawned.
+ * setup failure or a canary probe (filesystem OR egress) that escapes all
+ * fail the run before pi is spawned.
  */
 import fs from "node:fs";
 import os from "node:os";
@@ -77,6 +86,78 @@ export function resolveSandboxMode(config, spec) {
       'trial sets sandbox: "off" but bench.config.json enforces sandbox: "landlock" — a trial can only enable the sandbox, never disable it',
     );
   return fromConfig === "landlock" || fromTrial === "landlock" ? "landlock" : "off";
+}
+
+export const SANDBOX_EGRESS_VALUES = new Set(["unchecked", "blocked"]);
+
+/**
+ * Egress hosts the canary must confirm are UNREACHABLE when sandboxEgress is
+ * "blocked" — the exact hosts a contaminated benchmark used on 2026-09-28 to
+ * fetch SlopCode's public hidden tests and reference solutions
+ * (github.com/gabeorlanski/scb-problems) instead of solving the problem.
+ */
+export const DEFAULT_EGRESS_BLOCKED_HOSTS = ["github.com:443", "raw.githubusercontent.com:443", "pypi.org:443"];
+
+/**
+ * Effective sandboxEgress for a run, mirroring resolveSandboxMode: the bench
+ * config sets the default (`sandboxEgress`, "unchecked" when absent); a trial
+ * may only TIGHTEN it (unchecked -> blocked), never loosen a config that
+ * enforces "blocked". Throws on unknown values (a platform-claimed spec never
+ * went through validateTrialSpec).
+ *
+ * Also requires the filesystem sandbox itself to resolve to "landlock":
+ * egress probes run through the exact same Landlock-wrapped canary process as
+ * the filesystem probes (prepareLandlockRun), so there is nothing to run them
+ * in when the filesystem sandbox is off — silently skipping the check there
+ * would defeat the entire point of this verification. Never returns
+ * "unchecked" when "blocked" was actually requested; it throws instead.
+ * @param {{sandbox?: string, sandboxEgress?: string}} config
+ * @param {{sandbox?: string, sandboxEgress?: string} | null | undefined} spec
+ * @returns {"unchecked"|"blocked"}
+ */
+export function resolveSandboxEgress(config, spec) {
+  const fromConfig = config?.sandboxEgress ?? "unchecked";
+  const fromTrial = spec?.sandboxEgress;
+  if (!SANDBOX_EGRESS_VALUES.has(fromConfig)) throw new Error(`sandboxEgress: "${fromConfig}" in bench config is not one of unchecked, blocked`);
+  if (fromTrial !== undefined && !SANDBOX_EGRESS_VALUES.has(fromTrial))
+    throw new Error(`sandboxEgress: "${fromTrial}" in trial spec is not one of unchecked, blocked`);
+  if (fromConfig === "blocked" && fromTrial === "unchecked")
+    throw new Error(
+      'trial sets sandboxEgress: "unchecked" but bench.config.json enforces sandboxEgress: "blocked" — a trial can only tighten egress ' +
+        "checking, never loosen it",
+    );
+  const egress = fromConfig === "blocked" || fromTrial === "blocked" ? "blocked" : "unchecked";
+  if (egress === "blocked" && resolveSandboxMode(config, spec) !== "landlock")
+    throw new Error(
+      'sandboxEgress: "blocked" requires sandbox: "landlock" — egress probes run inside the same Landlock-wrapped canary process as the ' +
+        "filesystem probes, so there is no sandboxed process to run them in when the filesystem sandbox is off.",
+    );
+  return egress;
+}
+
+const HOST_PORT_RE = /^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?:[0-9]{1,5}$/;
+
+/**
+ * Normalize/validate the optional `sandboxEgressAllow` config section: a
+ * string[] of "host:port" entries (e.g. the model API host) that the egress
+ * canary must confirm ARE reachable when sandboxEgress is "blocked". Ignored
+ * when sandboxEgress is "unchecked". Returns a list of error strings (empty =
+ * valid).
+ */
+export function validateSandboxEgressAllow(raw) {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw) || !raw.every((s) => typeof s === "string"))
+    return ['sandboxEgressAllow: must be a string[] of "host:port" entries if present'];
+  const errs = [];
+  for (const s of raw) {
+    if (!HOST_PORT_RE.test(s)) {
+      errs.push(`sandboxEgressAllow: "${s}" must look like "host:port" (e.g. "api.deepseek.com:443")`);
+      continue;
+    }
+    const port = Number(s.slice(s.lastIndexOf(":") + 1));
+    if (!(port >= 1 && port <= 65535)) errs.push(`sandboxEgressAllow: "${s}" port must be 1-65535`);
+  }
+  return errs;
 }
 
 /** Absolute python3 used to launch the wrapper (it restricts itself, then execs). */
@@ -295,7 +376,7 @@ export function landlockArgvPrefix(rules, { python, execScript = LANDLOCK_EXEC }
 /** Probe program run INSIDE the sandbox (python3 -I -S -c). Prints one JSON
  *  array of {name, ok, errno, detail}. */
 export const CANARY_PY = String.raw`
-import json, os, subprocess, sys, tempfile
+import json, os, socket, subprocess, sys, tempfile
 out = []
 for p in json.loads(sys.argv[1]):
     op, target = p["op"], p.get("path")
@@ -339,6 +420,14 @@ for p in json.loads(sys.argv[1]):
             r["detail"] = (lines[0] if lines else "")[:80]
             if cp.returncode != 0:
                 raise RuntimeError("exit %d: %s" % (cp.returncode, r["detail"]))
+        elif op == "tcp":
+            # Egress probe (sandboxEgress). Landlock never restricts the network
+            # (see bin/landlock-exec.py) — this only tells the truth about whether
+            # something ELSE (a host-level firewall) is blocking it. A "deny"-
+            # expected probe passing (connection succeeds) means egress is open.
+            host, _, port_s = target.rpartition(":")
+            s = socket.create_connection((host, int(port_s)), timeout=5)
+            s.close()
         else:
             raise ValueError("unknown op %r" % op)
         r["ok"] = True
@@ -436,9 +525,38 @@ export function buildCanaryProbes({
 }
 
 /**
- * Judge probe results. A deny probe passes only on EACCES/EPERM; success is an
- * isolation breach ("ESCAPED") and any other error is inconclusive (e.g.
- * ENOENT could hide a missing target). An allow probe passes only on success.
+ * Egress probes for one run (sandboxEgress: "blocked"). Run through the exact
+ * same canary process as the filesystem probes (buildCanaryProbes) — bellows
+ * itself cannot close the network (it runs unprivileged; see
+ * bin/landlock-exec.py), so these only VERIFY that something else (a
+ * host-level firewall, e.g. the iptables allowlist in TUTORIAL.md) already
+ * did. `kind: "net"` tells evaluateCanary to judge these by connect
+ * success/failure rather than by filesystem errno.
+ *
+ * DEFAULT_EGRESS_BLOCKED_HOSTS must fail to connect (refused/reset/timeout/DNS
+ * failure all count as blocked); `egressAllow` entries (config.sandboxEgressAllow,
+ * e.g. the model API host) must succeed.
+ * @param {{egress: "unchecked"|"blocked", egressAllow?: string[]}} a
+ * @returns {{name:string, op:"tcp", path:string, kind:"net", expect:"allow"|"deny"}[]}
+ */
+export function buildEgressProbes({ egress, egressAllow = [] }) {
+  if (egress !== "blocked") return [];
+  const probes = [];
+  for (const hostPort of DEFAULT_EGRESS_BLOCKED_HOSTS)
+    probes.push({ name: `egress: ${hostPort} must be blocked`, op: "tcp", path: hostPort, kind: "net", expect: "deny" });
+  for (const hostPort of egressAllow)
+    probes.push({ name: `egress: ${hostPort} must be reachable (sandboxEgressAllow)`, op: "tcp", path: hostPort, kind: "net", expect: "allow" });
+  return probes;
+}
+
+/**
+ * Judge probe results. A filesystem deny probe passes only on EACCES/EPERM;
+ * success is an isolation breach ("ESCAPED") and any other error is
+ * inconclusive (e.g. ENOENT could hide a missing target). A net probe
+ * (`kind: "net"`, egress checking) has no meaningful errno to check —
+ * "connection refused/reset/timeout/DNS failure" are all just "not ok", and
+ * ANY of them count as blocked. An allow probe (filesystem or net) passes only
+ * on success.
  * @returns {{ok:boolean, escaped:boolean, rows:{name:string, expect:string, got:string, pass:boolean, detail:string}[]}}
  */
 export function evaluateCanary(probes, results) {
@@ -453,7 +571,7 @@ export function evaluateCanary(probes, results) {
       got = "allowed";
       pass = p.expect === "allow";
       if (p.expect === "deny") escaped = true;
-    } else if (r.errno === EACCES || r.errno === EPERM) {
+    } else if (p.kind === "net" || r.errno === EACCES || r.errno === EPERM) {
       got = "denied";
       pass = p.expect === "deny";
     } else {
@@ -530,8 +648,9 @@ function touch(p) {
  * @param {string} a.piRpcLogFile
  * @param {string} a.runsRoot
  * @param {NodeJS.ProcessEnv} a.piEnv      mutated: TMPDIR is set
+ * @param {"unchecked"|"blocked"} [a.sandboxEgress]  resolved via resolveSandboxEgress; default "unchecked"
  * @param {(m:string)=>void} [a.log]
- * @returns {{prefix:string[], piPath:string, rules:object[], tmpDir:string, canary:object}}
+ * @returns {{prefix:string[], piPath:string, rules:object[], tmpDir:string, canary:object, sandboxEgress:"unchecked"|"blocked"}}
  */
 export function prepareLandlockRun(a) {
   const log = a.log || (() => {});
@@ -561,20 +680,27 @@ export function prepareLandlockRun(a) {
   });
   const prefix = landlockArgvPrefix(rules, { python });
   const decoyFile = ensureCanaryDecoy(a.runsRoot);
-  const probes = buildCanaryProbes({
-    runDir: a.runDir,
-    workspaceDir: a.workspaceDir,
-    tmpDir,
-    binDir,
-    accordionRepo: a.accordionRepo,
-    completionLogFile: a.completionLogFile,
-    ownHarnessFiles: [a.hostTelemetryFile, a.piRpcLogFile].filter(Boolean),
-    decoyFile,
-    runsRoot: a.runsRoot,
-  });
+  const sandboxEgress = a.sandboxEgress || "unchecked";
+  const probes = [
+    ...buildCanaryProbes({
+      runDir: a.runDir,
+      workspaceDir: a.workspaceDir,
+      tmpDir,
+      binDir,
+      accordionRepo: a.accordionRepo,
+      completionLogFile: a.completionLogFile,
+      ownHarnessFiles: [a.hostTelemetryFile, a.piRpcLogFile].filter(Boolean),
+      decoyFile,
+      runsRoot: a.runsRoot,
+    }),
+    ...buildEgressProbes({ egress: sandboxEgress, egressAllow: a.config.sandboxEgressAllow }),
+  ];
   const t0 = Date.now();
   const canary = runCanary({ prefix, probes, env: a.piEnv, cwd: a.workspaceDir, python });
-  log(`[sandbox] landlock: ${rules.length} grants; canary ${canary.ok ? "PASSED" : "FAILED"} in ${Date.now() - t0}ms\n${canary.table}`);
+  log(
+    `[sandbox] landlock: ${rules.length} grants; egress=${sandboxEgress}; canary ${canary.ok ? "PASSED" : "FAILED"} ` +
+      `in ${Date.now() - t0}ms\n${canary.table}`,
+  );
   if (!canary.ok) {
     const why = canary.error
       ? canary.error
@@ -583,5 +709,5 @@ export function prepareLandlockRun(a) {
         : `probe(s) failed: ${canary.rows.filter((r) => !r.pass).map((r) => `${r.name} (${r.got}${r.detail ? `: ${r.detail}` : ""})`).join("; ")}`;
     throw new Error(`sandbox canary failed — refusing to start pi: ${why}`);
   }
-  return { prefix, piPath, rules, tmpDir, canary };
+  return { prefix, piPath, rules, tmpDir, canary, sandboxEgress };
 }
