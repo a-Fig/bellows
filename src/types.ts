@@ -47,9 +47,11 @@ export interface TrialSpec {
   sandbox?: "off" | "landlock";
   /**
    * Per-trial egress check (BenchConfig.sandboxEgress). "blocked" turns it on
-   * even when bench.config.json leaves it "unchecked"; "unchecked" is only
-   * accepted when the config doesn't enforce "blocked" (a trial can only
-   * tighten, never loosen). Absent => config.sandboxEgress. See
+   * even when bench.config.json leaves it unset; "unchecked" is only accepted
+   * when the EFFECTIVE sandbox (this trial's `sandbox` + config.sandbox)
+   * resolves to "off" — once it resolves to "landlock", egress defaults to
+   * "blocked" and an explicit "unchecked" throws instead of loosening it.
+   * Absent => the default picked by the effective sandbox mode. See
    * src/runner/sandbox.mjs resolveSandboxEgress.
    */
   sandboxEgress?: "unchecked" | "blocked";
@@ -61,7 +63,16 @@ export interface TrialSpec {
   /** Repeats per arm. Default 1. */
   seeds?: number;
   caps: {
-    /** Hard per-run cost ceiling in USD. Runner aborts the run at/past this. */
+    /**
+     * Hard per-run cost ceiling in USD. Runner aborts the run at/past this.
+     * Enforced against the AGENT's own spend (pi get_session_stats) PLUS the
+     * conductor's own spend (host.jsonl "complete" rows + the completions.jsonl
+     * side log — RunRecord.conductor.completeCostUsd), not agent cost alone —
+     * an LLM conductor's own summary calls run 29-43% of its total spend and
+     * used to be uncapped, letting it run well past a deterministic
+     * conductor's effective ceiling for the same dollar cap (see
+     * src/runner/run.mjs driveUntilDone / liveConductorCostUsd in collect.mjs).
+     */
     costUsd: number;
     /** Max assistant turns per run. */
     turns: number;
@@ -491,9 +502,15 @@ export interface BenchConfig {
    * (github.com, raw.githubusercontent.com, pypi.org — see
    * DEFAULT_EGRESS_BLOCKED_HOSTS) must fail, run through the same
    * Landlock-wrapped canary process as the filesystem probes. Requires
-   * `sandbox: "landlock"`. Default "unchecked" (current behavior: egress is
-   * never checked). See src/runner/sandbox.mjs and TUTORIAL.md — "Verifying
-   * egress is blocked".
+   * `sandbox: "landlock"`. Owner decision, 2026-09-28 ("dont let them have
+   * internet"): defaults to "blocked" whenever the EFFECTIVE sandbox mode
+   * (config + trial) resolves to "landlock", and to "unchecked" when it
+   * resolves to "off" — "unchecked" is only a valid explicit value when the
+   * sandbox is "off"; setting it while landlock is in effect throws rather
+   * than silently skipping the check (see src/runner/sandbox.mjs
+   * resolveSandboxEgress). Provision the host-level firewall this verifies
+   * with scripts/egress-allowlist.sh — see TUTORIAL.md "Verifying egress is
+   * blocked" / "Sealing a bench host".
    */
   sandboxEgress?: "unchecked" | "blocked";
   /** "host:port" entries (e.g. the model API host) the egress canary must

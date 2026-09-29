@@ -8,6 +8,7 @@ import {
   foldCompletionLog,
   collectCompletionLog,
   collectHostTelemetry,
+  liveConductorCostUsd,
   enrichTurnsWithWire,
   computePlanRtt,
 } from "../collect.mjs";
@@ -328,6 +329,32 @@ describe("foldHostTelemetry — null costUsd on a 'complete' row (not measured, 
     expect(tel.completeCostUnknownCount).toBe(1);
     // Legacy host.jsonl "complete" rows carry no provider/model to tag.
     expect(tel.completeCostUnknownProviders).toEqual([]);
+  });
+
+  // 2026-09-30 Fable re-review of #44: #43 (cost-cap integrity, merged first)
+  // and #44 (null-vs-zero, this branch) both touched this accumulation and
+  // needed reconciling on merge — a forged negative/NaN row (the file is
+  // agent-writable) must clamp to 0 (#43), and that is a DIFFERENT case from
+  // a genuinely unmeasured (null) row, which must not become 0 at all (#44).
+  // Mixing all three in one fixture pins the merged behavior.
+  it("clamps a forged negative/NaN costUsd to 0 (measured, not unknown) while a null row is counted unknown (not $0)", () => {
+    const fixture = [
+      JSON.stringify({ t: "attach", at: 100, conductor: "keel", budget: 40000 }),
+      JSON.stringify({ t: "complete", at: 200, costUsd: 0.02, latencyMs: 100 }),
+      JSON.stringify({ t: "complete", at: 250, costUsd: -999, latencyMs: 100 }), // forged negative
+      // JSON has no NaN literal (JSON.stringify(NaN) itself collapses to "null",
+      // which would test the wrong branch) — `1e999` is valid JSON text that
+      // JSON.parse overflows to Infinity, a non-finite value that's still
+      // typeof "number", exercising the same positiveCost clamp path a forged
+      // NaN would.
+      '{"t":"complete","at":260,"costUsd":1e999,"latencyMs":100}',
+      JSON.stringify({ t: "complete", at: 300, costUsd: null, latencyMs: 150 }), // genuinely unmeasured
+    ].join("\n");
+    const tel = foldHostTelemetry(fixture, "keel");
+    // Only the real $0.02 contributes; the forged rows clamp to 0, not -999 or Infinity.
+    expect(tel.completeCostUsd).toBeCloseTo(0.02, 9);
+    // Only the null row counts as unknown — the forged rows are "measured" (just clamped).
+    expect(tel.completeCostUnknownCount).toBe(1);
   });
 });
 
@@ -684,6 +711,26 @@ describe("foldCompletionLog / collectCompletionLog — completions.jsonl side lo
     });
   });
 
+  // 2026-09-30 Fable re-review of #44: reconciles #43 (positiveCost clamp,
+  // merged first) with #44 (null-vs-unknown distinction, this branch) — a
+  // forged negative/non-finite costUsd must clamp to 0 and NOT be counted as
+  // unknown (it IS "measured", just an integrity violation), while a genuine
+  // null must be counted unknown and NOT clamped into the cost sum.
+  it("clamps a forged negative/non-finite costUsd to 0 (measured, not unknown) while a null row is tagged unknown", () => {
+    const text = [
+      JSON.stringify({ t: "complete", at: 1, conductor: "triptych", provider: "p", model: "m", input: 1, output: 1, cacheRead: 0, cacheWrite: 0, costUsd: 0.01, ms: 1 }),
+      JSON.stringify({ t: "complete", at: 2, conductor: "triptych", provider: "p", model: "m", input: 1, output: 1, cacheRead: 0, cacheWrite: 0, costUsd: -50, ms: 1 }),
+      // JSON has no NaN literal; `1e999` is valid JSON text that overflows to
+      // Infinity on parse — still typeof "number", exercising the same clamp.
+      '{"t":"complete","at":3,"conductor":"triptych","provider":"p","model":"m","input":1,"output":1,"cacheRead":0,"cacheWrite":0,"costUsd":1e999,"ms":1}',
+      JSON.stringify({ t: "complete", at: 4, conductor: "triptych", provider: "q", model: "n", input: 1, output: 1, cacheRead: 0, cacheWrite: 0, costUsd: null, ms: 1 }),
+    ].join("\n");
+    const folded = foldCompletionLog(text);
+    expect(folded.completeCostUsd).toBeCloseTo(0.01, 9); // forged rows contribute 0, not -50 or Infinity
+    expect(folded.completeCostUnknownCount).toBe(1); // only the genuinely-null row
+    expect(folded.completeCostUnknownProviders).toEqual(["q:n"]);
+  });
+
   it("ignores non-complete lines, blank lines, and malformed JSON", () => {
     const text = [
       JSON.stringify({ t: "attach", at: 1, conductor: "keel", budget: 1 }),
@@ -767,6 +814,114 @@ describe("foldCompletionLog / collectCompletionLog — completions.jsonl side lo
         completeCostUnknownProviders: [],
       });
     });
+  });
+
+  describe("costUsd clamping (2026-09-29 Fable review, #42 note 4 / #43 blocking item 4)", () => {
+    // completions.jsonl is agent-writable (write-only under Landlock, but
+    // O_WRONLY without O_APPEND lets the agent's process tree overwrite it at
+    // offset 0), and this sum now feeds straight into caps.costUsd's live
+    // abort check (bellows #43) — a forged negative row must not lower the
+    // total. (NaN/Infinity can't arrive through this path at all: JSON has no
+    // literal for either, so JSON.stringify already turns them into `null`
+    // before a legitimate writer could even emit them, and a forged non-JSON
+    // token like a bare `NaN` fails JSON.parse and is dropped as a malformed
+    // line by parseJsonl, never reaching costUsd accumulation. The clamp
+    // still checks Number.isFinite defensively in case these functions are
+    // ever called on programmatically-built records instead of raw text.)
+    it("clamps a negative costUsd to 0 instead of subtracting from the total", () => {
+      const text = [
+        JSON.stringify({ t: "complete", at: 1, costUsd: 5, input: 1, output: 1, cacheRead: 0 }),
+        JSON.stringify({ t: "complete", at: 2, costUsd: -100, input: 1, output: 1, cacheRead: 0 }),
+      ].join("\n");
+      expect(foldCompletionLog(text).completeCostUsd).toBe(5);
+    });
+
+    it("foldHostTelemetry clamps a negative host-reported costUsd the same way", () => {
+      const text = [
+        JSON.stringify({ t: "complete", at: 1, costUsd: 2 }),
+        JSON.stringify({ t: "complete", at: 2, costUsd: -500 }),
+      ].join("\n");
+      expect(foldHostTelemetry(text).completeCostUsd).toBe(2);
+    });
+  });
+});
+
+describe("liveConductorCostUsd — mid-run conductor spend for caps.costUsd (bellows #38 follow-up)", () => {
+  let dir;
+  afterEach(() => {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+    dir = undefined;
+  });
+
+  it("returns 0 when neither file is given", () => {
+    expect(liveConductorCostUsd({})).toBe(0);
+    expect(liveConductorCostUsd()).toBe(0);
+  });
+
+  it("returns 0 for files that don't exist yet (conductor hasn't completed anything this run)", () => {
+    dir = mkdtempSync(path.join(tmpdir(), "bellows-live-cost-"));
+    expect(
+      liveConductorCostUsd({
+        hostTelemetryFile: path.join(dir, "host.jsonl"),
+        completionLogFile: path.join(dir, "completions.jsonl"),
+      }),
+    ).toBe(0);
+  });
+
+  it("treats a zero-byte (sandbox pre-created) file exactly like a missing one", () => {
+    dir = mkdtempSync(path.join(tmpdir(), "bellows-live-cost-"));
+    const hostFile = path.join(dir, "host.jsonl");
+    const completionFile = path.join(dir, "completions.jsonl");
+    writeFileSync(hostFile, "", "utf8");
+    writeFileSync(completionFile, "", "utf8");
+    expect(liveConductorCostUsd({ hostTelemetryFile: hostFile, completionLogFile: completionFile })).toBe(0);
+  });
+
+  it("sums host.jsonl 'complete' rows alone (legacy host, no completions.jsonl yet)", () => {
+    dir = mkdtempSync(path.join(tmpdir(), "bellows-live-cost-"));
+    const hostFile = path.join(dir, "host.jsonl");
+    writeFileSync(
+      hostFile,
+      [JSON.stringify({ t: "complete", at: 1, costUsd: 0.5, latencyMs: 100 }), JSON.stringify({ t: "complete", at: 2, costUsd: 0.25, latencyMs: 100 })].join(
+        "\n",
+      ),
+      "utf8",
+    );
+    expect(liveConductorCostUsd({ hostTelemetryFile: hostFile, completionLogFile: null })).toBe(0.75);
+  });
+
+  it("sums completions.jsonl side-log rows alone (protocol v22, no host.jsonl 'complete' rows)", () => {
+    dir = mkdtempSync(path.join(tmpdir(), "bellows-live-cost-"));
+    const completionFile = path.join(dir, "completions.jsonl");
+    writeFileSync(
+      completionFile,
+      [
+        JSON.stringify({ t: "complete", at: 1, costUsd: 0.1, input: 10, output: 5, cacheRead: 0 }),
+        JSON.stringify({ t: "complete", at: 2, costUsd: 0.2, input: 20, output: 10, cacheRead: 0 }),
+      ].join("\n"),
+      "utf8",
+    );
+    expect(liveConductorCostUsd({ hostTelemetryFile: null, completionLogFile: completionFile })).toBe(0.3);
+  });
+
+  it("adds BOTH sources when present, mirroring executeRun's post-run additive merge", () => {
+    dir = mkdtempSync(path.join(tmpdir(), "bellows-live-cost-"));
+    const hostFile = path.join(dir, "host.jsonl");
+    const completionFile = path.join(dir, "completions.jsonl");
+    writeFileSync(hostFile, JSON.stringify({ t: "complete", at: 1, costUsd: 0.5, latencyMs: 100 }) + "\n", "utf8");
+    writeFileSync(completionFile, JSON.stringify({ t: "complete", at: 1, costUsd: 0.3, input: 1, output: 1, cacheRead: 0 }) + "\n", "utf8");
+    expect(liveConductorCostUsd({ hostTelemetryFile: hostFile, completionLogFile: completionFile })).toBe(0.8);
+  });
+
+  it("tolerates a partial trailing line (poll racing an in-flight write) by skipping it", () => {
+    dir = mkdtempSync(path.join(tmpdir(), "bellows-live-cost-"));
+    const completionFile = path.join(dir, "completions.jsonl");
+    writeFileSync(
+      completionFile,
+      JSON.stringify({ t: "complete", at: 1, costUsd: 0.4, input: 1, output: 1, cacheRead: 0 }) + '\n{"t":"complete","at":2,"costUsd":0.9,"inp',
+      "utf8",
+    );
+    expect(liveConductorCostUsd({ hostTelemetryFile: null, completionLogFile: completionFile })).toBe(0.4);
   });
 });
 

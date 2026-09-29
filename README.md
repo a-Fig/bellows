@@ -20,6 +20,7 @@ couldn't see: cost, tokens, cache behavior, per-turn usage, and fold telemetry.
 | `trials/` | Trial specs (YAML). |
 | `test/fixtures/` | `conductors/echo-conductor/` — a minimal external-conductor reference/test fixture (no GPU/model dependency). |
 | `runs/` | Output (gitignored): RunRecords + artifacts. |
+| `scripts/egress-allowlist.sh` | Host-level iptables egress allowlist for a Linux bench host running `sandbox: "landlock"` trials — see TUTORIAL.md → *Sealing a bench host*. |
 
 ## Setup
 
@@ -43,10 +44,12 @@ out of the agent's env*.
 On Linux, `"sandbox": "landlock"` additionally confines pi and everything it spawns to
 its own run dir (no reading other arms' solutions, harness logs or `$HOME`) — see
 TUTORIAL.md → *Keeping the agent inside its run dir*; `node bin/bellows.mjs sandbox-check`
-verifies a machine. Landlock cannot restrict the network, so a sandboxed agent can
-still reach the open internet by default — add `"sandboxEgress": "blocked"` to have the
-same canary verify a host-level egress block is actually in place (bellows can only
-verify this, never enforce it) — see TUTORIAL.md → *Verifying egress is blocked*.
+verifies a machine. Landlock cannot restrict the network, so `sandboxEgress` defaults to
+`"blocked"` whenever the sandbox is `"landlock"` — the same canary independently verifies
+a host-level egress block is actually in place (bellows can only verify this, never
+enforce it) and fails the run before pi starts if it isn't. Seal a bench host once with
+`sudo scripts/egress-allowlist.sh --user <bench-user> --allow <model-api-host:443>` — see
+TUTORIAL.md → *Verifying egress is blocked* / *Sealing a bench host*.
 
 ## Usage
 
