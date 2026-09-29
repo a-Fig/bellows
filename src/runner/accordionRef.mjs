@@ -400,9 +400,13 @@ function clearInstallFailure(dir) {
  * reaped the run at its 180s no-heartbeat deadline and failed it, for every
  * arm in the run, not just conductors that needed a ws install. Using
  * spawnSafe (async) here lets the event loop — and the heartbeat — keep
- * running while npm does its I/O; opts.timeout is enforced by hand (spawn has
- * no built-in timeout, unlike spawnSync) via killTree, mirroring
- * src/worker/selfUpdate.mjs's defaultRunNpmCi.
+ * running while npm does its I/O; opts.timeout is enforced by hand via
+ * killTree instead of relying on spawn's own `timeout`/`killSignal` options
+ * (2026-09-30 Fable re-review of #44, cheap note: spawn DOES have a built-in
+ * timeout, unlike the earlier claim here — but it only signals the direct
+ * child, not the whole process tree a hung `npm` can leave behind, which is
+ * exactly what killTree is for), mirroring src/worker/selfUpdate.mjs's
+ * defaultRunNpmCi.
  * @param {string} cmd
  * @param {string[]} args
  * @param {import("node:child_process").SpawnOptions & {timeout?: number}} opts
@@ -430,7 +434,12 @@ function spawnAwaited(cmd, args, opts, spawnFn = spawnSafe) {
             resolve({ status: null, stderr, error: new Error(`timed out after ${timeoutMs}ms — killed the child`) });
           }, timeoutMs)
         : null;
-    timer?.unref?.();
+    // Left ref'd (not unref'd): the child's own handle already keeps the
+    // event loop alive for as long as this promise is pending (spawnSafe
+    // never detaches/unrefs it). That's a real, different situation from
+    // sleep() below, where nothing else is alive during the wait — unref'ing
+    // THAT timer let Node exit silently mid-lock-wait (2026-09-30 Fable
+    // re-review of #44, blocking bug).
     child.stderr?.on("data", (d) => (stderr += d));
     child.on("error", (error) => {
       if (settled) return;
@@ -438,7 +447,13 @@ function spawnAwaited(cmd, args, opts, spawnFn = spawnSafe) {
       if (timer) clearTimeout(timer);
       resolve({ status: null, stderr, error });
     });
-    child.on("exit", (code) => {
+    // "close" (not "exit"): "exit" fires as soon as the process terminates,
+    // which can be BEFORE its stdio streams finish draining — a stderr
+    // chunk still in flight at that instant would resolve with a truncated
+    // `stderr`. "close" fires only after stdio is fully flushed, so the
+    // error text callers classify on (e.g. selfUpdate's "npm ci failed")
+    // is never cut off (2026-09-30 Fable re-review of #44, cheap note).
+    child.on("close", (code) => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
@@ -628,10 +643,16 @@ function removeWorktree(accordionRepo, wt, log) {
  * sharing runsDir can wait here while the first is mid-install, and that wait
  * runs on the SAME event loop as loop.mjs's heartbeat — a synchronous
  * Atomics.wait busy-sleep would starve it exactly like the blocking npm spawn
- * this follow-up also fixes). ensureWorktree (the only caller) is async, so
- * this can just await a real timer between polls instead.
+ * this follow-up also fixes). ensureWorktree (the only caller in production)
+ * is async, so this can just await a real timer between polls instead.
+ *
+ * Exported (test seam only — not part of the module's real call graph outside
+ * this file) so a genuine cross-process test can exercise this exact wait
+ * loop in an isolated `node` child process with nothing else keeping its
+ * event loop alive, the precise condition under which the sleep() unref bug
+ * below let Node exit silently instead of waiting (see accordionRef.test.mjs).
  */
-async function acquireLock(lockPath, log, { timeoutMs = LOCK_TIMEOUT_MS, pollMs = 100, staleMs = LOCK_STALE_MS } = {}) {
+export async function acquireLock(lockPath, log, { timeoutMs = LOCK_TIMEOUT_MS, pollMs = 100, staleMs = LOCK_STALE_MS } = {}) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     try {
@@ -670,11 +691,22 @@ async function acquireLock(lockPath, log, { timeoutMs = LOCK_TIMEOUT_MS, pollMs 
   }
 }
 
-/** Non-blocking sleep (setTimeout-based — see acquireLock for why this must not busy-block the event loop). */
+/**
+ * Non-blocking sleep (setTimeout-based — see acquireLock for why this must
+ * not busy-block the event loop). Deliberately NOT unref'd (2026-09-30
+ * Fable re-review of #44, blocking bug): while acquireLock is waiting on a
+ * lock another process holds, nothing else is necessarily ref'd yet —
+ * nothing has been spawned, and the worker's heartbeat/telemetry/batcher
+ * intervals and undici's idle sockets are themselves all unref'd — so an
+ * unref'd wait timer here left NOTHING keeping the event loop alive. Node
+ * drained the loop and exited 0 silently mid-wait, the worker never called
+ * complete(), and the platform reaped the run ~180s later. This sleep is
+ * exactly the thing meant to hold the process open while genuinely still
+ * waiting for the lock, so it must stay ref'd.
+ */
 function sleep(ms) {
   return new Promise((resolve) => {
-    const t = setTimeout(resolve, ms);
-    t.unref?.();
+    setTimeout(resolve, ms);
   });
 }
 

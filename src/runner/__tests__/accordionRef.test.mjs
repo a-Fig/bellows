@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeAll, afterAll, afterEach } from "vitest
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import {
   validateAccordionRef,
   ACCORDION_REF_RE,
@@ -279,6 +279,125 @@ describe("lock timeout vs install timeout", () => {
     expect(LOCK_TIMEOUT_MS).toBeGreaterThanOrEqual(NPM_INSTALL_TIMEOUT_MS);
     expect(LOCK_STALE_MS).toBeGreaterThanOrEqual(NPM_INSTALL_TIMEOUT_MS);
   });
+});
+
+// --- acquireLock: REAL cross-process contention (bellows #39 follow-up,
+// 2026-09-30 Fable re-review of #44, BLOCKING bug) --------------------------
+// The in-process "two concurrent ensureWorktree calls" test above cannot
+// catch an unref'd wait timer: vitest's own worker process already has other
+// ref'd handles alive (its IPC channel back to the main vitest process, etc.)
+// keeping the event loop open regardless of any one timer's ref status — so
+// the exact bug Fable found (sleep()'s poll timer was unref'd; a waiting
+// acquireLock can be the ONLY thing keeping a fresh bellows worker process
+// alive, since the heartbeat/telemetry/batcher intervals and undici's idle
+// sockets are themselves unref'd and nothing has been spawned yet) never
+// reproduces inside that shared process. This test instead runs acquireLock
+// inside a bare, freshly-spawned `node` child process with NOTHING else
+// keeping its loop alive — exactly the condition Fable reproduced ("the
+// unpatched code exits after 1 ms").
+describe("acquireLock cross-process contention (real event-loop reproduction)", () => {
+  const accordionRefUrl = new URL("../accordionRef.mjs", import.meta.url).href;
+  let tmpDir;
+
+  beforeAll(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "acc-lock-xproc-"));
+  });
+  afterAll(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  /** Write a standalone .mjs child script that imports the REAL acquireLock. */
+  function writeChildScript(name, body) {
+    const p = path.join(tmpDir, name);
+    fs.writeFileSync(p, `import { acquireLock } from ${JSON.stringify(accordionRefUrl)};\n${body}\n`);
+    return p;
+  }
+
+  it(
+    "a waiter in an isolated node child process stays alive across the whole lock wait, instead of Node draining the event loop and exiting 0 silently (2026-09-30 Fable repro: unpatched code exits after ~1ms)",
+    async () => {
+      const lockPath = path.join(tmpDir, `${Date.now()}-${Math.random().toString(36).slice(2)}.lock`);
+      const holdMs = 600;
+
+      const holderScript = writeChildScript(
+        "holder.mjs",
+        [
+          "const [, , lockPath, holdMsStr] = process.argv;",
+          "const release = await acquireLock(lockPath, () => {}, { pollMs: 50, timeoutMs: 30000, staleMs: 30000 });",
+          'process.stdout.write("HOLDING\\n");',
+          "await new Promise((r) => setTimeout(r, Number(holdMsStr)));",
+          "release();",
+          'process.stdout.write("RELEASED\\n");',
+        ].join("\n"),
+      );
+      const waiterScript = writeChildScript(
+        "waiter.mjs",
+        [
+          "const [, , lockPath] = process.argv;",
+          "const release = await acquireLock(lockPath, () => {}, { pollMs: 50, timeoutMs: 30000, staleMs: 30000 });",
+          'process.stdout.write("ACQUIRED\\n");',
+          "release();",
+        ].join("\n"),
+      );
+
+      const holder = spawn(process.execPath, [holderScript, lockPath, String(holdMs)]);
+      let holderOut = "";
+      let holderErr = "";
+      holder.stdout.on("data", (d) => (holderOut += d));
+      holder.stderr.on("data", (d) => (holderErr += d));
+
+      // Don't start the waiter until the holder genuinely has the lock —
+      // otherwise both would race for it and the test wouldn't isolate the
+      // WAIT path.
+      await new Promise((resolve, reject) => {
+        const deadline = Date.now() + 10_000;
+        const check = setInterval(() => {
+          if (holderOut.includes("HOLDING")) {
+            clearInterval(check);
+            resolve();
+          } else if (Date.now() > deadline) {
+            clearInterval(check);
+            reject(new Error(`holder never reported HOLDING (stderr: ${holderErr})`));
+          }
+        }, 10);
+        holder.once("error", (e) => {
+          clearInterval(check);
+          reject(e);
+        });
+      });
+
+      const waiterStart = Date.now();
+      const waiter = spawn(process.execPath, [waiterScript, lockPath]);
+      let waiterOut = "";
+      let waiterErr = "";
+      let waiterExited = false;
+      let waiterExitCode = null;
+      waiter.stdout.on("data", (d) => (waiterOut += d));
+      waiter.stderr.on("data", (d) => (waiterErr += d));
+      const waiterExitPromise = new Promise((resolve) => {
+        waiter.once("exit", (code) => {
+          waiterExited = true;
+          waiterExitCode = code;
+          resolve();
+        });
+      });
+
+      // The crux of the regression: with the unref'd timer, the waiter's
+      // event loop has nothing else keeping it open and Node exits (code 0!)
+      // almost immediately — well before the holder has released. Check
+      // partway through the hold window that it has NOT already exited.
+      await new Promise((r) => setTimeout(r, holdMs * 0.6));
+      expect(waiterExited, `waiter exited early (stderr: ${waiterErr})`).toBe(false);
+
+      await waiterExitPromise;
+      const elapsed = Date.now() - waiterStart;
+      expect(waiterExitCode, `waiter stderr: ${waiterErr}`).toBe(0);
+      expect(waiterOut).toContain("ACQUIRED");
+      // Genuinely waited out the holder rather than a coincidental fast exit.
+      expect(elapsed).toBeGreaterThanOrEqual(holdMs * 0.8);
+    },
+    15_000,
+  );
 });
 
 // --- conductors/ws/* dependency install (mocked command runner) --------------
