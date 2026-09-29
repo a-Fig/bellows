@@ -25,6 +25,7 @@ import {
   appendAgentFinalizeNote,
   resolvePlatformBase,
   buildPiEnv,
+  clearStaleTelemetryFiles,
 } from "../run.mjs";
 
 class FakePi extends EventEmitter {
@@ -296,6 +297,56 @@ describe("driveUntilDone — combined agent+conductor cost cap (bellows #38 foll
     pi.emit("event", { type: "message_end", message: { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: "ls" } }] } });
     pi.emit("event", { type: "agent_end", willRetry: false });
     await expect(outcome).resolves.toEqual({ status: "completed", statusDetail: undefined });
+  });
+});
+
+describe("clearStaleTelemetryFiles — run-dir reuse must not sum a prior run's spend (bellows #38 stale-rows / #43 item 4)", () => {
+  const dirs = [];
+  afterEach(() => {
+    while (dirs.length) {
+      const d = dirs.pop();
+      try {
+        fs.rmSync(d, { recursive: true, force: true });
+      } catch {
+        /* best-effort cleanup */
+      }
+    }
+  });
+  const makeRunDir = () => {
+    const d = fs.mkdtempSync(path.join(tmpdir(), "bellows-staletelemetry-"));
+    dirs.push(d);
+    return d;
+  };
+
+  it("removes pre-existing host.jsonl and completions.jsonl content from a reused run dir", () => {
+    const runDir = makeRunDir();
+    const hostTelemetryFile = path.join(runDir, "host.jsonl");
+    const completionLogFile = path.join(runDir, "completions.jsonl");
+    fs.writeFileSync(hostTelemetryFile, JSON.stringify({ t: "complete", costUsd: 5 }) + "\n");
+    fs.writeFileSync(completionLogFile, JSON.stringify({ t: "complete", costUsd: 7 }) + "\n");
+
+    clearStaleTelemetryFiles([hostTelemetryFile, completionLogFile]);
+
+    expect(fs.existsSync(hostTelemetryFile)).toBe(false);
+    expect(fs.existsSync(completionLogFile)).toBe(false);
+  });
+
+  it("is a no-op (does not throw) when the files were never written", () => {
+    const runDir = makeRunDir();
+    const hostTelemetryFile = path.join(runDir, "host.jsonl");
+    const completionLogFile = path.join(runDir, "completions.jsonl");
+
+    expect(() => clearStaleTelemetryFiles([hostTelemetryFile, completionLogFile])).not.toThrow();
+    expect(fs.existsSync(hostTelemetryFile)).toBe(false);
+  });
+
+  it("skips null/undefined entries without throwing (arm 'none' has no hostTelemetryFile)", () => {
+    const runDir = makeRunDir();
+    const completionLogFile = path.join(runDir, "completions.jsonl");
+    fs.writeFileSync(completionLogFile, "stale\n");
+
+    expect(() => clearStaleTelemetryFiles([null, completionLogFile, undefined])).not.toThrow();
+    expect(fs.existsSync(completionLogFile)).toBe(false);
   });
 });
 

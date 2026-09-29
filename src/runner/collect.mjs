@@ -246,7 +246,7 @@ export function foldHostTelemetry(text, fallbackConductorId = "") {
         totalFoldOps += n(e.ops);
         break;
       case "complete":
-        if (typeof e.costUsd === "number") completeCostUsd += e.costUsd;
+        completeCostUsd += positiveCost(e.costUsd);
         break;
       case "error":
         if (e.message) errors.push(String(e.message));
@@ -450,7 +450,7 @@ export function foldCompletionLog(text) {
       completeErrors++;
       continue;
     }
-    if (typeof rec.costUsd === "number") completeCostUsd += rec.costUsd;
+    completeCostUsd += positiveCost(rec.costUsd);
     completeInputTokens += n(rec.input);
     completeOutputTokens += n(rec.output);
     completeCacheReadTokens += n(rec.cacheRead);
@@ -568,6 +568,19 @@ function n(v) {
  *  or a single bad sample would silently drag avgMs negative. */
 function isValidRtt(v) {
   return Number.isFinite(v) && v >= 0;
+}
+/** Clamp a `costUsd` field to a finite, non-negative number (0 otherwise).
+ *  host.jsonl and completions.jsonl are both agent-writable (2026-09-29
+ *  Fable review, #42 note 4 / #43 blocking item 4): under Landlock,
+ *  completions.jsonl is only write-only (O_WRONLY, no O_APPEND requirement),
+ *  so the agent's own process tree can overwrite it with a forged row, and
+ *  host.jsonl is reachable indirectly via the accordion-home descriptor.
+ *  Since bellows #43 feeds this sum straight into `caps.costUsd`'s live
+ *  abort check, an un-clamped negative or NaN/Infinity value could raise its
+ *  own ceiling (or silently cancel out a real cost) instead of merely being
+ *  wrong in a report. */
+function positiveCost(v) {
+  return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0;
 }
 export function round6(v) {
   return Math.round(v * 1e6) / 1e6;

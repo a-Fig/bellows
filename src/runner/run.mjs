@@ -19,6 +19,32 @@ function runsRootFrom(config) {
 
 /** Bellows repo root — the host's vite-node config and bench.config.json live here. */
 const BELLOWS_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+
+/**
+ * Delete any pre-existing telemetry files (host.jsonl, completions.jsonl) for a run
+ * dir before pi/the host are spawned. Run dirs are deterministic and get reused
+ * across re-runs of the same arm/seed; both files are append-only for the rest of
+ * a run, so leftover rows from a prior run would get folded into THIS run's
+ * conductor cost (collect.mjs's foldHostTelemetry/foldCompletionLog) and — since
+ * caps.costUsd now covers agent+conductor spend combined — could trip the live
+ * mid-run abort check on spend the run never actually incurred this time
+ * (2026-09-29 Fable review, bellows #38 blocking follow-up / #43 blocking item 4).
+ * Best-effort: a removal failure (e.g. a permissions oddity) is left for the
+ * spawn/write path itself to fail loudly on, rather than aborting the run over
+ * stale-telemetry hygiene alone. `null`/`undefined` entries (e.g. arm === "none"
+ * has no hostTelemetryFile) are skipped.
+ * @param {(string|null|undefined)[]} files
+ */
+export function clearStaleTelemetryFiles(files) {
+  for (const file of files) {
+    if (!file) continue;
+    try {
+      fs.rmSync(file, { force: true });
+    } catch {
+      /* best-effort — see doc comment above */
+    }
+  }
+}
 import { provisionRun, KICKOFF_PROMPT } from "./provision.mjs";
 import { agentSpawnEnv } from "./agentEnv.mjs";
 import { scrubEnv } from "./envScrub.mjs";
@@ -94,6 +120,20 @@ export async function executeRun(args) {
   // named once here so driveUntilDone can poll the SAME file live for the
   // combined caps.costUsd check (see maybePollCost).
   const completionLogFile = path.join(runDir, "completions.jsonl");
+  // Run dirs are deterministic (runs/<trial>/<arm>-<seed>, _worker/<trial>/<arm>-<seed>),
+  // so re-running the same arm/seed reuses this exact directory. Both files
+  // are append-only for the rest of this run (the Accordion extension appends
+  // via fs.appendFile, the host via appendFileSync in src/host/telemetry.ts;
+  // prepareLandlockRun's touch() below never writes) — if either already has
+  // rows from a PRIOR run in this dir, foldHostTelemetry/foldCompletionLog
+  // (collect.mjs) would sum the stale rows into THIS run's conductor cost,
+  // corrupting both the final record and, since caps.costUsd now covers
+  // agent+conductor spend combined, the LIVE mid-run abort check — a re-run
+  // could then abort immediately on spend it never actually incurred this
+  // time. Remove any stale content up front, before anything is spawned
+  // (2026-09-29 Fable review, bellows #38 blocking follow-up / #43 blocking
+  // item 4).
+  clearStaleTelemetryFiles([hostTelemetryFile, completionLogFile]);
 
   // Resolve up front so a bad "external:<id>" fails before anything is spawned.
   // config.mjs's trial validation already calls parseConductorArm on load, but a

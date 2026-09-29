@@ -119,18 +119,26 @@ run through the exact same Landlock-wrapped canary process as the filesystem
 probes, so there's nothing to run them in otherwise — bellows refuses the run
 up front rather than silently skipping the check.
 
-When enabled, the canary additionally does a plain TCP connect (5s timeout,
-dependency-free `socket.create_connection`, no libraries) to a fixed list of
-hosts that must be **unreachable**: `github.com:443`,
-`raw.githubusercontent.com:443`, `pypi.org:443`. Connection refused, reset,
-timeout, or a DNS failure all count as "blocked" — any of them is a PASS. If
-one of these connects successfully, that's an escape and the run is aborted
-before pi starts, exactly like a filesystem escape. Optionally, list hosts
-that **must** stay reachable (typically the model API) in
-`"sandboxEgressAllow": ["api.deepseek.com:443"]` — bench-config only, checked
-the same way in reverse. The run's `fingerprint.sandbox` records a short
-`egress: "unchecked" | "blocked"` alongside `mode` so reports show which runs
-actually had egress verified.
+When enabled, the runner first resolves a fixed list of hosts that must be
+**unreachable** — `github.com`, `raw.githubusercontent.com`, `pypi.org` — to a
+literal IP itself (never inside the sandbox; see `resolveEgressHost` /
+`buildEgressProbes` in `src/runner/sandbox.mjs`), then the canary does a plain
+TCP connect (5s timeout, dependency-free `socket.create_connection`, no
+libraries) to each resolved `ip:port`. Connection refused, reset, or timeout
+all count as "blocked" — any of them is a PASS. Resolution happens in the
+runner and not inside the canary on purpose: `socket.create_connection` given
+a bare hostname would do its own DNS lookup inside the sandbox, and a broken
+resolver there would fail the connect for a reason that has nothing to do
+with whether TCP itself is blocked — silently passing the check by accident.
+If the *runner* can't resolve one of these hosts, that's treated as
+inconclusive and the run is aborted before pi starts (same "throw before pi
+exists" posture as everything else here) rather than reported as "blocked".
+If a resolved IP connects successfully, that's an escape and the run is
+aborted the same way. Optionally, list hosts that **must** stay reachable
+(typically the model API) in `"sandboxEgressAllow": ["api.deepseek.com:443"]`
+— bench-config only, checked the same way in reverse. The run's
+`fingerprint.sandbox` records a short `egress: "unchecked" | "blocked"`
+alongside `mode` so reports show which runs actually had egress verified.
 
 **bellows only verifies — it never enforces.** You still need a host-level
 firewall. See the next section.

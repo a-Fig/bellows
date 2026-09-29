@@ -16,6 +16,7 @@ import {
   landlockArgvPrefix,
   buildCanaryProbes,
   buildEgressProbes,
+  resolveEgressHost,
   evaluateCanary,
   formatCanaryTable,
   runCanary,
@@ -159,24 +160,74 @@ describe("validateSandboxEgressAllow", () => {
 });
 
 describe("buildEgressProbes", () => {
-  it("returns nothing when egress is unchecked", () => {
-    expect(buildEgressProbes({ egress: "unchecked" })).toEqual([]);
-    expect(buildEgressProbes({ egress: "unchecked", egressAllow: ["api.deepseek.com:443"] })).toEqual([]);
+  // A fake resolver instead of the real getent-based default: this machine's
+  // tests run on Windows/macOS dev boxes without `getent`, and the whole
+  // point of resolving in the runner (rather than inside CANARY_PY) is that
+  // it's independently testable/injectable — see resolveEgressHost below.
+  const fakeResolve = (map) => (host) => (Object.prototype.hasOwnProperty.call(map, host) ? map[host] : null);
+
+  it("returns nothing when egress is unchecked (never even calls the resolver)", () => {
+    const resolveHost = () => {
+      throw new Error("must not be called");
+    };
+    expect(buildEgressProbes({ egress: "unchecked", resolveHost })).toEqual([]);
+    expect(buildEgressProbes({ egress: "unchecked", egressAllow: ["api.deepseek.com:443"], resolveHost })).toEqual([]);
   });
 
-  it("adds a deny probe for every default blocked host, kind net", () => {
-    const probes = buildEgressProbes({ egress: "blocked" });
+  it("adds a deny probe for every default blocked host, resolved to a literal IP", () => {
+    const resolveHost = fakeResolve({ "github.com": "10.0.0.1", "raw.githubusercontent.com": "10.0.0.2", "pypi.org": "10.0.0.3" });
+    const probes = buildEgressProbes({ egress: "blocked", resolveHost });
     expect(probes).toHaveLength(DEFAULT_EGRESS_BLOCKED_HOSTS.length);
     for (const p of probes) expect(p).toMatchObject({ op: "tcp", kind: "net", expect: "deny" });
-    expect(probes.map((p) => p.path)).toEqual(DEFAULT_EGRESS_BLOCKED_HOSTS);
+    expect(probes.map((p) => p.path)).toEqual(["10.0.0.1:443", "10.0.0.2:443", "10.0.0.3:443"]);
+    // The hostname is still in the name (for a readable canary table) even
+    // though the probe itself never resolves it.
+    expect(probes[0].name).toBe("egress: github.com:443 (10.0.0.1) must be blocked");
   });
 
-  it("adds an allow probe for every sandboxEgressAllow entry", () => {
-    const probes = buildEgressProbes({ egress: "blocked", egressAllow: ["api.deepseek.com:443"] });
+  it("adds an allow probe for every sandboxEgressAllow entry, resolved to a literal IP", () => {
+    const resolveHost = fakeResolve({
+      "github.com": "10.0.0.1",
+      "raw.githubusercontent.com": "10.0.0.2",
+      "pypi.org": "10.0.0.3",
+      "api.deepseek.com": "10.1.2.3",
+    });
+    const probes = buildEgressProbes({ egress: "blocked", egressAllow: ["api.deepseek.com:443"], resolveHost });
     const allow = probes.filter((p) => p.expect === "allow");
     expect(allow).toEqual([
-      { name: "egress: api.deepseek.com:443 must be reachable (sandboxEgressAllow)", op: "tcp", path: "api.deepseek.com:443", kind: "net", expect: "allow" },
+      { name: "egress: api.deepseek.com:443 (10.1.2.3) must be reachable (sandboxEgressAllow)", op: "tcp", path: "10.1.2.3:443", kind: "net", expect: "allow" },
     ]);
+  });
+
+  it("throws (does not silently pass) when the runner itself cannot resolve a must-be-blocked host", () => {
+    const resolveHost = fakeResolve({ "raw.githubusercontent.com": "10.0.0.2", "pypi.org": "10.0.0.3" }); // github.com missing -> null
+    expect(() => buildEgressProbes({ egress: "blocked", resolveHost })).toThrow(
+      /could not resolve "github\.com".*inconclusive and must fail/s,
+    );
+  });
+
+  it("throws when the runner cannot resolve a sandboxEgressAllow host", () => {
+    const resolveHost = fakeResolve({ "github.com": "10.0.0.1", "raw.githubusercontent.com": "10.0.0.2", "pypi.org": "10.0.0.3" }); // no entry for the allow host
+    expect(() => buildEgressProbes({ egress: "blocked", egressAllow: ["api.deepseek.com:443"], resolveHost })).toThrow(
+      /could not resolve "api\.deepseek\.com".*reachable/s,
+    );
+  });
+
+  it("defaults resolveHost to resolveEgressHost, which is exported for direct testing", () => {
+    // Proves the wiring without shelling out to a real getent: inject a fake spawn.
+    const spawn = (cmd, args) => {
+      expect(cmd).toBe("getent");
+      expect(args).toEqual(["ahostsv4", "example.com"]);
+      return { status: 0, stdout: "93.184.216.34   STREAM example.com\n" };
+    };
+    expect(resolveEgressHost("example.com", spawn)).toBe("93.184.216.34");
+  });
+
+  it("resolveEgressHost returns null on a failed/erroring/empty resolution (never throws itself)", () => {
+    expect(resolveEgressHost("nope.invalid", () => ({ status: 2, stdout: "" }))).toBeNull();
+    expect(resolveEgressHost("nope.invalid", () => ({ error: new Error("ENOENT: getent not found") }))).toBeNull();
+    expect(resolveEgressHost("nope.invalid", () => ({ status: 0, stdout: "" }))).toBeNull();
+    expect(resolveEgressHost("nope.invalid", () => ({ status: 0, stdout: "\n\n" }))).toBeNull();
   });
 });
 

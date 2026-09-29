@@ -559,6 +559,26 @@ export function buildCanaryProbes({
 }
 
 /**
+ * Resolve one hostname to a single IPv4 address via the system resolver
+ * (`getent ahostsv4` — the same tool scripts/egress-allowlist.sh uses to pin
+ * /etc/hosts). ALWAYS called from the runner itself (unsandboxed), never
+ * from inside the Landlock-wrapped canary process — see buildEgressProbes
+ * for why that distinction is the whole point. Injectable `spawn` for tests
+ * (this machine's tests run on Windows/macOS dev boxes without `getent`).
+ * @param {string} host
+ * @param {typeof spawnSync} [spawn]
+ * @returns {string|null} an IPv4 dotted-quad, or null if resolution failed
+ */
+export function resolveEgressHost(host, spawn = spawnSync) {
+  const r = spawn("getent", ["ahostsv4", host], { encoding: "utf8", timeout: 10_000 });
+  if (r.error || r.status !== 0 || !r.stdout) return null;
+  const first = r.stdout.split("\n").find((l) => l.trim());
+  if (!first) return null;
+  const ip = first.trim().split(/\s+/)[0];
+  return ip || null;
+}
+
+/**
  * Egress probes for one run (sandboxEgress: "blocked"). Run through the exact
  * same canary process as the filesystem probes (buildCanaryProbes) — bellows
  * itself cannot close the network (it runs unprivileged; see
@@ -567,19 +587,51 @@ export function buildCanaryProbes({
  * did. `kind: "net"` tells evaluateCanary to judge these by connect
  * success/failure rather than by filesystem errno.
  *
- * DEFAULT_EGRESS_BLOCKED_HOSTS must fail to connect (refused/reset/timeout/DNS
- * failure all count as blocked); `egressAllow` entries (config.sandboxEgressAllow,
- * e.g. the model API host) must succeed.
- * @param {{egress: "unchecked"|"blocked", egressAllow?: string[]}} a
+ * Every host:port is resolved to a literal IP HERE, in the runner, before the
+ * probe is ever built — not left to CANARY_PY's `socket.create_connection`
+ * to resolve by hostname inside the sandboxed process. That used to be a real
+ * gap (2026-09-29 Fable review, #42 note 1 / #43 note 1): evaluateCanary
+ * treats ANY connect failure on a `kind:"net"` probe as "denied" (a PASS for
+ * an `expect:"deny"` row), so a broken resolver, a resolver rejected by a
+ * partial firewall, or any other DNS hiccup inside the sandbox would make the
+ * canary report the network "blocked" even though a raw IP connection (e.g.
+ * `curl --resolve github.com:443:<ip> https://github.com/...`, or hardcoding
+ * the IP) would sail straight through — DNS still works for the sandboxed
+ * process by design (see TUTORIAL.md "Residual gaps"), so a DNS failure there
+ * proves nothing about whether TCP itself is blocked. Resolving here instead
+ * means every "must be blocked"/"must be reachable" verdict is a judgment
+ * about an actual TCP connect to a real address, never about whether a
+ * hostname happened to resolve inside the sandbox.
+ *
+ * If the RUNNER itself (unsandboxed, not subject to the gap above) can't
+ * resolve a host, that's anomalous — DNS keeps working for the bench user by
+ * design (see TUTORIAL.md), so a failure here usually means the resolver
+ * itself is down. The check is then inconclusive and must fail loudly,
+ * consistent with the "throw before pi exists" posture everywhere else in
+ * this file, rather than silently reporting the host "blocked" because there
+ * was no IP left to probe.
+ * @param {{egress: "unchecked"|"blocked", egressAllow?: string[], resolveHost?: (host:string)=>(string|null)}} a
  * @returns {{name:string, op:"tcp", path:string, kind:"net", expect:"allow"|"deny"}[]}
  */
-export function buildEgressProbes({ egress, egressAllow = [] }) {
+export function buildEgressProbes({ egress, egressAllow = [], resolveHost = resolveEgressHost }) {
   if (egress !== "blocked") return [];
+  const toIpProbe = (hostPort, expect, nameSuffix) => {
+    const idx = hostPort.lastIndexOf(":");
+    const host = hostPort.slice(0, idx);
+    const port = hostPort.slice(idx + 1);
+    const ip = resolveHost(host);
+    if (!ip)
+      throw new Error(
+        `sandbox egress check: could not resolve "${host}" (for "${hostPort}") from the runner — DNS failure or an unreachable resolver. ` +
+          "The egress canary always probes a literal IP it resolved itself here, never a hostname resolved inside the sandbox, so a DNS " +
+          `hiccup can never masquerade as "egress is blocked". Since the runner could not resolve "${host}", the check is inconclusive and ` +
+          `must fail rather than silently report it ${expect === "deny" ? "blocked" : "reachable"} — fix DNS on this host and retry.`,
+      );
+    return { name: `egress: ${hostPort} (${ip}) ${nameSuffix}`, op: "tcp", path: `${ip}:${port}`, kind: "net", expect };
+  };
   const probes = [];
-  for (const hostPort of DEFAULT_EGRESS_BLOCKED_HOSTS)
-    probes.push({ name: `egress: ${hostPort} must be blocked`, op: "tcp", path: hostPort, kind: "net", expect: "deny" });
-  for (const hostPort of egressAllow)
-    probes.push({ name: `egress: ${hostPort} must be reachable (sandboxEgressAllow)`, op: "tcp", path: hostPort, kind: "net", expect: "allow" });
+  for (const hostPort of DEFAULT_EGRESS_BLOCKED_HOSTS) probes.push(toIpProbe(hostPort, "deny", "must be blocked"));
+  for (const hostPort of egressAllow) probes.push(toIpProbe(hostPort, "allow", "must be reachable (sandboxEgressAllow)"));
   return probes;
 }
 
@@ -588,9 +640,13 @@ export function buildEgressProbes({ egress, egressAllow = [] }) {
  * success is an isolation breach ("ESCAPED") and any other error is
  * inconclusive (e.g. ENOENT could hide a missing target). A net probe
  * (`kind: "net"`, egress checking) has no meaningful errno to check —
- * "connection refused/reset/timeout/DNS failure" are all just "not ok", and
- * ANY of them count as blocked. An allow probe (filesystem or net) passes only
- * on success.
+ * "connection refused/reset/timeout" are all just "not ok", and ANY of them
+ * count as blocked. This is safe from a DNS false-"blocked" only because
+ * buildEgressProbes already resolved every host to a literal IP in the
+ * runner before this ever sees the probe — CANARY_PY's "tcp" op is handed an
+ * IP, not a hostname, so there is no DNS lookup left to fail inside the
+ * sandbox by the time a probe reaches this function. An allow probe
+ * (filesystem or net) passes only on success.
  * @returns {{ok:boolean, escaped:boolean, rows:{name:string, expect:string, got:string, pass:boolean, detail:string}[]}}
  */
 export function evaluateCanary(probes, results) {

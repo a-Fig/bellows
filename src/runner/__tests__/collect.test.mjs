@@ -733,6 +733,35 @@ describe("foldCompletionLog / collectCompletionLog — completions.jsonl side lo
       });
     });
   });
+
+  describe("costUsd clamping (2026-09-29 Fable review, #42 note 4 / #43 blocking item 4)", () => {
+    // completions.jsonl is agent-writable (write-only under Landlock, but
+    // O_WRONLY without O_APPEND lets the agent's process tree overwrite it at
+    // offset 0), and this sum now feeds straight into caps.costUsd's live
+    // abort check (bellows #43) — a forged negative row must not lower the
+    // total. (NaN/Infinity can't arrive through this path at all: JSON has no
+    // literal for either, so JSON.stringify already turns them into `null`
+    // before a legitimate writer could even emit them, and a forged non-JSON
+    // token like a bare `NaN` fails JSON.parse and is dropped as a malformed
+    // line by parseJsonl, never reaching costUsd accumulation. The clamp
+    // still checks Number.isFinite defensively in case these functions are
+    // ever called on programmatically-built records instead of raw text.)
+    it("clamps a negative costUsd to 0 instead of subtracting from the total", () => {
+      const text = [
+        JSON.stringify({ t: "complete", at: 1, costUsd: 5, input: 1, output: 1, cacheRead: 0 }),
+        JSON.stringify({ t: "complete", at: 2, costUsd: -100, input: 1, output: 1, cacheRead: 0 }),
+      ].join("\n");
+      expect(foldCompletionLog(text).completeCostUsd).toBe(5);
+    });
+
+    it("foldHostTelemetry clamps a negative host-reported costUsd the same way", () => {
+      const text = [
+        JSON.stringify({ t: "complete", at: 1, costUsd: 2 }),
+        JSON.stringify({ t: "complete", at: 2, costUsd: -500 }),
+      ].join("\n");
+      expect(foldHostTelemetry(text).completeCostUsd).toBe(2);
+    });
+  });
 });
 
 describe("liveConductorCostUsd — mid-run conductor spend for caps.costUsd (bellows #38 follow-up)", () => {
