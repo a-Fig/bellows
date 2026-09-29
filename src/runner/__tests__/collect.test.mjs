@@ -8,6 +8,7 @@ import {
   foldCompletionLog,
   collectCompletionLog,
   collectHostTelemetry,
+  liveConductorCostUsd,
   enrichTurnsWithWire,
   computePlanRtt,
 } from "../collect.mjs";
@@ -731,6 +732,114 @@ describe("foldCompletionLog / collectCompletionLog — completions.jsonl side lo
         completeCacheReadTokens: 1,
       });
     });
+  });
+
+  describe("costUsd clamping (2026-09-29 Fable review, #42 note 4 / #43 blocking item 4)", () => {
+    // completions.jsonl is agent-writable (write-only under Landlock, but
+    // O_WRONLY without O_APPEND lets the agent's process tree overwrite it at
+    // offset 0), and this sum now feeds straight into caps.costUsd's live
+    // abort check (bellows #43) — a forged negative row must not lower the
+    // total. (NaN/Infinity can't arrive through this path at all: JSON has no
+    // literal for either, so JSON.stringify already turns them into `null`
+    // before a legitimate writer could even emit them, and a forged non-JSON
+    // token like a bare `NaN` fails JSON.parse and is dropped as a malformed
+    // line by parseJsonl, never reaching costUsd accumulation. The clamp
+    // still checks Number.isFinite defensively in case these functions are
+    // ever called on programmatically-built records instead of raw text.)
+    it("clamps a negative costUsd to 0 instead of subtracting from the total", () => {
+      const text = [
+        JSON.stringify({ t: "complete", at: 1, costUsd: 5, input: 1, output: 1, cacheRead: 0 }),
+        JSON.stringify({ t: "complete", at: 2, costUsd: -100, input: 1, output: 1, cacheRead: 0 }),
+      ].join("\n");
+      expect(foldCompletionLog(text).completeCostUsd).toBe(5);
+    });
+
+    it("foldHostTelemetry clamps a negative host-reported costUsd the same way", () => {
+      const text = [
+        JSON.stringify({ t: "complete", at: 1, costUsd: 2 }),
+        JSON.stringify({ t: "complete", at: 2, costUsd: -500 }),
+      ].join("\n");
+      expect(foldHostTelemetry(text).completeCostUsd).toBe(2);
+    });
+  });
+});
+
+describe("liveConductorCostUsd — mid-run conductor spend for caps.costUsd (bellows #38 follow-up)", () => {
+  let dir;
+  afterEach(() => {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+    dir = undefined;
+  });
+
+  it("returns 0 when neither file is given", () => {
+    expect(liveConductorCostUsd({})).toBe(0);
+    expect(liveConductorCostUsd()).toBe(0);
+  });
+
+  it("returns 0 for files that don't exist yet (conductor hasn't completed anything this run)", () => {
+    dir = mkdtempSync(path.join(tmpdir(), "bellows-live-cost-"));
+    expect(
+      liveConductorCostUsd({
+        hostTelemetryFile: path.join(dir, "host.jsonl"),
+        completionLogFile: path.join(dir, "completions.jsonl"),
+      }),
+    ).toBe(0);
+  });
+
+  it("treats a zero-byte (sandbox pre-created) file exactly like a missing one", () => {
+    dir = mkdtempSync(path.join(tmpdir(), "bellows-live-cost-"));
+    const hostFile = path.join(dir, "host.jsonl");
+    const completionFile = path.join(dir, "completions.jsonl");
+    writeFileSync(hostFile, "", "utf8");
+    writeFileSync(completionFile, "", "utf8");
+    expect(liveConductorCostUsd({ hostTelemetryFile: hostFile, completionLogFile: completionFile })).toBe(0);
+  });
+
+  it("sums host.jsonl 'complete' rows alone (legacy host, no completions.jsonl yet)", () => {
+    dir = mkdtempSync(path.join(tmpdir(), "bellows-live-cost-"));
+    const hostFile = path.join(dir, "host.jsonl");
+    writeFileSync(
+      hostFile,
+      [JSON.stringify({ t: "complete", at: 1, costUsd: 0.5, latencyMs: 100 }), JSON.stringify({ t: "complete", at: 2, costUsd: 0.25, latencyMs: 100 })].join(
+        "\n",
+      ),
+      "utf8",
+    );
+    expect(liveConductorCostUsd({ hostTelemetryFile: hostFile, completionLogFile: null })).toBe(0.75);
+  });
+
+  it("sums completions.jsonl side-log rows alone (protocol v22, no host.jsonl 'complete' rows)", () => {
+    dir = mkdtempSync(path.join(tmpdir(), "bellows-live-cost-"));
+    const completionFile = path.join(dir, "completions.jsonl");
+    writeFileSync(
+      completionFile,
+      [
+        JSON.stringify({ t: "complete", at: 1, costUsd: 0.1, input: 10, output: 5, cacheRead: 0 }),
+        JSON.stringify({ t: "complete", at: 2, costUsd: 0.2, input: 20, output: 10, cacheRead: 0 }),
+      ].join("\n"),
+      "utf8",
+    );
+    expect(liveConductorCostUsd({ hostTelemetryFile: null, completionLogFile: completionFile })).toBe(0.3);
+  });
+
+  it("adds BOTH sources when present, mirroring executeRun's post-run additive merge", () => {
+    dir = mkdtempSync(path.join(tmpdir(), "bellows-live-cost-"));
+    const hostFile = path.join(dir, "host.jsonl");
+    const completionFile = path.join(dir, "completions.jsonl");
+    writeFileSync(hostFile, JSON.stringify({ t: "complete", at: 1, costUsd: 0.5, latencyMs: 100 }) + "\n", "utf8");
+    writeFileSync(completionFile, JSON.stringify({ t: "complete", at: 1, costUsd: 0.3, input: 1, output: 1, cacheRead: 0 }) + "\n", "utf8");
+    expect(liveConductorCostUsd({ hostTelemetryFile: hostFile, completionLogFile: completionFile })).toBe(0.8);
+  });
+
+  it("tolerates a partial trailing line (poll racing an in-flight write) by skipping it", () => {
+    dir = mkdtempSync(path.join(tmpdir(), "bellows-live-cost-"));
+    const completionFile = path.join(dir, "completions.jsonl");
+    writeFileSync(
+      completionFile,
+      JSON.stringify({ t: "complete", at: 1, costUsd: 0.4, input: 1, output: 1, cacheRead: 0 }) + '\n{"t":"complete","at":2,"costUsd":0.9,"inp',
+      "utf8",
+    );
+    expect(liveConductorCostUsd({ hostTelemetryFile: null, completionLogFile: completionFile })).toBe(0.4);
   });
 });
 

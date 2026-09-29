@@ -25,6 +25,7 @@ import {
   appendAgentFinalizeNote,
   resolvePlatformBase,
   buildPiEnv,
+  clearStaleTelemetryFiles,
 } from "../run.mjs";
 
 class FakePi extends EventEmitter {
@@ -187,6 +188,165 @@ describe("driveUntilDone — sentinel-echo / degenerate terminal response (2026-
 
     await expect(outcome).resolves.toEqual({ status: "completed", statusDetail: undefined });
     expect(telemetry.sawAgentFinalize).toBe(true);
+  });
+});
+
+describe("driveUntilDone — combined agent+conductor cost cap (bellows #38 follow-up)", () => {
+  class CostPi extends EventEmitter {
+    constructor(cost) {
+      super();
+      this.cost = cost;
+    }
+    async getSessionStats() {
+      return { cost: this.cost, tokens: { total: 1 } };
+    }
+  }
+
+  const dirs = [];
+  afterEach(() => {
+    while (dirs.length) {
+      const d = dirs.pop();
+      try {
+        fs.rmSync(d, { recursive: true, force: true });
+      } catch {
+        /* best-effort cleanup */
+      }
+    }
+  });
+
+  const makeRunDir = () => {
+    const d = fs.mkdtempSync(path.join(tmpdir(), "bellows-costcap-"));
+    dirs.push(d);
+    return d;
+  };
+
+  it("stays under a cap that agent cost alone would not reach, with no telemetry files given", async () => {
+    const pi = new CostPi(0.6);
+    const spec = { caps: { minutes: 1, turns: 100, costUsd: 1 } };
+    const outcome = driveUntilDone({ pi, host: null, spec, log: () => {}, label: "test" });
+
+    pi.emit("event", { type: "message_end", message: { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: "ls" } }] } });
+    pi.emit("event", { type: "agent_end", willRetry: false });
+
+    await expect(outcome).resolves.toEqual({ status: "completed", statusDetail: undefined });
+  });
+
+  it("aborts on combined agent+conductor cost even though agent cost alone is under the cap (host.jsonl)", async () => {
+    const runDir = makeRunDir();
+    const hostTelemetryFile = path.join(runDir, "host.jsonl");
+    fs.writeFileSync(hostTelemetryFile, JSON.stringify({ t: "complete", at: 1, costUsd: 0.5 }) + "\n", "utf8");
+
+    const pi = new CostPi(0.6); // agent cost alone (0.6) is under the cap (1)
+    const spec = { caps: { minutes: 1, turns: 100, costUsd: 1 } };
+    const outcome = driveUntilDone({ pi, host: null, spec, log: () => {}, label: "test", hostTelemetryFile });
+
+    pi.emit("event", { type: "message_end", message: { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: "ls" } }] } });
+
+    await expect(outcome).resolves.toEqual({
+      status: "aborted-cost",
+      statusDetail: "cost $1.1000 (agent $0.6000 + conductor $0.5000) >= cap $1",
+    });
+  });
+
+  it("aborts on combined agent+conductor cost from completions.jsonl (Accordion protocol v22 side log)", async () => {
+    const runDir = makeRunDir();
+    const completionLogFile = path.join(runDir, "completions.jsonl");
+    fs.writeFileSync(
+      completionLogFile,
+      JSON.stringify({ t: "complete", at: 1, provider: "anthropic", model: "claude-x", input: 10, output: 5, cacheRead: 0, costUsd: 0.5 }) + "\n",
+      "utf8",
+    );
+
+    const pi = new CostPi(0.6);
+    const spec = { caps: { minutes: 1, turns: 100, costUsd: 1 } };
+    const outcome = driveUntilDone({ pi, host: null, spec, log: () => {}, label: "test", completionLogFile });
+
+    pi.emit("event", { type: "message_end", message: { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: "ls" } }] } });
+
+    await expect(outcome).resolves.toEqual({
+      status: "aborted-cost",
+      statusDetail: "cost $1.1000 (agent $0.6000 + conductor $0.5000) >= cap $1",
+    });
+  });
+
+  it("adds host.jsonl and completions.jsonl conductor spend together with agent cost", async () => {
+    const runDir = makeRunDir();
+    const hostTelemetryFile = path.join(runDir, "host.jsonl");
+    const completionLogFile = path.join(runDir, "completions.jsonl");
+    fs.writeFileSync(hostTelemetryFile, JSON.stringify({ t: "complete", at: 1, costUsd: 0.2 }) + "\n", "utf8");
+    fs.writeFileSync(completionLogFile, JSON.stringify({ t: "complete", at: 1, costUsd: 0.2 }) + "\n", "utf8");
+
+    const pi = new CostPi(0.5); // 0.5 agent + 0.2 + 0.2 conductor = 0.9, under cap of 1 — must not abort yet
+    const spec = { caps: { minutes: 1, turns: 100, costUsd: 1 } };
+    const outcome = driveUntilDone({ pi, host: null, spec, log: () => {}, label: "test", hostTelemetryFile, completionLogFile });
+
+    pi.emit("event", { type: "message_end", message: { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: "ls" } }] } });
+    pi.emit("event", { type: "agent_end", willRetry: false });
+    await expect(outcome).resolves.toEqual({ status: "completed", statusDetail: undefined });
+  });
+
+  it("does not abort when telemetry files are absent (arm 'none' — no conductor spend to add)", async () => {
+    const runDir = makeRunDir();
+    const hostTelemetryFile = path.join(runDir, "host.jsonl"); // never written
+    const completionLogFile = path.join(runDir, "completions.jsonl"); // never written
+
+    const pi = new CostPi(0.9);
+    const spec = { caps: { minutes: 1, turns: 100, costUsd: 1 } };
+    const outcome = driveUntilDone({ pi, host: null, spec, log: () => {}, label: "test", hostTelemetryFile, completionLogFile });
+
+    pi.emit("event", { type: "message_end", message: { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: "ls" } }] } });
+    pi.emit("event", { type: "agent_end", willRetry: false });
+    await expect(outcome).resolves.toEqual({ status: "completed", statusDetail: undefined });
+  });
+});
+
+describe("clearStaleTelemetryFiles — run-dir reuse must not sum a prior run's spend (bellows #38 stale-rows / #43 item 4)", () => {
+  const dirs = [];
+  afterEach(() => {
+    while (dirs.length) {
+      const d = dirs.pop();
+      try {
+        fs.rmSync(d, { recursive: true, force: true });
+      } catch {
+        /* best-effort cleanup */
+      }
+    }
+  });
+  const makeRunDir = () => {
+    const d = fs.mkdtempSync(path.join(tmpdir(), "bellows-staletelemetry-"));
+    dirs.push(d);
+    return d;
+  };
+
+  it("removes pre-existing host.jsonl and completions.jsonl content from a reused run dir", () => {
+    const runDir = makeRunDir();
+    const hostTelemetryFile = path.join(runDir, "host.jsonl");
+    const completionLogFile = path.join(runDir, "completions.jsonl");
+    fs.writeFileSync(hostTelemetryFile, JSON.stringify({ t: "complete", costUsd: 5 }) + "\n");
+    fs.writeFileSync(completionLogFile, JSON.stringify({ t: "complete", costUsd: 7 }) + "\n");
+
+    clearStaleTelemetryFiles([hostTelemetryFile, completionLogFile]);
+
+    expect(fs.existsSync(hostTelemetryFile)).toBe(false);
+    expect(fs.existsSync(completionLogFile)).toBe(false);
+  });
+
+  it("is a no-op (does not throw) when the files were never written", () => {
+    const runDir = makeRunDir();
+    const hostTelemetryFile = path.join(runDir, "host.jsonl");
+    const completionLogFile = path.join(runDir, "completions.jsonl");
+
+    expect(() => clearStaleTelemetryFiles([hostTelemetryFile, completionLogFile])).not.toThrow();
+    expect(fs.existsSync(hostTelemetryFile)).toBe(false);
+  });
+
+  it("skips null/undefined entries without throwing (arm 'none' has no hostTelemetryFile)", () => {
+    const runDir = makeRunDir();
+    const completionLogFile = path.join(runDir, "completions.jsonl");
+    fs.writeFileSync(completionLogFile, "stale\n");
+
+    expect(() => clearStaleTelemetryFiles([null, completionLogFile, undefined])).not.toThrow();
+    expect(fs.existsSync(completionLogFile)).toBe(false);
   });
 });
 

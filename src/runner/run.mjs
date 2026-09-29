@@ -19,6 +19,32 @@ function runsRootFrom(config) {
 
 /** Bellows repo root — the host's vite-node config and bench.config.json live here. */
 const BELLOWS_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+
+/**
+ * Delete any pre-existing telemetry files (host.jsonl, completions.jsonl) for a run
+ * dir before pi/the host are spawned. Run dirs are deterministic and get reused
+ * across re-runs of the same arm/seed; both files are append-only for the rest of
+ * a run, so leftover rows from a prior run would get folded into THIS run's
+ * conductor cost (collect.mjs's foldHostTelemetry/foldCompletionLog) and — since
+ * caps.costUsd now covers agent+conductor spend combined — could trip the live
+ * mid-run abort check on spend the run never actually incurred this time
+ * (2026-09-29 Fable review, bellows #38 blocking follow-up / #43 blocking item 4).
+ * Best-effort: a removal failure (e.g. a permissions oddity) is left for the
+ * spawn/write path itself to fail loudly on, rather than aborting the run over
+ * stale-telemetry hygiene alone. `null`/`undefined` entries (e.g. arm === "none"
+ * has no hostTelemetryFile) are skipped.
+ * @param {(string|null|undefined)[]} files
+ */
+export function clearStaleTelemetryFiles(files) {
+  for (const file of files) {
+    if (!file) continue;
+    try {
+      fs.rmSync(file, { force: true });
+    } catch {
+      /* best-effort — see doc comment above */
+    }
+  }
+}
 import { provisionRun, KICKOFF_PROMPT } from "./provision.mjs";
 import { agentSpawnEnv } from "./agentEnv.mjs";
 import { scrubEnv } from "./envScrub.mjs";
@@ -29,6 +55,7 @@ import {
   collectSession,
   collectHostTelemetry,
   collectCompletionLog,
+  liveConductorCostUsd,
   enrichTurnsWithWire,
   computePlanRtt,
   round6,
@@ -88,6 +115,25 @@ export async function executeRun(args) {
 
   fs.mkdirSync(runDir, { recursive: true });
   const hostTelemetryFile = arm === "none" ? null : path.join(runDir, "host.jsonl");
+  // Same file foldCompletionLog/collectCompletionLog reads post-run (see the
+  // "Fold in the Accordion extension's completions.jsonl" block below) —
+  // named once here so driveUntilDone can poll the SAME file live for the
+  // combined caps.costUsd check (see maybePollCost).
+  const completionLogFile = path.join(runDir, "completions.jsonl");
+  // Run dirs are deterministic (runs/<trial>/<arm>-<seed>, _worker/<trial>/<arm>-<seed>),
+  // so re-running the same arm/seed reuses this exact directory. Both files
+  // are append-only for the rest of this run (the Accordion extension appends
+  // via fs.appendFile, the host via appendFileSync in src/host/telemetry.ts;
+  // prepareLandlockRun's touch() below never writes) — if either already has
+  // rows from a PRIOR run in this dir, foldHostTelemetry/foldCompletionLog
+  // (collect.mjs) would sum the stale rows into THIS run's conductor cost,
+  // corrupting both the final record and, since caps.costUsd now covers
+  // agent+conductor spend combined, the LIVE mid-run abort check — a re-run
+  // could then abort immediately on spend it never actually incurred this
+  // time. Remove any stale content up front, before anything is spawned
+  // (2026-09-29 Fable review, bellows #38 blocking follow-up / #43 blocking
+  // item 4).
+  clearStaleTelemetryFiles([hostTelemetryFile, completionLogFile]);
 
   // Resolve up front so a bad "external:<id>" fails before anything is spawned.
   // config.mjs's trial validation already calls parseConductorArm on load, but a
@@ -230,7 +276,7 @@ export async function executeRun(args) {
       scrubPiEnv: config.scrubPiEnv,
       piEnvPassthrough: config.piEnvPassthrough,
       armEnv,
-      completionLogFile: path.join(runDir, "completions.jsonl"),
+      completionLogFile,
       log: (m) => log(`[${label}] ${m}`),
     });
     // Issue #16: heal macOS worker-provisioning defects before the agent's first
@@ -260,7 +306,7 @@ export async function executeRun(args) {
           accordionHome,
           accordionRepo: effConfig.accordionRepo,
           hostTelemetryFile,
-          completionLogFile: path.join(runDir, "completions.jsonl"),
+          completionLogFile,
           piRpcLogFile: path.join(runDir, "pi-rpc.log"),
           runsRoot: runsRootFrom(config),
           piEnv,
@@ -312,7 +358,17 @@ export async function executeRun(args) {
     // Kick off the agent.
     pi.send({ type: "prompt", message: KICKOFF_PROMPT });
 
-    const outcome = await driveUntilDone({ pi, host, spec, log, label, abortSignal, telemetry: driveTelemetry });
+    const outcome = await driveUntilDone({
+      pi,
+      host,
+      spec,
+      log,
+      label,
+      abortSignal,
+      telemetry: driveTelemetry,
+      hostTelemetryFile,
+      completionLogFile,
+    });
     status = outcome.status;
     statusDetail = outcome.statusDetail;
   } catch (e) {
@@ -444,7 +500,7 @@ export async function executeRun(args) {
   // legacy hosts that DO emit "complete" rows), never a replacement.
   if (conductor) {
     try {
-      const completionLog = collectCompletionLog(path.join(runDir, "completions.jsonl"));
+      const completionLog = collectCompletionLog(completionLogFile);
       if (completionLog) {
         conductor.completeCostUsd = round6(conductor.completeCostUsd + completionLog.completeCostUsd);
         conductor.completeCalls = completionLog.completeCalls;
@@ -602,9 +658,13 @@ export async function executeRun(args) {
  *   caller reads after this promise settles (e.g. for record.agentFinalized).
  *   Kept OUT of the resolved value so the {status, statusDetail} shape driven
  *   callers/tests already depend on never changes.
+ * @param {string | null} [hostTelemetryFile]  this run's host.jsonl (see liveConductorCostUsd) —
+ *   folded into caps.costUsd alongside the agent's own spend. Null for arm "none".
+ * @param {string | null} [completionLogFile]  this run's completions.jsonl (ACCORDION_COMPLETION_LOG,
+ *   see liveConductorCostUsd) — same combined-cap purpose as hostTelemetryFile.
  * @returns {Promise<{status:import("../types.ts").RunStatus, statusDetail?:string}>}
  */
-export function driveUntilDone({ pi, host, spec, log, label, abortSignal, telemetry }) {
+export function driveUntilDone({ pi, host, spec, log, label, abortSignal, telemetry, hostTelemetryFile, completionLogFile }) {
   return new Promise((resolve) => {
     const deadline = Date.now() + spec.caps.minutes * 60 * 1000;
     // Stall detection must never pre-empt the wall-clock cap. The run contract is
@@ -683,15 +743,32 @@ export function driveUntilDone({ pi, host, spec, log, label, abortSignal, teleme
         return;
       }
       failedStatsPolls = 0;
-      if (stats.cost >= spec.caps.costUsd) {
-        log(`[${label}] cost cap hit: $${stats.cost.toFixed(4)} >= $${spec.caps.costUsd}`);
-        finish("aborted-cost", `cost $${stats.cost.toFixed(4)} >= cap $${spec.caps.costUsd}`);
+      // caps.costUsd is enforced against agent + conductor spend combined
+      // (bellows #38 added conductor cost telemetry but didn't cap on it —
+      // an LLM conductor's own summary calls are 29-43% of its total spend,
+      // so capping on agent cost alone let LLM conductors run well past a
+      // deterministic conductor's effective ceiling for the same dollar cap).
+      // Both figures are on pi's own pricing basis: agentCost comes straight
+      // from pi's get_session_stats(); conductorCost is summed from
+      // host.jsonl/completions.jsonl rows, which the Accordion extension logs
+      // in the same $ terms pi-ai reports (see runCompletion in
+      // extension/accordion.ts) — no unit conversion needed to add them.
+      const agentCost = stats.cost;
+      const conductorCost = liveConductorCostUsd({ hostTelemetryFile, completionLogFile });
+      const totalCost = round6(agentCost + conductorCost);
+      if (totalCost >= spec.caps.costUsd) {
+        const detail = `cost $${totalCost.toFixed(4)} (agent $${agentCost.toFixed(4)} + conductor $${conductorCost.toFixed(4)}) >= cap $${spec.caps.costUsd}`;
+        log(`[${label}] cost cap hit: ${detail}`);
+        finish("aborted-cost", detail);
         return;
       }
       // Zero-priced custom providers make the dollar cap inert — the token cap
-      // is the backstop. Warn once so a capless run is never silent.
+      // is the backstop. Warn once so a capless run is never silent. Gated on
+      // the COMBINED total (not just agent cost): a conductor with real
+      // per-token pricing still makes the cap effective even when the
+      // agent's own provider prices at $0.
       const totalTokens = stats.tokens && typeof stats.tokens.total === "number" ? stats.tokens.total : null;
-      if (stats.cost === 0 && totalTokens !== null && totalTokens > 100_000 && !warnedZeroCost) {
+      if (totalCost === 0 && totalTokens !== null && totalTokens > 100_000 && !warnedZeroCost) {
         warnedZeroCost = true;
         log(`[${label}] WARN: provider reports $0 at ${totalTokens} tokens — dollar cap is inert${spec.caps.totalTokens ? "" : " and no caps.totalTokens is set"}`);
       }
@@ -1373,13 +1450,24 @@ function emptyUsage() {
   };
 }
 
-function logRunSummary(record, log) {
+/**
+ * Log the "[done] ..." run summary line. Exported for unit tests — the log
+ * line is the only user-visible surface for the agent/conductor cost
+ * breakdown (the record.json fields themselves are what caps.costUsd
+ * enforcement + reports already read).
+ * @param {import("../types.ts").RunRecord} record
+ * @param {(m:string)=>void} log
+ */
+export function logRunSummary(record, log) {
   const p = record.platform;
   const ck = p ? `${p.checkpointsSolved}/${p.checkpointsAttempted}` : "-";
   const score = p && p.runScore != null ? p.runScore.toFixed(3) : "-";
+  const agentCost = record.usage.costUsd;
+  const conductorCost = record.conductor?.completeCostUsd || 0;
+  const totalCost = round6(agentCost + conductorCost);
   log(
     `[done] ${record.label}  status=${record.status}  ` +
-      `cost=$${record.usage.costUsd.toFixed(4)}  tokens=${record.usage.totalTokens}  ` +
+      `cost=$${totalCost.toFixed(4)} (agent $${agentCost.toFixed(4)} + conductor $${conductorCost.toFixed(4)})  tokens=${record.usage.totalTokens}  ` +
       `turns=${record.usage.assistantTurns}  ckpts=${ck}  score=${score}` +
       (record.statusDetail ? `  (${record.statusDetail})` : ""),
   );

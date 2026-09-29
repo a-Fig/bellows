@@ -246,7 +246,7 @@ export function foldHostTelemetry(text, fallbackConductorId = "") {
         totalFoldOps += n(e.ops);
         break;
       case "complete":
-        if (typeof e.costUsd === "number") completeCostUsd += e.costUsd;
+        completeCostUsd += positiveCost(e.costUsd);
         break;
       case "error":
         if (e.message) errors.push(String(e.message));
@@ -450,7 +450,7 @@ export function foldCompletionLog(text) {
       completeErrors++;
       continue;
     }
-    if (typeof rec.costUsd === "number") completeCostUsd += rec.costUsd;
+    completeCostUsd += positiveCost(rec.costUsd);
     completeInputTokens += n(rec.input);
     completeOutputTokens += n(rec.output);
     completeCacheReadTokens += n(rec.cacheRead);
@@ -471,6 +471,47 @@ export function foldCompletionLog(text) {
 export function collectCompletionLog(file) {
   if (!file || isAbsentOrEmpty(file)) return null;
   return foldCompletionLog(fs.readFileSync(file, "utf8"));
+}
+
+/**
+ * Conductor spend so far THIS RUN, read live off whatever host.jsonl /
+ * completions.jsonl already have on disk — both are append-only for the
+ * duration of the run (see foldHostTelemetry's "complete" events and
+ * foldCompletionLog / ACCORDION_COMPLETION_LOG). Mirrors the additive merge
+ * executeRun does post-run for the final record's `conductor.completeCostUsd`
+ * (host.jsonl's own "complete" rows, from legacy hosts that report cost that
+ * way, PLUS completions.jsonl — see run.mjs) so a mid-run cap check compares
+ * against the SAME total the finished record will report, not just a subset
+ * of it.
+ *
+ * Used by driveUntilDone to fold conductor spend into `caps.costUsd`
+ * enforcement (bellows #38 added this telemetry but didn't cap on it — LLM
+ * conductors' own summary calls are 29-43% of their total spend). Best-effort
+ * and read-tolerant: a file that doesn't exist yet (arm "none", no conductor
+ * completion this run yet) contributes 0, and a read racing a partial
+ * trailing write is fine — parseJsonl silently skips an incomplete/malformed
+ * line, and a transient read error is swallowed (never lets a filesystem
+ * hiccup abort a run the cap itself wouldn't have caught).
+ * @param {{hostTelemetryFile?: string | null, completionLogFile?: string | null}} a
+ * @returns {number}
+ */
+export function liveConductorCostUsd({ hostTelemetryFile, completionLogFile } = {}) {
+  let total = 0;
+  if (hostTelemetryFile && !isAbsentOrEmpty(hostTelemetryFile)) {
+    try {
+      total += foldHostTelemetry(fs.readFileSync(hostTelemetryFile, "utf8")).completeCostUsd;
+    } catch {
+      /* best-effort mid-run read — a transient error just costs this one poll */
+    }
+  }
+  if (completionLogFile && !isAbsentOrEmpty(completionLogFile)) {
+    try {
+      total += foldCompletionLog(fs.readFileSync(completionLogFile, "utf8")).completeCostUsd;
+    } catch {
+      /* best-effort mid-run read */
+    }
+  }
+  return round6(total);
 }
 
 /**
@@ -527,6 +568,19 @@ function n(v) {
  *  or a single bad sample would silently drag avgMs negative. */
 function isValidRtt(v) {
   return Number.isFinite(v) && v >= 0;
+}
+/** Clamp a `costUsd` field to a finite, non-negative number (0 otherwise).
+ *  host.jsonl and completions.jsonl are both agent-writable (2026-09-29
+ *  Fable review, #42 note 4 / #43 blocking item 4): under Landlock,
+ *  completions.jsonl is only write-only (O_WRONLY, no O_APPEND requirement),
+ *  so the agent's own process tree can overwrite it with a forged row, and
+ *  host.jsonl is reachable indirectly via the accordion-home descriptor.
+ *  Since bellows #43 feeds this sum straight into `caps.costUsd`'s live
+ *  abort check, an un-clamped negative or NaN/Infinity value could raise its
+ *  own ceiling (or silently cancel out a real cost) instead of merely being
+ *  wrong in a report. */
+function positiveCost(v) {
+  return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0;
 }
 export function round6(v) {
   return Math.round(v * 1e6) / 1e6;

@@ -178,9 +178,14 @@ export function normalizeBenchConfig(raw) {
           ),
         }
       : {}),
-    // Default "unchecked" (opt-in). "blocked" makes the sandbox canary also
-    // verify no open-internet egress — see src/runner/sandbox.mjs.
-    sandboxEgress: raw.sandboxEgress || "unchecked",
+    // Absent here (rather than a flat static default) so resolveSandboxEgress
+    // can pick the default from the EFFECTIVE sandbox mode: "blocked" when it
+    // resolves to "landlock", "unchecked" when "off" — see
+    // src/runner/sandbox.mjs resolveSandboxEgress. Only set when the operator
+    // wrote it explicitly (still only ever TIGHTENS "blocked" onto every
+    // trial; an explicit "unchecked" here is rejected at run time for any
+    // trial that turns landlock on).
+    ...(raw.sandboxEgress !== undefined ? { sandboxEgress: raw.sandboxEgress } : {}),
     ...(raw.sandboxEgressAllow !== undefined ? { sandboxEgressAllow: raw.sandboxEgressAllow.slice() } : {}),
   };
 }
