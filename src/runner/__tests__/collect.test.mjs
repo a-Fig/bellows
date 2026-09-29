@@ -1,5 +1,15 @@
-import { describe, it, expect } from "vitest";
-import { parseSession, foldHostTelemetry, enrichTurnsWithWire, computePlanRtt } from "../collect.mjs";
+import { describe, it, expect, afterEach } from "vitest";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import {
+  parseSession,
+  foldHostTelemetry,
+  foldCompletionLog,
+  collectCompletionLog,
+  enrichTurnsWithWire,
+  computePlanRtt,
+} from "../collect.mjs";
 
 // Fixture mirrors the real pi session JSONL schema verified from
 // ~/.pi/agent/sessions: message records with message.role, message.usage
@@ -610,5 +620,116 @@ describe("enrichTurnsWithWire", () => {
   it("no-ops without telemetry", () => {
     const { turns } = parseSession(SESSION_FIXTURE);
     expect(enrichTurnsWithWire(turns, null)).toBe(turns);
+  });
+});
+
+// completions.jsonl (Accordion ACCORDION_COMPLETION_LOG side log — see
+// extension/accordion.ts runCompletion): the ONLY source of completion cost
+// under Accordion protocol v22, since those calls never round-trip through
+// host.jsonl. foldHostTelemetry always seeds completeCalls/completeErrors/
+// completeInputTokens/completeOutputTokens/completeCacheReadTokens at 0 (see
+// above) so ConductorTelemetry's shape is stable even when no completion log
+// is folded in; foldCompletionLog/collectCompletionLog below produce the
+// real counts executeRun merges on top.
+describe("foldCompletionLog / collectCompletionLog — completions.jsonl side log", () => {
+  const FIXTURE = [
+    { t: "complete", at: 1000, conductor: "triptych", provider: "anthropic", model: "claude-x", input: 100, output: 20, cacheRead: 5, cacheWrite: 0, costUsd: 0.01, ms: 400 },
+    { t: "complete", at: 2000, conductor: "triptych", provider: "anthropic", model: "claude-x", input: 200, output: 40, cacheRead: 10, cacheWrite: 0, costUsd: 0.02, ms: 500 },
+    // failure line: no usage fields, must count toward completeErrors and completeCalls
+    // but NOT toward cost/token sums.
+    { t: "complete", at: 3000, conductor: "triptych", provider: "anthropic", model: "claude-x", error: "timeout", ms: 5000 },
+    // a costUsd of null (usage.cost.total absent) must not throw and must not add to the sum.
+    { t: "complete", at: 4000, conductor: "triptych", provider: "anthropic", model: "claude-x", input: 50, output: 5, cacheRead: 0, cacheWrite: 0, costUsd: null, ms: 100 },
+  ]
+    .map((e) => JSON.stringify(e))
+    .join("\n");
+
+  it("sums cost/tokens across success lines and counts calls/errors", () => {
+    const folded = foldCompletionLog(FIXTURE);
+    expect(folded).toEqual({
+      completeCostUsd: 0.03,
+      completeCalls: 4,
+      completeErrors: 1,
+      completeInputTokens: 350, // 100 + 200 + 50 (error line contributes 0)
+      completeOutputTokens: 65, // 20 + 40 + 5
+      completeCacheReadTokens: 15, // 5 + 10 + 0
+    });
+  });
+
+  it("ignores non-complete lines, blank lines, and malformed JSON", () => {
+    const text = [
+      JSON.stringify({ t: "attach", at: 1, conductor: "keel", budget: 1 }),
+      "",
+      "{ not json",
+      JSON.stringify({ t: "complete", at: 2, costUsd: 0.5, input: 1, output: 1, cacheRead: 0 }),
+    ].join("\n");
+    expect(foldCompletionLog(text)).toEqual({
+      completeCostUsd: 0.5,
+      completeCalls: 1,
+      completeErrors: 0,
+      completeInputTokens: 1,
+      completeOutputTokens: 1,
+      completeCacheReadTokens: 0,
+    });
+  });
+
+  it("returns all-zero for an empty file", () => {
+    expect(foldCompletionLog("")).toEqual({
+      completeCostUsd: 0,
+      completeCalls: 0,
+      completeErrors: 0,
+      completeInputTokens: 0,
+      completeOutputTokens: 0,
+      completeCacheReadTokens: 0,
+    });
+  });
+
+  describe("collectCompletionLog — file path case", () => {
+    let dir;
+    afterEach(() => {
+      if (dir) rmSync(dir, { recursive: true, force: true });
+      dir = undefined;
+    });
+
+    it("reads and folds a real completions.jsonl file", () => {
+      dir = mkdtempSync(path.join(tmpdir(), "bellows-completion-log-"));
+      const file = path.join(dir, "completions.jsonl");
+      writeFileSync(file, FIXTURE, "utf8");
+      expect(collectCompletionLog(file)).toEqual(foldCompletionLog(FIXTURE));
+    });
+
+    it("tolerates a missing file, returning null", () => {
+      expect(collectCompletionLog(path.join(tmpdir(), "definitely-does-not-exist-completions.jsonl"))).toBeNull();
+    });
+
+    it("returns null for an empty/undefined path", () => {
+      expect(collectCompletionLog("")).toBeNull();
+      expect(collectCompletionLog(undefined)).toBeNull();
+    });
+
+    it("tolerates a file with bad lines mixed with good ones", () => {
+      dir = mkdtempSync(path.join(tmpdir(), "bellows-completion-log-"));
+      const file = path.join(dir, "completions.jsonl");
+      writeFileSync(file, "not json at all\n" + JSON.stringify({ t: "complete", at: 1, costUsd: 0.1, input: 1, output: 1, cacheRead: 1 }) + "\n\n", "utf8");
+      expect(collectCompletionLog(file)).toEqual({
+        completeCostUsd: 0.1,
+        completeCalls: 1,
+        completeErrors: 0,
+        completeInputTokens: 1,
+        completeOutputTokens: 1,
+        completeCacheReadTokens: 1,
+      });
+    });
+  });
+});
+
+describe("foldHostTelemetry — completions.jsonl field defaults", () => {
+  it("seeds completeCalls/completeErrors/completeInputTokens/completeOutputTokens/completeCacheReadTokens at 0", () => {
+    const tel = foldHostTelemetry(HOST_FIXTURE, "fallback");
+    expect(tel.completeCalls).toBe(0);
+    expect(tel.completeErrors).toBe(0);
+    expect(tel.completeInputTokens).toBe(0);
+    expect(tel.completeOutputTokens).toBe(0);
+    expect(tel.completeCacheReadTokens).toBe(0);
   });
 });

@@ -18,6 +18,10 @@
  *   message.timestamp  = ms epoch
  *   message.content = [ {type:"text"|"thinking"|"toolCall"|...}, ... ]
  *
+ * Also folds completions.jsonl — the Accordion extension's
+ * ACCORDION_COMPLETION_LOG side log of runCompletion() calls — into the same
+ * ConductorTelemetry (see foldCompletionLog below).
+ *
  * Conforms to src/types.ts (UsageTotals, TurnMetric, ConductorTelemetry, HostEvent).
  */
 import fs from "node:fs";
@@ -308,6 +312,17 @@ export function foldHostTelemetry(text, fallbackConductorId = "") {
     conductLatencyMs: { p50: percentile(latencies, 50), max: latencies.length ? Math.max(...latencies) : 0 },
     heldPlanReplies,
     completeCostUsd: round6(completeCostUsd),
+    // Defaults for the completions.jsonl side-log fields (see foldCompletionLog
+    // below) — always present so ConductorTelemetry has a stable shape even
+    // when the caller never merges a completion log in (e.g. this function's
+    // own unit tests, or a run predating ACCORDION_COMPLETION_LOG). executeRun
+    // overwrites these with foldCompletionLog's counts when completions.jsonl
+    // exists.
+    completeCalls: 0,
+    completeErrors: 0,
+    completeInputTokens: 0,
+    completeOutputTokens: 0,
+    completeCacheReadTokens: 0,
     errors,
     infos,
     lastStatusText,
@@ -400,6 +415,64 @@ export function collectHostTelemetry(hostFile, fallbackConductorId = "") {
   return foldHostTelemetry(fs.readFileSync(hostFile, "utf8"), fallbackConductorId);
 }
 
+/**
+ * Fold a completions.jsonl side log (the Accordion extension's
+ * ACCORDION_COMPLETION_LOG — one JSON line per pi-ai complete() call made by
+ * runCompletion in extension/accordion.ts, success or failure) into the
+ * completion-usage slice of ConductorTelemetry. Independent of host.jsonl /
+ * foldHostTelemetry: the extension writes this file directly, so it exists
+ * (or not) regardless of whether host.jsonl ever saw a "complete" row — which,
+ * under Accordion protocol v22, it never does (every conductor's out-of-band
+ * completion now runs inside the extension, out of the host's view).
+ *
+ * Line shapes (see extension/accordion.ts runCompletion):
+ *   success: {"t":"complete","at":ms,"conductor":id|null,"provider":str,
+ *             "model":str,"input":n,"output":n,"cacheRead":n,"cacheWrite":n,
+ *             "costUsd":n|null,"ms":n}
+ *   failure: {"t":"complete","at":ms,"conductor":id|null,"provider":str,
+ *             "model":str,"error":str,"ms":n}  (no usage fields)
+ *
+ * @param {string} text  raw JSONL
+ * @returns {{completeCostUsd:number, completeCalls:number, completeErrors:number,
+ *            completeInputTokens:number, completeOutputTokens:number, completeCacheReadTokens:number}}
+ */
+export function foldCompletionLog(text) {
+  let completeCostUsd = 0;
+  let completeCalls = 0;
+  let completeErrors = 0;
+  let completeInputTokens = 0;
+  let completeOutputTokens = 0;
+  let completeCacheReadTokens = 0;
+  for (const rec of parseJsonl(text)) {
+    if (!rec || rec.t !== "complete") continue;
+    completeCalls++;
+    if (typeof rec.error === "string") {
+      completeErrors++;
+      continue;
+    }
+    if (typeof rec.costUsd === "number") completeCostUsd += rec.costUsd;
+    completeInputTokens += n(rec.input);
+    completeOutputTokens += n(rec.output);
+    completeCacheReadTokens += n(rec.cacheRead);
+  }
+  return {
+    completeCostUsd: round6(completeCostUsd),
+    completeCalls,
+    completeErrors,
+    completeInputTokens,
+    completeOutputTokens,
+    completeCacheReadTokens,
+  };
+}
+
+/** Read + fold a completions.jsonl side log. Returns null if absent (no
+ *  ACCORDION_COMPLETION_LOG writer ran — e.g. arm "none", or a run predating
+ *  the env var). */
+export function collectCompletionLog(file) {
+  if (!file || !fs.existsSync(file)) return null;
+  return foldCompletionLog(fs.readFileSync(file, "utf8"));
+}
+
 /** Attach wireTokens onto turns by matching each turn's timestamp to the
  *  nearest preceding budget-series sample (best-effort enrichment). */
 export function enrichTurnsWithWire(turns, telemetry) {
@@ -441,7 +514,7 @@ function n(v) {
 function isValidRtt(v) {
   return Number.isFinite(v) && v >= 0;
 }
-function round6(v) {
+export function round6(v) {
   return Math.round(v * 1e6) / 1e6;
 }
 export function percentile(arr, p) {

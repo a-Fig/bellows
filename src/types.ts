@@ -301,8 +301,26 @@ export interface ConductorTelemetry {
   conductLatencyMs: { p50: number; max: number };
   /** Times the 250ms window forced the previously-computed plan. */
   heldPlanReplies: number;
-  /** Spend attributed to host.complete() calls (LLM conductors). */
+  /**
+   * Spend attributed to conductor LLM summary calls (compaction-naive,
+   * triptych, handoff, ...). Sums two sources: any legacy host.jsonl
+   * "complete" rows (foldHostTelemetry) PLUS the Accordion extension's
+   * ACCORDION_COMPLETION_LOG side log (completions.jsonl, foldCompletionLog
+   * in collect.mjs) — under Accordion protocol v22 the extension's own
+   * runCompletion() is the ONLY place these calls are observable, since they
+   * never round-trip through the host.
+   */
   completeCostUsd: number;
+  /** Total runCompletion() calls recorded in completions.jsonl, success + failure. */
+  completeCalls: number;
+  /** Of completeCalls, how many carried an "error" field (no usage was available). */
+  completeErrors: number;
+  /** Summed input tokens across successful completions.jsonl calls. */
+  completeInputTokens: number;
+  /** Summed output tokens across successful completions.jsonl calls. */
+  completeOutputTokens: number;
+  /** Summed cacheRead tokens across successful completions.jsonl calls. */
+  completeCacheReadTokens: number;
   errors: string[];
   /** Non-error informational notes (greet/status/disconnect, "died — cleared to raw", ...). */
   infos: string[];

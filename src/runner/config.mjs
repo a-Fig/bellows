@@ -19,17 +19,25 @@ const VALID_THINKING = new Set(["off", "minimal", "low", "medium", "high"]);
 // Vars the runner itself sets/controls when spawning pi (see buildPiEnv in
 // run.mjs): PI_CODING_AGENT_DIR/ACCORDION_HOME are set explicitly,
 // PI_CODING_AGENT_SESSION_DIR is explicitly deleted to force the default
-// session layout, and PATH/HOME are load-bearing for the spawn to work at
-// all. An arm's `env` clobbering any of these would silently break the run
-// (or, for PI_CODING_AGENT_DIR/ACCORDION_HOME, silently point pi at the wrong
-// agent dir / accordion checkout) rather than doing what the arm author
-// intended, so validateTrialSpec/validateArmEnv reject them outright.
+// session layout, PATH/HOME are load-bearing for the spawn to work at all,
+// and ACCORDION_COMPLETION_LOG points the Accordion extension's completion
+// side log (extension/accordion.ts runCompletion) at this run's
+// completions.jsonl, which the collector reads back into
+// ConductorTelemetry.completeCostUsd/etc (see collect.mjs foldCompletionLog).
+// An arm's `env` clobbering any of these would silently break the run (or,
+// for PI_CODING_AGENT_DIR/ACCORDION_HOME, silently point pi at the wrong
+// agent dir / accordion checkout; for ACCORDION_COMPLETION_LOG, silently lose
+// or redirect completion-cost telemetry) rather than doing what the arm
+// author intended, so validateTrialSpec/validateArmEnv reject them outright.
+// buildPiEnv also re-applies ACCORDION_COMPLETION_LOG after merging armEnv,
+// so even a caller that bypasses this validation can't override it.
 export const RUNNER_CONTROLLED_ENV_VARS = new Set([
   "PI_CODING_AGENT_DIR",
   "ACCORDION_HOME",
   "PI_CODING_AGENT_SESSION_DIR",
   "PATH",
   "HOME",
+  "ACCORDION_COMPLETION_LOG",
 ]);
 
 const ARM_ENV_KEY_RE = /^[A-Z][A-Z0-9_]{0,63}$/;
