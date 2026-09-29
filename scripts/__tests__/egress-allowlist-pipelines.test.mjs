@@ -71,6 +71,14 @@ const HOSTS_LINE_AWK = extractBetween('hosts_line="$(awk -v h="$host" \'', '\' /
 // with a concrete test value below rather than left to shell expansion).
 const HOSTS_SED_FRAGMENT = extractBetween('sed -i -E "${hosts_line}', '" /etc/hosts', "hosts-pin sed substitution");
 
+// probe_tcp()'s rc/stderr-text classification if/elif chain — extracted from
+// between `  if [ "$rc" -eq 0 ]; then` and the function's closing `\n}`.
+// Deliberately excludes the /dev/tcp connect attempt itself (real network
+// I/O, not something a unit test should do) — just the pure classification
+// logic that turns an exit code + captured stderr text into one of
+// open/timeout/refused/unreachable/error.
+const PROBE_TCP_CLASSIFY = extractBetween('  if [ "$rc" -eq 0 ]; then', "\n}", "probe_tcp classification if/elif chain");
+
 function runBash(cmd, input) {
   const r = spawnSync("bash", ["-c", cmd], { input, encoding: "utf8" });
   if (r.error) throw r.error;
@@ -187,6 +195,47 @@ describe.skipIf(!HAS_BASH)("egress-allowlist.sh shell pipelines (extracted from 
 
     it("replaces an IPv6 address form too", () => {
       expect(replaceIp("::1 ip6-localhost", "::2")).toBe("::2 ip6-localhost");
+    });
+  });
+
+  // 2026-10-02 Fable re-review of #45 round 3, blocking note 2: under
+  // `net.ipv6.conf.all.disable_ipv6=1`, a v6 connect attempt gets
+  // EADDRNOTAVAIL ("cannot assign requested address"), which the classifier
+  // used to bucket as inconclusive "error" — meaning `--check` could never
+  // PASS on such a host even though IPv6 genuinely is blocked. Also confirms
+  // the same text is NOT treated as blocked for a v4 target, since an
+  // unrelated local resource issue (e.g. ephemeral port exhaustion) could in
+  // principle raise EADDRNOTAVAIL there without meaning anything about the
+  // firewall.
+  describe("probe_tcp's rc/stderr classification", () => {
+    function classify(rc, out, isV6) {
+      const script = `rc=${rc}\nout=${JSON.stringify(out)}\nis_v6=${isV6 ? "true" : "false"}\nif [ "$rc" -eq 0 ]; then${PROBE_TCP_CLASSIFY}\n`;
+      const r = runBash(script);
+      expect(r.status).toBe(0);
+      return r.stdout.trim();
+    }
+
+    it("open on rc=0, timeout on rc=124", () => {
+      expect(classify(0, "", false)).toBe("open");
+      expect(classify(124, "", false)).toBe("timeout");
+    });
+
+    it("refused / unreachable on their strerror text, for either family", () => {
+      expect(classify(1, "bash: connect: Connection refused", false)).toBe("refused");
+      expect(classify(1, "bash: connect: Network is unreachable", false)).toBe("unreachable");
+      expect(classify(1, "bash: connect: Network is unreachable", true)).toBe("unreachable");
+    });
+
+    it("EADDRNOTAVAIL ('cannot assign requested address') counts as unreachable for a v6 target", () => {
+      expect(classify(1, "bash: connect: Cannot assign requested address", true)).toBe("unreachable");
+    });
+
+    it("the same EADDRNOTAVAIL text is left as inconclusive 'error' for a v4 target", () => {
+      expect(classify(1, "bash: connect: Cannot assign requested address", false)).toBe("error");
+    });
+
+    it("anything else is inconclusive 'error', never silently blocked", () => {
+      expect(classify(1, "bash: connect: Operation not permitted", false)).toBe("error");
     });
   });
 });

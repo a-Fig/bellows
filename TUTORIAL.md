@@ -216,13 +216,21 @@ script every time DNS changes), allows that pinned IP on the given port, and
 rejects everything else for the bench user (TCP reset, plus a full IPv6
 block). Re-running is safe — it rebuilds its chain from scratch each time, so
 adding a host or refreshing a rotated IP is just running it again: the
-resolution step always queries DNS directly (`getent -s dns`, bypassing
-`/etc/hosts`), so a re-run genuinely picks up a new edge IP instead of
-re-reading back the pin it wrote last time (2026-10-01 Fable re-review of
-#45, blocking note 2 — the earlier `getent ahostsv4` form checked
-`/etc/hosts` first per `nsswitch.conf`'s default order, so a re-run
-silently re-confirmed the stale pinned IP forever and this "refreshing a
-rotated IP" claim was false until fixed). Verify a
+resolution step always queries DNS directly, so a re-run genuinely picks up
+a new edge IP instead of re-reading back the pin it wrote last time
+(2026-10-01 Fable re-review of #45, blocking note 2 — the earlier `getent
+ahostsv4` form checked `/etc/hosts` first per `nsswitch.conf`'s default
+order, so a re-run silently re-confirmed the stale pinned IP forever and
+this "refreshing a rotated IP" claim was false until fixed). On a host
+running systemd-resolved (the real bench VMs' setup), plain `getent -s dns`
+turned out NOT to be enough either — resolved synthesizes an /etc/hosts
+answer itself, upstream of both getent's NSS ordering and resolved's own
+query cache, so `getent -s dns`, `dig @127.0.0.53`, and even `resolvectl
+query --cache=no` all still returned the stale pin in testing. Only
+`resolvectl query --synthesize=no` (which the script now uses whenever
+resolved is the active resolver, falling back to `getent -s dns` otherwise —
+2026-10-02 Fable re-review of #45 round 3, blocking note 1) tells resolved
+to skip its own synthesis and actually reach out to DNS. Verify a
 sealed host without touching firewall rules — this probes AS the bench user
 (`sudo -u`), the same direction the per-run canary checks:
 
@@ -275,7 +283,14 @@ cannot, prove the allowlist has no other holes):
   -j ACCEPT` with no destination match, which is broader than "loopback":
   Linux routes a packet addressed to any of the host's own configured
   addresses over `lo`, not just `127.0.0.0/8`, so the old rule also admitted
-  traffic to the host's real eth0/Tailscale/docker0 addresses).
+  traffic to the host's real eth0/Tailscale/docker0 addresses). `--check`
+  verifies IPv6 is actually blocked separately from the loopback-listener
+  scan above: as root, structurally, via `ip6tables -C OUTPUT ... -j
+  REJECT` — note `-C` only checks that the rule is *present*, not where it
+  sits relative to any other rule already in `OUTPUT` (i.e. not precedence);
+  when not root, behaviorally instead, via a throwaway `[::1]` listener
+  (needs `node`) the bench user must fail to reach (2026-10-02 Fable
+  re-review of #45 round 3, blocking note 3).
 - **Rules do not survive a reboot.** The script only calls `iptables`/
   `ip6tables` directly — it does not persist rules (no
   iptables-persistent/netfilter-persistent integration, no systemd unit).

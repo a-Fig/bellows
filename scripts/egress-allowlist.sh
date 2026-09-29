@@ -182,10 +182,15 @@ Usage:
                        unreachable by definition.
   --check             do not touch firewall rules; report whether
                        github.com/raw.githubusercontent.com/pypi.org (each
-                       resolved HERE, as you the invoker, via DNS directly
-                       (getent -s dns) — never by the bench user's own
-                       possibly-hijacked resolution, and never by reading
-                       back a stale /etc/hosts pin)
+                       resolved HERE, as you the invoker, via DNS directly —
+                       never by the bench user's own possibly-hijacked
+                       resolution, and never by reading back a stale
+                       /etc/hosts pin. Uses `resolvectl query
+                       --synthesize=no` when systemd-resolved is the active
+                       resolver (plain `getent -s dns ahostsv4` isn't enough
+                       there: resolved synthesizes /etc/hosts answers itself,
+                       upstream of getent's NSS ordering — see resolve_ip()),
+                       falling back to `getent -s dns ahostsv4` otherwise)
                        plus a few fixed literal IPs (1.1.1.1:443, 8.8.8.8:53,
                        140.82.112.3:443, and an IPv6 literal
                        [2606:4700:4700::1111]:443 — DNS-independent, so they
@@ -194,12 +199,15 @@ Usage:
                        --allow host is reachable (probed AS the bench user
                        via sudo -u, or directly if you already are that
                        user), no unexpected loopback listener exists, and
-                       (when run as root) that ip6tables actually has its
-                       own OUTPUT REJECT rule for the bench uid — a
-                       structural check, since the IPv6 literal probe above
-                       alone can't tell "blocked by our rule" apart from "no
-                       IPv6 route exists at all" (degrades to a WARN, not a
-                       FAIL, when not root).
+                       that IPv6 is actually blocked for the bench uid: as
+                       root, structurally (`ip6tables -C OUTPUT ... -j
+                       REJECT` — checks the rule is PRESENT, not where it
+                       sits relative to any other OUTPUT rule, i.e. not
+                       precedence); when not root (no access to ip6tables'
+                       own rule set), behaviorally instead, by opening a
+                       throwaway [::1] listener and confirming the bench
+                       user can't reach it (needs `node`) — either way a
+                       FAIL, not a silent PASS, if it can't be confirmed.
                        Requires root, to already BE --user, or passwordless
                        sudo to --user — exits 2 (not a PASS) if none of those
                        can be confirmed, rather than silently reporting
@@ -291,25 +299,55 @@ fi
 # as the invoker, the exact same way an --allow host is resolved for pinning
 # — means the check probes the REAL address, never one the thing under test
 # could have poisoned.
+# Detects whether systemd-resolved is genuinely answering queries right now
+# (used by resolve_ip below). Deliberately NOT just `systemctl is-active
+# systemd-resolved`: that requires a real systemd PID 1 and fails outright in
+# ANY container/chroot context (verified in this fix's own Docker test
+# container: resolved was running and answering correctly, yet `systemctl
+# is-active` still failed with "System has not been booted with systemd as
+# init system") — a live D-Bus round-trip via `resolvectl status` is a more
+# direct, more portable signal of "resolved is actually active", and it
+# degrades safely to "not active" (triggering the getent fallback below)
+# anywhere resolved genuinely isn't running.
+resolved_active() {
+  command -v resolvectl >/dev/null 2>&1 || return 1
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    return 0
+  fi
+  resolvectl status >/dev/null 2>&1
+}
+
 resolve_ip() {
-  # `-s dns` (2026-10-01 Fable re-review of #45, blocking note 2): forces
-  # getent to use ONLY the `dns` NSS service for this lookup, never `files`
-  # (i.e. /etc/hosts). Plain `getent ahostsv4` follows nsswitch.conf's
-  # configured order, which on essentially every distro checks `files`
-  # BEFORE `dns` — and this same function's caller in the apply path PINS its
-  # result into /etc/hosts. Without `-s dns`, a re-run's resolve_ip call for
-  # an already-pinned host reads back the STALE pinned IP from /etc/hosts
-  # instead of querying DNS at all, so the pin perpetuates itself forever:
-  # TUTORIAL.md's "re-run to refresh a rotated CDN IP" was false, since the
-  # very re-run meant to pick up the new IP would just re-confirm the old
-  # one. Verified live (Fable's container repro) that `-s dns` bypasses the
-  # pin and returns the real current answer. `|| true` on the left side of
-  # the pipe keeps a resolution failure (getent exits non-zero for an unknown
-  # host, or when the `dns` service isn't configured in nsswitch.conf at all)
-  # from tripping `set -e`/`pipefail` on the caller's `ip="$(resolve_ip
-  # "$host")"` — the empty-result case is handled explicitly by the caller
-  # instead.
-  { getent -s dns ahostsv4 "$1" 2>/dev/null || true; } | awk '{print $1; exit}'
+  # (2026-10-02 Fable re-review of #45 round 3, blocking note 1): the round-2
+  # `getent -s dns` fix does NOT work on a real bench VM running
+  # systemd-resolved. Fable's repro on resolved 255.4: with /etc/resolv.conf
+  # pointing at the stub (127.0.0.53), `getent -s dns`, `dig @127.0.0.53`,
+  # and even `resolvectl query --cache=no` all still returned the STALE
+  # /etc/hosts pin — because resolved synthesizes answers from /etc/hosts
+  # itself, upstream of glibc's NSS `files`-vs-`dns` ordering (which
+  # `-s dns` only controls) and upstream of its own query cache (which
+  # `--cache=no` only bypasses). Only `resolvectl query --synthesize=no`
+  # tells resolved to skip ITS OWN /etc/hosts synthesis and return the real
+  # upstream answer — verified in this fix's own Docker container (resolved
+  # actually running): a poisoned /etc/hosts entry was correctly bypassed by
+  # `--synthesize=no` and returned the genuine DNS answer.
+  #
+  # Falls back to the round-2 `getent -s dns ahostsv4` form when resolvectl
+  # isn't available or resolved isn't the active resolver (resolved_active
+  # above) — that form is still correct there, since without resolved's own
+  # synthesis layer in the picture, bypassing NSS `files` is sufficient.
+  # `|| true` (and the outer `|| true` on the resolvectl attempt) keeps a
+  # resolution failure from tripping `set -e`/`pipefail` on the caller's
+  # `ip="$(resolve_ip "$host")"` — the empty-result case is handled
+  # explicitly by the caller instead.
+  local host="$1" ip=""
+  if resolved_active; then
+    ip="$(resolvectl query --synthesize=no --legend=no -t A "$host" 2>/dev/null | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' | head -n1)" || true
+  fi
+  if [ -z "$ip" ]; then
+    ip="$({ getent -s dns ahostsv4 "$host" 2>/dev/null || true; } | awk '{print $1; exit}')"
+  fi
+  printf '%s\n' "$ip"
 }
 
 # Mirrors isUnsafeEgressProbeTarget in src/runner/sandbox.mjs (the IPv4-only
@@ -380,14 +418,25 @@ require_sudo_to_bench_user() {
 #   open         connection succeeded — the port IS reachable
 #   refused      ECONNREFUSED (iptables REJECT --reject-with tcp-reset, or
 #                nothing listening) — a confirmed block
-#   unreachable  ENETUNREACH / EHOSTUNREACH — also a confirmed block
+#   unreachable  ENETUNREACH / EHOSTUNREACH — also a confirmed block; for an
+#                IPv6 target, EADDRNOTAVAIL ("cannot assign requested
+#                address") counts too (2026-10-02 Fable re-review of #45
+#                round 3, blocking note 2) — the errno a v6 connect attempt
+#                gets when the kernel has IPv6 disabled outright (e.g.
+#                `net.ipv6.conf.all.disable_ipv6=1`, a legitimate way a bench
+#                host can satisfy "IPv6 is blocked" without ip6tables at
+#                all), NOT scoped to v4 targets since an unrelated local
+#                resource issue (e.g. ephemeral port exhaustion) could in
+#                principle also raise EADDRNOTAVAIL there without meaning
+#                anything about the firewall
 #   timeout      no response inside the 5s budget — inconclusive (a silent
 #                DROP looks identical to a dead host or a routing problem)
 #   error        anything else (unknown host, sudo denied, permission
 #                error, ...) — inconclusive; NEVER treated as blocked
 probe_tcp() {
   local host="$1" port="$2"
-  local out rc
+  local out rc is_v6=false
+  case "$host" in *:*) is_v6=true ;; esac
   # `&& rc=0 || rc=$?` (not a plain `out=$(...); rc=$?`) because under
   # `set -e` a bare failing assignment-from-command-substitution — which
   # EVERY blocked/refused/timed-out probe is, i.e. the common case — is a
@@ -417,6 +466,8 @@ probe_tcp() {
   elif printf '%s' "$out" | grep -qi 'connection refused'; then
     echo refused
   elif printf '%s' "$out" | grep -qiE 'network is unreachable|no route to host'; then
+    echo unreachable
+  elif $is_v6 && printf '%s' "$out" | grep -qi 'cannot assign requested address'; then
     echo unreachable
   else
     echo "error"
@@ -548,28 +599,104 @@ check_loopback_listeners() {
 # or not the rule exists). When running as root — the only context that can
 # read ip6tables' own rule set — inspect it directly instead:
 # `ip6tables -C OUTPUT -m owner --uid-owner $UID_N -j REJECT` exits 0 iff
-# that exact rule is present, which is the thing actually guaranteeing IPv6
-# is blocked, independent of routing/connectivity. --check normally runs
-# unprivileged (as the bench user, or via sudo -u — see
-# require_sudo_to_bench_user), so this degrades to a WARN, not a FAIL, when
-# not root: the literal-IPv6 probe is the only signal available in that
-# case, with the weaker guarantee documented above — exactly why this
-# function exists as a second, independent check for when it CAN run.
+# that exact rule is PRESENT (this checks presence only, not where it sits
+# relative to any other OUTPUT rule/precedence — see the header comment's
+# fail-closed rule-ordering discussion for why the ordering itself matters
+# and is verified separately, by construction, not by this check), which is
+# the thing actually guaranteeing IPv6 is blocked, independent of
+# routing/connectivity.
+#
+# --check normally runs unprivileged (as the bench user, or via sudo -u —
+# see require_sudo_to_bench_user). Without root, this used to just WARN and
+# report ok (2026-10-01 Fable re-review of #45) — but that combined with
+# round 2 dropping "::1" from check_loopback_listeners's classifier (on the
+# assumption IPv6 is always fully blocked) to silently PASS a non-root
+# --check on a host where the v6 REJECT rule had actually regressed AND the
+# literal external IPv6 probe above couldn't catch it either, because a host
+# with no real WAN IPv6 route shows the same "blocked" result whether or not
+# the rule exists (2026-10-02 Fable re-review of #45 round 3, blocking note
+# 3 — this is fail-open). Loopback doesn't depend on real WAN routing the
+# way the external probe does, so the non-root path below opens a THROWAWAY
+# listener on [::1] itself (as the invoker, an ephemeral port, torn down
+# right after) and has the bench user try to connect to it via probe_tcp — a
+# definitive, routing-independent behavioral signal, at the cost of needing
+# `node` (already a hard dependency of the bellows host this script secures)
+# to act as that listener since bash's own /dev/tcp can only connect, never
+# listen.
 check_ipv6_blocked() {
   if ! command -v ip6tables >/dev/null 2>&1; then
     echo "  WARN: 'ip6tables' not found — cannot structurally verify IPv6 is blocked (relying on the literal IPv6 probe above only)"
     return 0
   fi
-  if [ "$(id -u)" != "0" ]; then
-    echo "  WARN: not root — cannot inspect ip6tables' own rule set to structurally verify IPv6 is blocked for $BENCH_USER (relying on the literal IPv6 probe above only, which can't tell 'blocked by our rule' apart from 'no IPv6 route exists at all')"
-    return 0
+  if [ "$(id -u)" = "0" ]; then
+    if ip6tables -C OUTPUT -m owner --uid-owner "$UID_N" -j REJECT 2>/dev/null; then
+      echo "  ok:   ip6tables OUTPUT REJECT rule for uid $UID_N is present"
+      return 0
+    fi
+    echo "  FAIL: no ip6tables OUTPUT REJECT rule for uid $UID_N — IPv6 egress is NOT blocked for $BENCH_USER (run this script in apply mode, not just --check, to install it)"
+    return 1
   fi
-  if ip6tables -C OUTPUT -m owner --uid-owner "$UID_N" -j REJECT 2>/dev/null; then
-    echo "  ok:   ip6tables OUTPUT REJECT rule for uid $UID_N is present"
-    return 0
+  check_ipv6_loopback_behavioral
+}
+
+# Non-root fallback for check_ipv6_blocked above (2026-10-02 Fable re-review
+# of #45 round 3, blocking note 3): opens a one-shot TCP listener bound to
+# the LITERAL address [::1] (not the "::" wildcard — deliberately the exact
+# address round 2 stopped flagging in check_loopback_listeners) via a tiny
+# Node script, as the invoker, then reuses probe_tcp to have the BENCH USER
+# try to connect to it. A "refused"/"unreachable" result is a genuine,
+# routing-independent confirmation IPv6-loopback egress is blocked for the
+# bench user; anything else — including "open" (a real bypass) and any
+# inconclusive result (no `node`, the listener never came up, a timeout) —
+# is a FAIL here, not a WARN: unlike check_loopback_listeners's `ss` check
+# (a best-effort bonus layered on top of the primary firewall probes),
+# verifying IPv6 is blocked is itself one of the two blocking checks from
+# round 2, so silently passing on "couldn't tell" is exactly the fail-open
+# gap this function exists to close.
+check_ipv6_loopback_behavioral() {
+  if ! command -v node >/dev/null 2>&1; then
+    echo "  FAIL: not root and 'node' not found — cannot verify IPv6 is blocked for $BENCH_USER either structurally (needs root) or behaviorally (needs node for a throwaway [::1] listener); this is NOT confirmed as blocked"
+    return 1
   fi
-  echo "  FAIL: no ip6tables OUTPUT REJECT rule for uid $UID_N — IPv6 egress is NOT blocked for $BENCH_USER (run this script in apply mode, not just --check, to install it)"
-  return 1
+  local tmpport port="" waited=0 node_pid result
+  tmpport="$(mktemp)"
+  node -e '
+    const net = require("net");
+    const fs = require("fs");
+    const srv = net.createServer((sock) => sock.destroy());
+    srv.on("error", () => process.exit(1));
+    srv.listen(0, "::1", () => { fs.writeFileSync(process.argv[1], String(srv.address().port)); });
+    setTimeout(() => { try { srv.close(); } catch (e) {} process.exit(0); }, 6000);
+  ' "$tmpport" >/dev/null 2>&1 &
+  node_pid=$!
+  while [ -z "$port" ] && [ "$waited" -lt 30 ]; do
+    port="$(cat "$tmpport" 2>/dev/null)"
+    [ -n "$port" ] && break
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  rm -f "$tmpport"
+  if [ -z "$port" ]; then
+    echo "  FAIL: could not start a throwaway [::1] listener (node failed to bind — possibly IPv6 is disabled system-wide, not just for $BENCH_USER) — cannot verify IPv6 is blocked for $BENCH_USER behaviorally; this is NOT confirmed as blocked"
+    kill "$node_pid" 2>/dev/null || true
+    return 1
+  fi
+  result="$(probe_tcp "::1" "$port")"
+  kill "$node_pid" 2>/dev/null || true
+  case "$result" in
+    refused | unreachable)
+      echo "  ok:   [::1]:$port (throwaway local listener) unreachable by $BENCH_USER ($result) — IPv6 loopback egress is blocked (behavioral check; not root, so no structural guarantee)"
+      return 0
+      ;;
+    open)
+      echo "  FAIL: [::1]:$port (throwaway local listener) is REACHABLE by $BENCH_USER — IPv6 egress is NOT blocked"
+      return 1
+      ;;
+    *)
+      echo "  FAIL: could not determine whether [::1]:$port is reachable by $BENCH_USER ($result) — inconclusive, and not root, so there is no structural fallback; this is NOT confirmed as blocked"
+      return 1
+      ;;
+  esac
 }
 
 do_check() {
