@@ -129,6 +129,7 @@ BENCH_USER=""
 ALLOW=()
 ALLOW_LOOPBACK=()
 CHECK=false
+SKIP_LISTENER_AUDIT=false
 
 # Mirrors DEFAULT_EGRESS_BLOCKED_HOSTS in src/runner/sandbox.mjs — the exact
 # hosts a contaminated benchmark used on 2026-09-28. Kept in sync by hand;
@@ -221,7 +222,20 @@ Usage:
                        Requires root, to already BE --user, or passwordless
                        sudo to --user — exits 2 (not a PASS) if none of those
                        can be confirmed, rather than silently reporting
-                       everything as "blocked".
+                       everything as "blocked". The loopback-listener scan
+                       itself requires `ss` (iproute2, ships on every stock
+                       Ubuntu) and FAILS, not WARNs, if it's missing — a
+                       skipped listener audit is exactly the kind of gap a
+                       loopback proxy on 127.0.0.1 could hide behind. Use
+                       --skip-listener-audit (below) to explicitly accept
+                       that gap instead.
+  --skip-listener-audit
+                       (--check only) explicitly accept NOT scanning for
+                       unexpected loopback listeners, on a host where `ss`
+                       genuinely cannot be installed. Prints a loud WARN
+                       every time it's used — this is an operator-chosen
+                       gap, never a silent default, and it does NOT relax
+                       anything else --check verifies.
 
 Exit codes: 0 PASS, 1 a probe failed or was inconclusive (timeout/error —
 never counted as blocked), 2 --check could not run anything as --user
@@ -249,6 +263,10 @@ while [ $# -gt 0 ]; do
       ;;
     --check)
       CHECK=true
+      shift
+      ;;
+    --skip-listener-audit)
+      SKIP_LISTENER_AUDIT=true
       shift
       ;;
     -h | --help)
@@ -535,17 +553,25 @@ probe_tcp() {
 # couldn't attribute it — e.g. no permission to see another user's process)
 # is treated the same as "not the bench user": fails closed, since the whole
 # point is catching a listener the operator doesn't already know about
-# (2026-09-29 Fable re-review of #43, non-blocking note). Degrades to a WARN
-# (not a FAIL) if `ss` isn't installed at all, since this is a bonus check
-# layered on top of the primary probes above, not itself the firewall
-# verification — but if `ss` IS installed and simply fails when run (wrong
-# permissions in some restricted context, a broken /proc, ...), that's a
-# check failure, not silently "no listeners found" (2026-09-30 Fable
-# re-review of #45, cheap note).
+# (2026-09-29 Fable re-review of #43, non-blocking note). FAILs (does NOT
+# degrade to a WARN) if `ss` isn't installed at all (2026-10-03 coordinator
+# review, pre-Fable: a skipped listener audit lets a loopback proxy on
+# 127.0.0.1 pass unnoticed — exactly the bypass this audit exists to catch;
+# `ss` ships in iproute2 on every stock Ubuntu, so this never fires on a
+# normal box). `--skip-listener-audit` is the explicit, loud escape hatch for
+# a host that genuinely can't have `ss` installed — anything less explicit
+# would silently reopen the same fail-open gap. Also FAILs (not silently "no
+# listeners found") if `ss` IS installed but simply fails when run (wrong
+# permissions in some restricted context, a broken /proc, ...) — 2026-09-30
+# Fable re-review of #45, cheap note.
 check_loopback_listeners() {
   if ! command -v ss >/dev/null 2>&1; then
-    echo "  WARN: 'ss' not found — cannot check for loopback listeners (a local proxy bound to 127.x/wildcard/::ffff:127.x would bypass the allowlist undetected)"
-    return 0
+    if $SKIP_LISTENER_AUDIT; then
+      echo "  WARN: 'ss' not found — SKIPPING the loopback listener audit (--skip-listener-audit was passed). A local proxy bound to 127.x/wildcard/::ffff:127.x would bypass the allowlist UNDETECTED. This is an explicit, operator-chosen gap, not a default."
+      return 0
+    fi
+    echo "  FAIL: 'ss' not found — cannot check for loopback listeners (a local proxy bound to 127.x/wildcard/::ffff:127.x would bypass the allowlist undetected). Install iproute2 (ships on every stock Ubuntu), or pass --skip-listener-audit to explicitly accept this gap."
+    return 1
   fi
   local ss_out ss_status
   if ! ss_out="$(ss -ltnp 2>/dev/null)"; then
@@ -708,8 +734,8 @@ check_ipv6_blocked() {
 # routing-independent confirmation IPv6-loopback egress is blocked for the
 # bench user; anything else — including "open" (a real bypass) and any
 # inconclusive result (no `node`, the listener never came up, a timeout) —
-# is a FAIL here, not a WARN: unlike check_loopback_listeners's `ss` check
-# (a best-effort bonus layered on top of the primary firewall probes),
+# is a FAIL here, not a WARN — same philosophy check_loopback_listeners now
+# also follows for its own missing-`ss` case (2026-10-03 coordinator review):
 # verifying IPv6 is blocked is itself one of the two blocking checks from
 # round 2, so silently passing on "couldn't tell" is exactly the fail-open
 # gap this function exists to close.

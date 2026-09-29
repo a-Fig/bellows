@@ -95,6 +95,13 @@ const RESOLVECTL_A_PARSER = extractBetween("2>/dev/null | awk '", "')\" || true"
 // all and could silently PASS with IPv6 actually open).
 const CHECK_IPV6_BLOCKED = extractBetween("check_ipv6_blocked() {", "\n}", "check_ipv6_blocked (ip6tables guard placement)");
 
+// check_loopback_listeners()'s `ss`-not-found guard — extracted from the
+// function's opening brace to just before `local ss_out` (2026-10-03
+// coordinator review, pre-Fable: a skipped listener audit lets a loopback
+// proxy on 127.0.0.1 pass undetected, so missing `ss` must FAIL by default;
+// --skip-listener-audit is the explicit, loud escape hatch).
+const LISTENER_AUDIT_GUARD = extractBetween("check_loopback_listeners() {", "\n  local ss_out", "check_loopback_listeners ss-missing guard");
+
 function runBash(cmd, input) {
   const r = spawnSync("bash", ["-c", cmd], { input, encoding: "utf8" });
   if (r.error) throw r.error;
@@ -355,6 +362,49 @@ echo "RC:$?"
     it("non-root, ip6tables present on PATH too: still reaches the behavioral fallback (root-ness gates the branch, not tool availability)", () => {
       const out = run({ uid: 1001, ip6tablesOnPath: true, ruleFound: true, behavioralRc: 0 });
       expect(out).toContain("BEHAVIORAL_CALLED");
+      expect(out).toContain("RC:0");
+    });
+  });
+
+  // 2026-10-03 coordinator review, pre-Fable: check_loopback_listeners used
+  // to degrade to a WARN (return 0) when `ss` wasn't found — a skipped
+  // listener audit is exactly the bypass this check exists to catch (a
+  // loopback proxy on 127.0.0.1 would pass unnoticed). `ss` ships in
+  // iproute2 on every stock Ubuntu, so the FAIL below never fires on a
+  // normal box; --skip-listener-audit is the explicit, loud opt-out.
+  describe("check_loopback_listeners' ss-missing guard defaults to FAIL, not WARN", () => {
+    function run(skipListenerAudit) {
+      const script = `
+SKIP_LISTENER_AUDIT=${skipListenerAudit ? "true" : "false"}
+command() {
+  if [ "\${1:-}" = "-v" ] && [ "\${2:-}" = "ss" ]; then
+    return 1
+  fi
+  builtin command "$@"
+}
+check_loopback_listeners() {
+${LISTENER_AUDIT_GUARD}
+  :
+}
+check_loopback_listeners
+echo "RC:$?"
+`;
+      const r = runBash(script);
+      expect(r.status).toBe(0);
+      return r.stdout;
+    }
+
+    it("FAILs by default when 'ss' is missing (no --skip-listener-audit)", () => {
+      const out = run(false);
+      expect(out).toContain("FAIL");
+      expect(out).not.toContain("WARN");
+      expect(out).toContain("RC:1");
+    });
+
+    it("WARNs loudly and passes (0) ONLY when --skip-listener-audit was explicitly passed", () => {
+      const out = run(true);
+      expect(out).toContain("WARN");
+      expect(out).toContain("SKIPPING");
       expect(out).toContain("RC:0");
     });
   });
