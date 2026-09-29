@@ -14,6 +14,9 @@ import {
   resolveEffectiveAccordionRepo,
   provisionWorktree,
   installConductorWsDeps,
+  NPM_INSTALL_TIMEOUT_MS,
+  LOCK_TIMEOUT_MS,
+  LOCK_STALE_MS,
 } from "../accordionRef.mjs";
 
 // --- validation --------------------------------------------------------------
@@ -160,8 +163,8 @@ describe.skipIf(!GIT_OK)("worktree create/reuse/mismatch (scratch git repo)", ()
     expect(benchRefName("a/b")).toMatch(/^refs\/bellows-bench\/[0-9a-f]{40}$/);
   });
 
-  it("ensureWorktree CREATES a detached worktree checked out at the sha", () => {
-    const wt = ensureWorktree({ accordionRepo: srcRepo, sha: shaB, runsDir });
+  it("ensureWorktree CREATES a detached worktree checked out at the sha", async () => {
+    const wt = await ensureWorktree({ accordionRepo: srcRepo, sha: shaB, runsDir });
     expect(wt).toBe(worktreePath(runsDir, shaB));
     expect(fs.existsSync(wt)).toBe(true);
     expect(run(wt, ["rev-parse", "HEAD"])).toBe(shaB);
@@ -171,18 +174,18 @@ describe.skipIf(!GIT_OK)("worktree create/reuse/mismatch (scratch git repo)", ()
     expect(fs.readFileSync(path.join(wt, "a.txt"), "utf8")).toBe("two");
   });
 
-  it("ensureWorktree REUSES an existing matching worktree (same path, no error)", () => {
-    const wt1 = ensureWorktree({ accordionRepo: srcRepo, sha: shaB, runsDir });
+  it("ensureWorktree REUSES an existing matching worktree (same path, no error)", async () => {
+    const wt1 = await ensureWorktree({ accordionRepo: srcRepo, sha: shaB, runsDir });
     // Drop a marker; a reuse must not blow it away.
     const marker = path.join(wt1, "REUSE_MARKER");
     fs.writeFileSync(marker, "x");
-    const wt2 = ensureWorktree({ accordionRepo: srcRepo, sha: shaB, runsDir });
+    const wt2 = await ensureWorktree({ accordionRepo: srcRepo, sha: shaB, runsDir });
     expect(wt2).toBe(wt1);
     expect(fs.existsSync(marker)).toBe(true); // untouched => reused, not recreated
   });
 
-  it("ensureWorktree re-attempts provisioning on reuse when the worktree matches but was never marked provisioned (bellows #39 follow-up)", () => {
-    const wt = ensureWorktree({ accordionRepo: srcRepo, sha: shaB, runsDir });
+  it("ensureWorktree re-attempts provisioning on reuse when the worktree matches but was never marked provisioned (bellows #39 follow-up)", async () => {
+    const wt = await ensureWorktree({ accordionRepo: srcRepo, sha: shaB, runsDir });
     const marker = path.join(wt, ".bellows-provisioned");
     expect(fs.existsSync(marker)).toBe(true); // provisioned by the call above (no conductors/ws dir -> trivial success)
 
@@ -195,44 +198,44 @@ describe.skipIf(!GIT_OK)("worktree create/reuse/mismatch (scratch git repo)", ()
     fs.rmSync(marker, { force: true });
     expect(fs.existsSync(marker)).toBe(false);
 
-    const wt2 = ensureWorktree({ accordionRepo: srcRepo, sha: shaB, runsDir });
+    const wt2 = await ensureWorktree({ accordionRepo: srcRepo, sha: shaB, runsDir });
     expect(wt2).toBe(wt);
     // Provisioning was retried (real installConductorWsDeps: no conductors/ws
     // dir here, so it trivially succeeds) and the marker is back.
     expect(fs.existsSync(marker)).toBe(true);
   });
 
-  it("ensureWorktree RECREATES when the dir exists but HEAD mismatches", () => {
+  it("ensureWorktree RECREATES when the dir exists but HEAD mismatches", async () => {
     const wt = worktreePath(runsDir, shaB);
     // Corrupt: force the existing worktree's HEAD to the WRONG commit.
     run(wt, ["checkout", "-q", "--detach", shaA]);
     expect(run(wt, ["rev-parse", "HEAD"])).toBe(shaA); // now mismatched
     const marker = path.join(wt, "REUSE_MARKER");
     fs.writeFileSync(marker, "stale");
-    const out = ensureWorktree({ accordionRepo: srcRepo, sha: shaB, runsDir });
+    const out = await ensureWorktree({ accordionRepo: srcRepo, sha: shaB, runsDir });
     expect(out).toBe(wt);
     expect(run(wt, ["rev-parse", "HEAD"])).toBe(shaB); // healed back to the pinned sha
     expect(fs.existsSync(marker)).toBe(false); // recreated => stale marker gone
   });
 
-  it("ensureWorktree RECREATES when the dir exists but is not a git worktree (broken)", () => {
+  it("ensureWorktree RECREATES when the dir exists but is not a git worktree (broken)", async () => {
     const sha = shaA;
     const wt = worktreePath(runsDir, sha);
     // Pre-create a plain (non-worktree) directory where the worktree should go.
     fs.mkdirSync(wt, { recursive: true });
     fs.writeFileSync(path.join(wt, "junk.txt"), "not a git worktree");
-    const out = ensureWorktree({ accordionRepo: srcRepo, sha, runsDir });
+    const out = await ensureWorktree({ accordionRepo: srcRepo, sha, runsDir });
     expect(out).toBe(wt);
     expect(run(wt, ["rev-parse", "HEAD"])).toBe(sha);
   });
 
-  it("resolveEffectiveAccordionRepo(no ref) returns the base repo unchanged", () => {
-    const eff = resolveEffectiveAccordionRepo({ accordionRepo: srcRepo, accordionRef: undefined, runsDir });
+  it("resolveEffectiveAccordionRepo(no ref) returns the base repo unchanged", async () => {
+    const eff = await resolveEffectiveAccordionRepo({ accordionRepo: srcRepo, accordionRef: undefined, runsDir });
     expect(eff).toEqual({ repo: srcRepo, ref: null, sha: null });
   });
 
-  it("resolveEffectiveAccordionRepo(ref) resolves to the pinned worktree + sha", () => {
-    const eff = resolveEffectiveAccordionRepo({ accordionRepo: srcRepo, accordionRef: "pr-branch", runsDir });
+  it("resolveEffectiveAccordionRepo(ref) resolves to the pinned worktree + sha", async () => {
+    const eff = await resolveEffectiveAccordionRepo({ accordionRepo: srcRepo, accordionRef: "pr-branch", runsDir });
     expect(eff.ref).toBe("pr-branch");
     expect(eff.sha).toBe(shaB);
     expect(eff.repo).toBe(worktreePath(runsDir, shaB));
@@ -242,6 +245,39 @@ describe.skipIf(!GIT_OK)("worktree create/reuse/mismatch (scratch git repo)", ()
   it("shortSha is the first 12 chars", () => {
     expect(shortSha(shaB)).toBe(shaB.slice(0, 12));
     expect(shortSha(shaB)).toHaveLength(12);
+  });
+
+  // bellows #39 follow-up, 2026-09-30 Fable re-review of #44 — "cross-process
+  // variant": acquireLock must wait, not just poll-and-fail. Two concurrent
+  // ensureWorktree calls for the SAME sha race for the lockfile; the loser
+  // should wait (via the real, non-blocking poll loop) and reuse what the
+  // winner created, not throw a lock-timeout error.
+  it("two concurrent ensureWorktree calls for the same sha both resolve to the same worktree (real lock contention)", async () => {
+    const sha = shaA;
+    const [wt1, wt2] = await Promise.all([
+      ensureWorktree({ accordionRepo: srcRepo, sha, runsDir }),
+      ensureWorktree({ accordionRepo: srcRepo, sha, runsDir }),
+    ]);
+    expect(wt1).toBe(worktreePath(runsDir, sha));
+    expect(wt2).toBe(wt1);
+    expect(run(wt1, ["rev-parse", "HEAD"])).toBe(sha);
+  });
+});
+
+// --- lock/install timeout relationship (bellows #39 follow-up, 2026-09-30
+// Fable re-review of #44: "make the lock timeout at least the install
+// timeout") -------------------------------------------------------------
+
+describe("lock timeout vs install timeout", () => {
+  it("LOCK_TIMEOUT_MS and LOCK_STALE_MS are each >= NPM_INSTALL_TIMEOUT_MS", () => {
+    // A holder of the worktree lock may legitimately be mid-install for up to
+    // NPM_INSTALL_TIMEOUT_MS. If a waiter's patience (LOCK_TIMEOUT_MS) or the
+    // stale-lock steal threshold (LOCK_STALE_MS) were shorter than that, a
+    // second process sharing runsDir would throw "timed out waiting for
+    // lock" — or steal a still-live holder's lock — while the first was
+    // still legitimately installing.
+    expect(LOCK_TIMEOUT_MS).toBeGreaterThanOrEqual(NPM_INSTALL_TIMEOUT_MS);
+    expect(LOCK_STALE_MS).toBeGreaterThanOrEqual(NPM_INSTALL_TIMEOUT_MS);
   });
 });
 
@@ -268,7 +304,13 @@ describe("installConductorWsDeps", () => {
     }
   });
 
-  /** A fake spawnSafeSync that records calls and returns a successful SpawnSyncReturns-shape. */
+  /**
+   * A fake async/sync-agnostic spawn that records calls and returns a
+   * successful SpawnSyncReturns-shape. installConductorWsDeps `await`s
+   * whatever this returns, so a plain synchronous return (as here) works
+   * identically to the real default (spawnAwaited), which resolves a Promise
+   * of the same shape — no test needs to know the difference.
+   */
   function makeSpawnFn(calls, { status = 0, stderr = "", error } = {}) {
     return (cmd, args, opts) => {
       calls.push({ cmd, args, opts });
@@ -276,20 +318,31 @@ describe("installConductorWsDeps", () => {
     };
   }
 
-  function makeWsConductor(worktree, name, { pkgJson = true, lockfile = false, nodeModules = false } = {}) {
+  function makeWsConductor(worktree, name, { pkgJson = true, lockfile = false, nodeModules = false, partialNodeModules = false } = {}) {
     const dir = path.join(worktree, "conductors", "ws", name);
     fs.mkdirSync(dir, { recursive: true });
     if (pkgJson) fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name }));
     if (lockfile) fs.writeFileSync(path.join(dir, "package-lock.json"), "{}");
-    if (nodeModules) fs.mkdirSync(path.join(dir, "node_modules"), { recursive: true });
+    if (nodeModules) {
+      // A COMPLETED install: node_modules/.package-lock.json is the sentinel
+      // npm writes near the end of a successful `ci`/`install` (see
+      // hasCompletedInstall in accordionRef.mjs).
+      fs.mkdirSync(path.join(dir, "node_modules"), { recursive: true });
+      fs.writeFileSync(path.join(dir, "node_modules", ".package-lock.json"), "{}");
+    }
+    if (partialNodeModules) {
+      // Simulates a killed/timed-out install (bellows #39 follow-up,
+      // 2026-09-30 Fable re-review of #44): node_modules exists (npm created
+      // it early) but the completed-install sentinel is absent.
+      fs.mkdirSync(path.join(dir, "node_modules", "some-half-extracted-pkg"), { recursive: true });
+    }
     return dir;
   }
 
-  it("no conductors/ws dir at all -> no-op, spawnFn never called, never throws, returns true", () => {
+  it("no conductors/ws dir at all -> no-op, spawnFn never called, never throws, returns true", async () => {
     const worktree = mkWorktree();
     const calls = [];
-    let result;
-    expect(() => (result = installConductorWsDeps(worktree, () => {}, makeSpawnFn(calls)))).not.toThrow();
+    const result = await installConductorWsDeps(worktree, () => {}, makeSpawnFn(calls));
     expect(calls).toHaveLength(0);
     // A no-op ("nothing needed installing") is a SUCCESS, not a failure —
     // provisionWorktree relies on this to still mark a worktree with no
@@ -297,12 +350,12 @@ describe("installConductorWsDeps", () => {
     expect(result).toBe(true);
   });
 
-  it("package.json + package-lock.json, no node_modules -> runs `npm ci --no-audit --no-fund` in that dir", () => {
+  it("package.json + package-lock.json, no node_modules -> runs `npm ci --no-audit --no-fund` in that dir", async () => {
     const worktree = mkWorktree();
     const dir = makeWsConductor(worktree, "triptych", { lockfile: true });
     const calls = [];
     const logs = [];
-    installConductorWsDeps(worktree, (m) => logs.push(m), makeSpawnFn(calls));
+    await installConductorWsDeps(worktree, (m) => logs.push(m), makeSpawnFn(calls));
 
     expect(calls).toHaveLength(1);
     expect(calls[0].cmd).toBe("npm");
@@ -311,51 +364,66 @@ describe("installConductorWsDeps", () => {
     expect(logs).toContain("[accordionRef] installed deps in conductors/ws/triptych");
   });
 
-  it("returns true when every needed install succeeds", () => {
+  it("returns true when every needed install succeeds", async () => {
     const worktree = mkWorktree();
     makeWsConductor(worktree, "triptych", { lockfile: true });
-    const result = installConductorWsDeps(worktree, () => {}, makeSpawnFn([]));
+    const result = await installConductorWsDeps(worktree, () => {}, makeSpawnFn([]));
     expect(result).toBe(true);
   });
 
-  it("package.json with NO package-lock.json -> falls back to `npm install --no-audit --no-fund --ignore-scripts`", () => {
+  it("package.json with NO package-lock.json -> falls back to `npm install --no-audit --no-fund --ignore-scripts`", async () => {
     const worktree = mkWorktree();
     makeWsConductor(worktree, "thermocline", { lockfile: false });
     const calls = [];
-    installConductorWsDeps(worktree, () => {}, makeSpawnFn(calls));
+    await installConductorWsDeps(worktree, () => {}, makeSpawnFn(calls));
 
     expect(calls).toHaveLength(1);
     expect(calls[0].args).toEqual(["install", "--no-audit", "--no-fund", "--ignore-scripts"]);
   });
 
-  it("node_modules already present -> skipped, spawnFn never called for that dir (idempotent)", () => {
+  it("a COMPLETED node_modules (sentinel present) -> skipped, spawnFn never called for that dir (idempotent)", async () => {
     const worktree = mkWorktree();
     makeWsConductor(worktree, "triptych", { lockfile: true, nodeModules: true });
     const calls = [];
     const logs = [];
-    installConductorWsDeps(worktree, (m) => logs.push(m), makeSpawnFn(calls));
+    await installConductorWsDeps(worktree, (m) => logs.push(m), makeSpawnFn(calls));
 
     expect(calls).toHaveLength(0);
     expect(logs).toHaveLength(0);
   });
 
-  it("a dir with no package.json (stray file/dir under conductors/ws) is skipped", () => {
+  // bellows #39 follow-up, 2026-09-30 Fable re-review of #44: "the
+  // node_modules existence check must not treat a partial extract as done."
+  it("a PARTIAL node_modules (no completed-install sentinel) is NOT treated as already-installed -> reinstalled", async () => {
+    const worktree = mkWorktree();
+    const dir = makeWsConductor(worktree, "triptych", { lockfile: true, partialNodeModules: true });
+    expect(fs.existsSync(path.join(dir, "node_modules"))).toBe(true); // the old (insufficient) check's signal
+    expect(fs.existsSync(path.join(dir, "node_modules", ".package-lock.json"))).toBe(false);
+    const calls = [];
+    const result = await installConductorWsDeps(worktree, () => {}, makeSpawnFn(calls));
+
+    expect(calls).toHaveLength(1); // reinstalled, not skipped
+    expect(calls[0].args[0]).toBe("ci");
+    expect(result).toBe(true);
+  });
+
+  it("a dir with no package.json (stray file/dir under conductors/ws) is skipped", async () => {
     const worktree = mkWorktree();
     fs.mkdirSync(path.join(worktree, "conductors", "ws", "not-a-conductor"), { recursive: true });
     fs.writeFileSync(path.join(worktree, "conductors", "ws", "README.md"), "not a dir"); // stray file entry
     const calls = [];
-    expect(() => installConductorWsDeps(worktree, () => {}, makeSpawnFn(calls))).not.toThrow();
+    await expect(installConductorWsDeps(worktree, () => {}, makeSpawnFn(calls))).resolves.toBe(true);
     expect(calls).toHaveLength(0);
   });
 
-  it("installs each conductor that needs it, independently, in one pass", () => {
+  it("installs each conductor that needs it, independently, in one pass", async () => {
     const worktree = mkWorktree();
     makeWsConductor(worktree, "triptych", { lockfile: true }); // needs ci
     makeWsConductor(worktree, "thermocline", { lockfile: false }); // needs install
     makeWsConductor(worktree, "already-done", { lockfile: true, nodeModules: true }); // skipped
     const calls = [];
     const logs = [];
-    installConductorWsDeps(worktree, (m) => logs.push(m), makeSpawnFn(calls));
+    await installConductorWsDeps(worktree, (m) => logs.push(m), makeSpawnFn(calls));
 
     expect(calls).toHaveLength(2);
     const byDir = Object.fromEntries(calls.map((c) => [path.basename(c.opts.cwd), c.args]));
@@ -366,13 +434,13 @@ describe("installConductorWsDeps", () => {
     expect(logs).toContain("[accordionRef] installed deps in conductors/ws/thermocline");
   });
 
-  it("nonzero exit -> logs a WARN with the exit code and stderr, does NOT throw", () => {
+  it("nonzero exit -> logs a WARN with the exit code and stderr, does NOT throw", async () => {
     const worktree = mkWorktree();
     makeWsConductor(worktree, "triptych", { lockfile: true });
     const calls = [];
     const logs = [];
     const spawnFn = makeSpawnFn(calls, { status: 1, stderr: "npm ERR! network timeout\n" });
-    expect(() => installConductorWsDeps(worktree, (m) => logs.push(m), spawnFn)).not.toThrow();
+    await expect(installConductorWsDeps(worktree, (m) => logs.push(m), spawnFn)).resolves.toBe(false);
 
     expect(logs).toHaveLength(1);
     expect(logs[0]).toMatch(/WARN/);
@@ -381,35 +449,35 @@ describe("installConductorWsDeps", () => {
     expect(logs[0]).toContain("npm ERR! network timeout");
   });
 
-  it("returns false when an install exits nonzero (bellows #39: signals provisionWorktree to not mark success)", () => {
+  it("returns false when an install exits nonzero (bellows #39: signals provisionWorktree to not mark success)", async () => {
     const worktree = mkWorktree();
     makeWsConductor(worktree, "triptych", { lockfile: true });
     const spawnFn = makeSpawnFn([], { status: 1, stderr: "npm ERR! network timeout\n" });
-    const result = installConductorWsDeps(worktree, () => {}, spawnFn);
+    const result = await installConductorWsDeps(worktree, () => {}, spawnFn);
     expect(result).toBe(false);
   });
 
-  it("spawn error (e.g. ENOENT — npm not on PATH) -> logs a WARN, does NOT throw", () => {
+  it("spawn error (e.g. ENOENT — npm not on PATH) -> logs a WARN, does NOT throw", async () => {
     const worktree = mkWorktree();
     makeWsConductor(worktree, "triptych", { lockfile: true });
     const calls = [];
     const logs = [];
     const spawnFn = makeSpawnFn(calls, { error: Object.assign(new Error("spawnSync npm ENOENT"), { code: "ENOENT" }) });
-    expect(() => installConductorWsDeps(worktree, (m) => logs.push(m), spawnFn)).not.toThrow();
+    await expect(installConductorWsDeps(worktree, (m) => logs.push(m), spawnFn)).resolves.toBe(false);
 
     expect(logs).toHaveLength(1);
     expect(logs[0]).toMatch(/WARN/);
     expect(logs[0]).toContain("ENOENT");
   });
 
-  it("returns false on a spawn error", () => {
+  it("returns false on a spawn error", async () => {
     const worktree = mkWorktree();
     makeWsConductor(worktree, "triptych", { lockfile: true });
     const spawnFn = makeSpawnFn([], { error: Object.assign(new Error("spawnSync npm ENOENT"), { code: "ENOENT" }) });
-    expect(installConductorWsDeps(worktree, () => {}, spawnFn)).toBe(false);
+    await expect(installConductorWsDeps(worktree, () => {}, spawnFn)).resolves.toBe(false);
   });
 
-  it("a spawnFn that itself throws -> caught, logged as a WARN, does NOT throw or abort remaining dirs", () => {
+  it("a spawnFn that itself throws -> caught, logged as a WARN, does NOT throw or abort remaining dirs", async () => {
     const worktree = mkWorktree();
     makeWsConductor(worktree, "triptych", { lockfile: true });
     makeWsConductor(worktree, "thermocline", { lockfile: false });
@@ -419,22 +487,22 @@ describe("installConductorWsDeps", () => {
       calls += 1;
       throw new Error("boom");
     };
-    expect(() => installConductorWsDeps(worktree, (m) => logs.push(m), throwingSpawnFn)).not.toThrow();
+    await expect(installConductorWsDeps(worktree, (m) => logs.push(m), throwingSpawnFn)).resolves.toBe(false);
 
     expect(calls).toBe(2); // both dirs attempted despite the first throwing
     expect(logs.filter((m) => m.includes("WARN") && m.includes("boom"))).toHaveLength(2);
   });
 
-  it("returns false when a throwing spawnFn fails every dir", () => {
+  it("returns false when a throwing spawnFn fails every dir", async () => {
     const worktree = mkWorktree();
     makeWsConductor(worktree, "triptych", { lockfile: true });
     const throwingSpawnFn = () => {
       throw new Error("boom");
     };
-    expect(installConductorWsDeps(worktree, () => {}, throwingSpawnFn)).toBe(false);
+    await expect(installConductorWsDeps(worktree, () => {}, throwingSpawnFn)).resolves.toBe(false);
   });
 
-  it("returns false overall when only ONE of several conductors fails (a partial failure is still a failure)", () => {
+  it("returns false overall when only ONE of several conductors fails (a partial failure is still a failure)", async () => {
     const worktree = mkWorktree();
     makeWsConductor(worktree, "triptych", { lockfile: true }); // will succeed
     makeWsConductor(worktree, "thermocline", { lockfile: false }); // will fail
@@ -442,7 +510,62 @@ describe("installConductorWsDeps", () => {
       if (path.basename(opts.cwd) === "thermocline") return { status: 1, stderr: "boom" };
       return { status: 0, stderr: "" };
     };
-    expect(installConductorWsDeps(worktree, () => {}, spawnFn)).toBe(false);
+    await expect(installConductorWsDeps(worktree, () => {}, spawnFn)).resolves.toBe(false);
+  });
+
+  // --- failure-memo backoff (bellows #39 follow-up, 2026-09-30 Fable re-review
+  // of #44: "add a failure memo with backoff per (SHA, workspace), so repeated
+  // failures fail fast instead of hanging each run") -----------------------
+
+  const FAILURE_MEMO_NAME = ".bellows-install-failed.json"; // must match accordionRef.mjs's PROVISION_FAILURE_MEMO_NAME
+
+  it("a failed install writes a failure memo into the conductor's own dir", async () => {
+    const worktree = mkWorktree();
+    const dir = makeWsConductor(worktree, "triptych", { lockfile: true });
+    const spawnFn = makeSpawnFn([], { status: 1, stderr: "npm ERR! registry unreachable\n" });
+    await installConductorWsDeps(worktree, () => {}, spawnFn);
+
+    const memoPath = path.join(dir, FAILURE_MEMO_NAME);
+    expect(fs.existsSync(memoPath)).toBe(true);
+    const memo = JSON.parse(fs.readFileSync(memoPath, "utf8"));
+    expect(typeof memo.at).toBe("string");
+    expect(memo.message).toContain("registry unreachable");
+  });
+
+  it("a RECENT failure memo makes the next call skip re-spawning npm entirely (fail fast)", async () => {
+    const worktree = mkWorktree();
+    const dir = makeWsConductor(worktree, "triptych", { lockfile: true });
+    fs.writeFileSync(path.join(dir, FAILURE_MEMO_NAME), JSON.stringify({ at: new Date().toISOString(), message: "npm ERR! registry unreachable" }));
+    const calls = [];
+    const logs = [];
+    const result = await installConductorWsDeps(worktree, (m) => logs.push(m), makeSpawnFn(calls));
+
+    expect(calls).toHaveLength(0); // never re-attempted npm at all
+    expect(result).toBe(false);
+    expect(logs.some((m) => m.includes("WARN") && m.includes("skipping npm install") && m.includes("triptych"))).toBe(true);
+  });
+
+  it("a STALE failure memo (older than the backoff window) is retried normally", async () => {
+    const worktree = mkWorktree();
+    const dir = makeWsConductor(worktree, "triptych", { lockfile: true });
+    const longAgo = new Date(Date.now() - 60 * 60_000).toISOString(); // 1h ago >> the backoff window
+    fs.writeFileSync(path.join(dir, FAILURE_MEMO_NAME), JSON.stringify({ at: longAgo, message: "npm ERR! registry unreachable" }));
+    const calls = [];
+    const result = await installConductorWsDeps(worktree, () => {}, makeSpawnFn(calls));
+
+    expect(calls).toHaveLength(1); // retried, not skipped
+    expect(result).toBe(true);
+  });
+
+  it("a successful retry clears the failure memo so a later call doesn't skip", async () => {
+    const worktree = mkWorktree();
+    const dir = makeWsConductor(worktree, "triptych", { lockfile: true });
+    const longAgo = new Date(Date.now() - 60 * 60_000).toISOString();
+    const memoPath = path.join(dir, FAILURE_MEMO_NAME);
+    fs.writeFileSync(memoPath, JSON.stringify({ at: longAgo, message: "npm ERR! registry unreachable" }));
+
+    await installConductorWsDeps(worktree, () => {}, makeSpawnFn([])); // succeeds
+    expect(fs.existsSync(memoPath)).toBe(false);
   });
 });
 
@@ -465,70 +588,78 @@ describe("provisionWorktree — conductor deps wiring", () => {
     }
   });
 
-  it("calls installDeps(worktree, log) once on first provisioning", () => {
+  it("calls installDeps(worktree, log) once on first provisioning", async () => {
     const worktree = mkWorktree();
     const accordionRepo = mkWorktree(); // no app/tsconfig.json -> stub step is a no-op
     const installDeps = vi.fn();
-    provisionWorktree({ accordionRepo, worktree, log: () => {}, installDeps });
+    await provisionWorktree({ accordionRepo, worktree, log: () => {}, installDeps });
 
     expect(installDeps).toHaveBeenCalledTimes(1);
     expect(installDeps.mock.calls[0][0]).toBe(worktree);
     expect(typeof installDeps.mock.calls[0][1]).toBe("function");
   });
 
-  it("does NOT call installDeps again once the .bellows-provisioned marker exists (reuse)", () => {
+  it("does NOT call installDeps again once the .bellows-provisioned marker exists (reuse)", async () => {
     const worktree = mkWorktree();
     const accordionRepo = mkWorktree();
     const installDeps = vi.fn();
-    provisionWorktree({ accordionRepo, worktree, log: () => {}, installDeps });
-    provisionWorktree({ accordionRepo, worktree, log: () => {}, installDeps });
+    await provisionWorktree({ accordionRepo, worktree, log: () => {}, installDeps });
+    await provisionWorktree({ accordionRepo, worktree, log: () => {}, installDeps });
 
     expect(installDeps).toHaveBeenCalledTimes(1);
   });
 
-  it("defaults installDeps to the real installConductorWsDeps (no conductors/ws dir -> harmless no-op)", () => {
+  it("defaults installDeps to the real installConductorWsDeps (no conductors/ws dir -> harmless no-op)", async () => {
     const worktree = mkWorktree();
     const accordionRepo = mkWorktree();
     // No injected installDeps: exercises the real default wiring end-to-end.
-    expect(() => provisionWorktree({ accordionRepo, worktree, log: () => {} })).not.toThrow();
+    await expect(provisionWorktree({ accordionRepo, worktree, log: () => {} })).resolves.not.toThrow();
     expect(fs.existsSync(path.join(worktree, ".bellows-provisioned"))).toBe(true);
   });
 
   // bellows #39 follow-up: "the install marker should ideally only be written
   // on success" — a failed installDeps must NOT leave .bellows-provisioned
   // behind, or a broken worktree looks permanently "done" to every later run.
-  it("does NOT write the marker when installDeps returns false (failed install)", () => {
+  it("does NOT write the marker when installDeps returns false (failed install)", async () => {
     const worktree = mkWorktree();
     const accordionRepo = mkWorktree();
     const installDeps = vi.fn(() => false);
     const logs = [];
-    provisionWorktree({ accordionRepo, worktree, log: (m) => logs.push(m), installDeps });
+    await provisionWorktree({ accordionRepo, worktree, log: (m) => logs.push(m), installDeps });
 
     expect(fs.existsSync(path.join(worktree, ".bellows-provisioned"))).toBe(false);
     expect(logs.some((m) => m.includes("WARN") && m.includes("did not fully succeed"))).toBe(true);
   });
 
-  it("retries installDeps on a later call after a failed install left no marker", () => {
+  it("retries installDeps on a later call after a failed install left no marker", async () => {
     const worktree = mkWorktree();
     const accordionRepo = mkWorktree();
     const installDeps = vi.fn().mockReturnValueOnce(false).mockReturnValueOnce(true);
 
-    provisionWorktree({ accordionRepo, worktree, log: () => {}, installDeps }); // fails, no marker
+    await provisionWorktree({ accordionRepo, worktree, log: () => {}, installDeps }); // fails, no marker
     expect(fs.existsSync(path.join(worktree, ".bellows-provisioned"))).toBe(false);
 
-    provisionWorktree({ accordionRepo, worktree, log: () => {}, installDeps }); // retried, succeeds
+    await provisionWorktree({ accordionRepo, worktree, log: () => {}, installDeps }); // retried, succeeds
     expect(installDeps).toHaveBeenCalledTimes(2);
     expect(fs.existsSync(path.join(worktree, ".bellows-provisioned"))).toBe(true);
   });
 
-  it("a bare vi.fn() (returns undefined) still counts as success and writes the marker", () => {
+  it("a bare vi.fn() (returns undefined) still counts as success and writes the marker", async () => {
     // Guards the exact compatibility case the marker-gating logic must not
     // break: callers/tests that pass installDeps without bothering to return
     // anything must be treated as success, only an explicit `false` is failure.
     const worktree = mkWorktree();
     const accordionRepo = mkWorktree();
     const installDeps = vi.fn();
-    provisionWorktree({ accordionRepo, worktree, log: () => {}, installDeps });
+    await provisionWorktree({ accordionRepo, worktree, log: () => {}, installDeps });
     expect(fs.existsSync(path.join(worktree, ".bellows-provisioned"))).toBe(true);
+  });
+
+  it("installDeps returning a Promise<false> (the real installConductorWsDeps' shape) is awaited before deciding the marker", async () => {
+    const worktree = mkWorktree();
+    const accordionRepo = mkWorktree();
+    const installDeps = vi.fn(() => Promise.resolve(false));
+    await provisionWorktree({ accordionRepo, worktree, log: () => {}, installDeps });
+    expect(fs.existsSync(path.join(worktree, ".bellows-provisioned"))).toBe(false);
   });
 });

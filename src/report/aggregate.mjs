@@ -21,17 +21,22 @@ export function conductorOf(run) {
  * `compaction-naive` arm with `ACCORDION_SUMMARY_TRIGGER: "0.75"`) — this key
  * is what lets aggregateGroup tell them apart instead of pooling their runs
  * into one row (2026-09-29 Fable review, bellows #37 blocking follow-up).
- * "\u0001" separates entries (never legal in an env var name/value per
- * validateArmEnv) so there's no ambiguity from '=' or ',' inside a value.
+ * Built with JSON.stringify over the sorted [key, value] entries rather than
+ * a hand-joined string (bellows #39 follow-up, 2026-09-30 Fable re-review of
+ * #44): a "\u0001"-joined string was ambiguous if a value ever legitimately
+ * CONTAINED a literal "\u0001" — validateArmEnv (config.mjs) only checks env
+ * value type/length, not its character set, so a platform-submitted value
+ * with that byte in it could alias two genuinely different arms into the
+ * same bucket. JSON.stringify of a [key, value] pair array has no such
+ * collision (each entry is individually length-prefixed by JSON's own
+ * quoting/escaping), whatever bytes the value contains.
  * Empty/absent env -> "" so the common no-overrides case is a stable key.
  */
 export function envKeyOf(run) {
   const env = run.fingerprint?.env;
-  if (!env || typeof env !== "object") return "";
-  return Object.keys(env)
-    .sort()
-    .map((k) => `${k}=${env[k]}`)
-    .join("\u0001");
+  const keys = env && typeof env === "object" ? Object.keys(env) : [];
+  if (keys.length === 0) return "";
+  return JSON.stringify(keys.sort().map((k) => [k, env[k]]));
 }
 
 /** Human-readable rendering of an arm's env overrides, e.g. "FOO=1, BAR=2". Empty string when there are none. */
@@ -105,7 +110,22 @@ export function aggregateGroup(group) {
     // for a run with no conductor telemetry (arm "none", or a run that
     // predates conductor cost collection) rather than dropping it from the
     // median entirely, since the agent portion is still real spend.
-    const combinedCostUsd = median(runs.map((r) => (typeof r.usage?.costUsd === "number" ? r.usage.costUsd : 0) + (r.conductor ? r.conductor.completeCostUsd : 0)));
+    //
+    // r.conductor.completeCostUsd must be type-guarded, not just truthiness-
+    // checked on r.conductor (bellows #39 follow-up, 2026-09-30 Fable
+    // re-review of #44): a pre-#38 RunRecord can have a truthy `r.conductor`
+    // whose completeCostUsd is `undefined` (the field didn't exist yet), and
+    // `0 + undefined === NaN`. median() silently drops non-finite entries, so
+    // that run's combined-cost contribution vanished from the aggregate
+    // entirely instead of falling back to its agent-only cost like every
+    // other conductor-less/pre-#38 run does.
+    const combinedCostUsd = median(
+      runs.map((r) => {
+        const agent = typeof r.usage?.costUsd === "number" ? r.usage.costUsd : 0;
+        const conductor = typeof r.conductor?.completeCostUsd === "number" ? r.conductor.completeCostUsd : 0;
+        return agent + conductor;
+      }),
+    );
     // How many runs in this bucket had at least one conductor completion whose
     // price came back unknown (null) rather than a real number — the report
     // flags this so a conductorCostUsd of e.g. $0.00 isn't misread as "this

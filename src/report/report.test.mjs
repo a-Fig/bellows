@@ -430,6 +430,18 @@ describe("aggregateGroup keeps same-conductor arms with different env separate (
     expect(envLabelOf({ fingerprint: {} })).toBe("");
   });
 
+  // bellows #39 follow-up, 2026-09-30 Fable re-review of #44: the old
+  // "\u0001"-joined string key let two GENUINELY DIFFERENT env objects alias
+  // to the same key if a value happened to contain a literal "\u0001" — which
+  // validateArmEnv (config.mjs) never forbids. A one-entry env whose value
+  // itself contains "\u0001B=2" produced the exact same joined string as a
+  // two-entry env {A:"1", B:"2"}.
+  it("envKeyOf does not alias two different env objects via a value containing the old separator char", () => {
+    const oneEntryWithEmbeddedSeparator = { fingerprint: { env: { A: "1\u0001B=2" } } };
+    const twoEntries = { fingerprint: { env: { A: "1", B: "2" } } };
+    expect(envKeyOf(oneEntryWithEmbeddedSeparator)).not.toBe(envKeyOf(twoEntries));
+  });
+
   it("renders both arms' env as a distinguishing badge in the HTML report", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "bellows-report-envsplit-"));
     const runsDir = path.join(dir, "runs");
@@ -484,6 +496,22 @@ describe("aggregateGroup includes conductor cost (bellows #38 follow-up item 2)"
     expect(row.conductorCostUsd).toBeNull();
     // combinedCostUsd still reflects the real agent spend rather than dropping it.
     expect(row.combinedCostUsd).toBeCloseTo(0.1, 6);
+  });
+
+  // bellows #39 follow-up, 2026-09-30 Fable re-review of #44: a pre-#38
+  // RunRecord can have a truthy `conductor` object whose completeCostUsd is
+  // `undefined` (the field didn't exist before #38) rather than `null`
+  // (today's "measured as unknown" sentinel). `0 + undefined === NaN`, and
+  // median() silently drops non-finite entries — so this run's combinedCostUsd
+  // contribution used to vanish from the aggregate entirely instead of
+  // falling back to its real agent-only spend like the "conductor: null" case
+  // above already does.
+  it("a pre-#38 record with conductor.completeCostUsd undefined (not null) falls back to agent-only cost, not NaN", () => {
+    const run = makeRun({ id: "x/keel/1", conductorId: "keel", seed: 1, costUsd: 0.1 });
+    run.conductor = { completeCostUnknownCount: 0, completeCostUnknownProviders: [] }; // no completeCostUsd key at all
+    const [row] = aggregateGroup({ runs: [run] });
+    expect(row.combinedCostUsd).toBeCloseTo(0.1, 6);
+    expect(Number.isNaN(row.combinedCostUsd)).toBe(false);
   });
 
   it("flags runs whose conductor had an unknown-priced completion, naming the provider(s)", () => {

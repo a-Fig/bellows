@@ -203,7 +203,7 @@ export async function executeRun(args) {
   let accordionRepo = config.accordionRepo;
   if (spec.accordionRef) {
     try {
-      const eff = resolveEffectiveAccordionRepo({
+      const eff = await resolveEffectiveAccordionRepo({
         accordionRepo: config.accordionRepo,
         accordionRef: spec.accordionRef,
         runsDir: runsRootFrom(config),

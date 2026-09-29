@@ -33,7 +33,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { spawnSafeSync } from "./proc.mjs";
+import { spawnSafe, killTree } from "./proc.mjs";
 
 /** git rev must be a plausible branch/tag/SHA and must not look like a flag. */
 export const ACCORDION_REF_RE = /^[A-Za-z0-9._/-]{1,200}$/;
@@ -162,9 +162,9 @@ export function worktreePath(runsDir, sha) {
  * @param {string} args.sha            full 40-char SHA to pin
  * @param {string} args.runsDir        run output root (absolute)
  * @param {(m:string)=>void} [args.log]
- * @returns {string} the worktree path (the effective accordion repo)
+ * @returns {Promise<string>} the worktree path (the effective accordion repo)
  */
-export function ensureWorktree({ accordionRepo, sha, runsDir, log = () => {} }) {
+export async function ensureWorktree({ accordionRepo, sha, runsDir, log = () => {} }) {
   if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error(`ensureWorktree: sha must be a full 40-char SHA (got "${sha}")`);
   const wt = worktreePath(runsDir, sha);
   const anchorDir = path.join(runsDir, "_accordion");
@@ -187,7 +187,7 @@ export function ensureWorktree({ accordionRepo, sha, runsDir, log = () => {} }) 
   // Serialize creation (and re-provisioning attempts) across concurrent runs
   // with a lockfile (atomic O_EXCL).
   const lockPath = wt + ".lock";
-  const release = acquireLock(lockPath, log);
+  const release = await acquireLock(lockPath, log);
   try {
     if (!worktreeMatches(wt, sha)) {
       // The dir exists but is broken/mismatched (or a stale worktree registration
@@ -219,7 +219,7 @@ export function ensureWorktree({ accordionRepo, sha, runsDir, log = () => {} }) 
     // racing run while we waited for the lock. provisionWorktree is itself
     // marker-gated and only marks success, so this is a cheap no-op once truly
     // provisioned and a real retry otherwise (bellows #39 follow-up).
-    provisionWorktree({ accordionRepo, worktree: wt, log });
+    await provisionWorktree({ accordionRepo, worktree: wt, log });
     return wt;
   } finally {
     release();
@@ -252,12 +252,14 @@ export function ensureWorktree({ accordionRepo, sha, runsDir, log = () => {} }) 
  * @param {string} args.accordionRepo
  * @param {string} args.worktree
  * @param {(m:string)=>void} [args.log]
- * @param {(worktree:string, log:(m:string)=>void)=>(boolean|void)} [args.installDeps]
- *   test seam — replaces installConductorWsDeps. Returning `false` means
- *   provisioning did NOT fully succeed; anything else (including a bare
- *   `vi.fn()` test double returning `undefined`) counts as success.
+ * @param {(worktree:string, log:(m:string)=>void)=>(boolean|void|Promise<boolean|void>)} [args.installDeps]
+ *   test seam — replaces installConductorWsDeps. Returning (or resolving to)
+ *   `false` means provisioning did NOT fully succeed; anything else
+ *   (including a bare `vi.fn()` test double returning `undefined`) counts as
+ *   success.
+ * @returns {Promise<void>}
  */
-export function provisionWorktree({ accordionRepo, worktree, log = () => {}, installDeps = installConductorWsDeps }) {
+export async function provisionWorktree({ accordionRepo, worktree, log = () => {}, installDeps = installConductorWsDeps }) {
   const marker = path.join(worktree, ".bellows-provisioned");
   if (fs.existsSync(marker)) return;
   const dstDir = path.join(worktree, "app", ".svelte-kit");
@@ -285,7 +287,7 @@ export function provisionWorktree({ accordionRepo, worktree, log = () => {}, ins
   // ideally only be written on success"). See ensureWorktree for the other
   // half of this fix — the marker alone isn't sufficient, since something also
   // has to call provisionWorktree again on reuse for a retry to ever happen.
-  const installed = installDeps(worktree, log);
+  const installed = await installDeps(worktree, log);
   if (installed === false) {
     log(`[accordionRef] WARN: provisioning ${worktree} did not fully succeed — leaving .bellows-provisioned unwritten so a later run retries`);
     return;
@@ -298,14 +300,160 @@ export function provisionWorktree({ accordionRepo, worktree, log = () => {}, ins
 }
 
 /** Bounded like selfUpdate.mjs's NPM_CI_TIMEOUT_MS — npm installs can be slow on a cold cache. */
-const NPM_INSTALL_TIMEOUT_MS = 5 * 60_000;
+export const NPM_INSTALL_TIMEOUT_MS = 5 * 60_000;
+
+/**
+ * How long a failed conductors/ws install is remembered so a later call skips
+ * retrying it outright (bellows #39 follow-up, 2026-09-30 Fable re-review of
+ * #44 — "add a failure memo with backoff per (SHA, workspace), so repeated
+ * failures fail fast instead of hanging each run"). The memo lives INSIDE the
+ * failed conductor's own dir (`<dir>/.bellows-install-failed.json`), which
+ * already keys it by both the pinned SHA (the dir is under
+ * `_accordion/<sha12>`) and the workspace (`conductors/ws/<name>`) without any
+ * extra bookkeeping. Retries happen naturally: ensureWorktree's fast path
+ * requires `.bellows-provisioned`, which provisionWorktree only writes on a
+ * FULLY successful installDeps — so every claim against a still-broken SHA
+ * re-enters this function, and the memo just makes each of those re-entries
+ * cheap (skip re-spawning npm) until the backoff window elapses, instead of
+ * re-running (and re-waiting out) a multi-minute install every time.
+ */
+export const PROVISION_FAILURE_BACKOFF_MS = 10 * 60_000;
+const PROVISION_FAILURE_MEMO_NAME = ".bellows-install-failed.json";
+
+/**
+ * The cross-process worktree lock (acquireLock, below) must be willing to
+ * wait at least as long as a legitimate install can take, plus margin
+ * (bellows #39 follow-up, 2026-09-30 Fable re-review of #44 — "make the lock
+ * timeout at least the install timeout"): the holder may legitimately be
+ * mid-install for up to NPM_INSTALL_TIMEOUT_MS. A shorter lock timeout let a
+ * SECOND process sharing runsDir throw "timed out ... waiting for lock" on
+ * every run pinning this sha while the first was still installing — for a
+ * dependency the second run might not even need. staleMs (used to steal a
+ * lock believed abandoned by a crashed holder) needs the same margin, or a
+ * legitimately still-installing holder's own lock could be stolen out from
+ * under it right as its install finishes.
+ */
+export const LOCK_TIMEOUT_MS = NPM_INSTALL_TIMEOUT_MS + 30_000;
+export const LOCK_STALE_MS = NPM_INSTALL_TIMEOUT_MS + 60_000;
+
+/**
+ * True iff `dir/node_modules` reflects a COMPLETE npm ci/install, not a
+ * partial extract left by one that was killed or timed out mid-run (bellows
+ * #39 follow-up, 2026-09-30 Fable re-review of #44 — "the node_modules
+ * existence check must not treat a partial extract as done"). Both `npm ci`
+ * and `npm install` write `node_modules/.package-lock.json` as one of the
+ * LAST steps of a successful run, so its presence is a much stronger signal
+ * than the bare directory existing (which a killed install can leave behind
+ * half-populated, and which this function used to accept as "done").
+ */
+function hasCompletedInstall(dir) {
+  return fs.existsSync(path.join(dir, "node_modules", ".package-lock.json"));
+}
+
+function failureMemoPath(dir) {
+  return path.join(dir, PROVISION_FAILURE_MEMO_NAME);
+}
+
+/** The failure memo for `dir` if it's still within its backoff window, else null. */
+function recentInstallFailure(dir) {
+  let memo;
+  try {
+    memo = JSON.parse(fs.readFileSync(failureMemoPath(dir), "utf8"));
+  } catch {
+    return null; // no memo, or unreadable/corrupt — treat as no recent failure
+  }
+  if (!memo || typeof memo.at !== "string") return null;
+  const ageMs = Date.now() - Date.parse(memo.at);
+  if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs >= PROVISION_FAILURE_BACKOFF_MS) return null;
+  return memo;
+}
+
+function recordInstallFailure(dir, message) {
+  try {
+    fs.writeFileSync(failureMemoPath(dir), JSON.stringify({ at: new Date().toISOString(), message: String(message).slice(0, 1000) }));
+  } catch {
+    /* best-effort — worst case the next call just retries instead of backing off */
+  }
+}
+
+function clearInstallFailure(dir) {
+  try {
+    fs.rmSync(failureMemoPath(dir), { force: true });
+  } catch {
+    /* best-effort */
+  }
+}
+
+/**
+ * Async counterpart to spawnSafeSync's RETURN SHAPE ({status, stderr, error}),
+ * built on the non-blocking spawnSafe (bellows #39 follow-up, 2026-09-30
+ * Fable re-review of #44: "keep the install off the heartbeat's critical
+ * path — use async spawn, or make sure the heartbeat keeps firing during the
+ * install"). installConductorWsDeps used to call spawnSafeSync directly,
+ * which runs child_process.spawnSync SYNCHRONOUSLY — it blocks Node's entire
+ * single-threaded event loop for up to opts.timeout. This function runs deep
+ * inside the worker's executeRun call chain (resolveEffectiveAccordionRepo ->
+ * ensureWorktree -> provisionWorktree -> here — see run.mjs), which shares an
+ * event loop with loop.mjs's 30s heartbeat setInterval (executeClaimedRun) —
+ * so a hanging npm registry blocked the heartbeat too (JS has one thread; a
+ * synchronous child_process call cannot yield to a timer), and the platform
+ * reaped the run at its 180s no-heartbeat deadline and failed it, for every
+ * arm in the run, not just conductors that needed a ws install. Using
+ * spawnSafe (async) here lets the event loop — and the heartbeat — keep
+ * running while npm does its I/O; opts.timeout is enforced by hand (spawn has
+ * no built-in timeout, unlike spawnSync) via killTree, mirroring
+ * src/worker/selfUpdate.mjs's defaultRunNpmCi.
+ * @param {string} cmd
+ * @param {string[]} args
+ * @param {import("node:child_process").SpawnOptions & {timeout?: number}} opts
+ * @param {typeof spawnSafe} [spawnFn]  test seam: substitute a fake async/sync spawn
+ * @returns {Promise<{status: number|null, stderr: string, error: Error|null}>}
+ */
+function spawnAwaited(cmd, args, opts, spawnFn = spawnSafe) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawnFn(cmd, args, opts);
+    } catch (error) {
+      resolve({ status: null, stderr: "", error });
+      return;
+    }
+    let stderr = "";
+    let settled = false;
+    const timeoutMs = opts && opts.timeout;
+    const timer =
+      typeof timeoutMs === "number" && timeoutMs > 0
+        ? setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            killTree(child);
+            resolve({ status: null, stderr, error: new Error(`timed out after ${timeoutMs}ms — killed the child`) });
+          }, timeoutMs)
+        : null;
+    timer?.unref?.();
+    child.stderr?.on("data", (d) => (stderr += d));
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve({ status: null, stderr, error });
+    });
+    child.on("exit", (code) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve({ status: code, stderr, error: null });
+    });
+  });
+}
 
 /**
  * Install npm dependencies for every out-of-process conductor under
- * `<worktree>/conductors/ws/*` that has a `package.json` but no `node_modules`
- * yet (the presence check IS the idempotency guard — re-provisioning a worktree
- * whose deps are already installed is a fast no-op; provisionWorktree's own
- * `.bellows-provisioned` marker additionally skips calling this at all on reuse).
+ * `<worktree>/conductors/ws/*` that has a `package.json` but no completed
+ * install yet (hasCompletedInstall IS the idempotency guard — re-provisioning
+ * a worktree whose deps are already installed is a fast no-op;
+ * provisionWorktree's own `.bellows-provisioned` marker additionally skips
+ * calling this at all on reuse).
  *
  * Runs `npm ci --no-audit --no-fund` when a `package-lock.json` is present
  * (reproducible, matches CI); falls back to `npm install --no-audit --no-fund`
@@ -321,7 +469,10 @@ const NPM_INSTALL_TIMEOUT_MS = 5 * 60_000;
  * for code skeletonization are not installed...") remains the loud signal for
  * an operator; this function only tries to avoid ever producing it. It DOES
  * report success/failure via its return value (see below) so provisionWorktree
- * can decide whether to mark the worktree provisioned.
+ * can decide whether to mark the worktree provisioned. A failure is also
+ * memoed (see recordInstallFailure) so a later call within
+ * PROVISION_FAILURE_BACKOFF_MS skips re-attempting that dir instead of
+ * re-running (and re-waiting out) the whole install again.
  *
  * `--ignore-scripts` (bellows #39 follow-up): verified empirically against the
  * current conductor workspaces rather than assumed — triptych's full resolved
@@ -335,12 +486,17 @@ const NPM_INSTALL_TIMEOUT_MS = 5 * 60_000;
  *
  * @param {string} worktree
  * @param {(m:string)=>void} [log]
- * @param {typeof spawnSafeSync} [spawnFn]  test seam: substitute a fake sync spawn
- * @returns {boolean} true if every conductor that needed installing succeeded
- *   (including the trivial "nothing to install" cases); false if at least one
- *   install failed.
+ * @param {(cmd:string, args:string[], opts:object)=>(object|Promise<object>)} [spawnFn]
+ *   test seam: substitute a fake spawn. May return a SpawnSyncReturns-shaped
+ *   object directly (as before) or a Promise of one — both are awaited the
+ *   same way, so every pre-existing synchronous test fake keeps working
+ *   unchanged.
+ * @returns {Promise<boolean>} true if every conductor that needed installing
+ *   succeeded (including the trivial "nothing to install" cases and a dir
+ *   skipped because a completed install already exists); false if at least
+ *   one install failed or was skipped due to a recent-failure backoff.
  */
-export function installConductorWsDeps(worktree, log = () => {}, spawnFn = spawnSafeSync) {
+export async function installConductorWsDeps(worktree, log = () => {}, spawnFn = spawnAwaited) {
   const wsDir = path.join(worktree, "conductors", "ws");
   let entries;
   try {
@@ -353,12 +509,23 @@ export function installConductorWsDeps(worktree, log = () => {}, spawnFn = spawn
     if (!entry.isDirectory()) continue;
     const dir = path.join(wsDir, entry.name);
     if (!fs.existsSync(path.join(dir, "package.json"))) continue;
-    if (fs.existsSync(path.join(dir, "node_modules"))) continue; // already installed
+    if (hasCompletedInstall(dir)) continue; // already installed
+
+    const recentFailure = recentInstallFailure(dir);
+    if (recentFailure) {
+      const remainingS = Math.max(0, Math.round((PROVISION_FAILURE_BACKOFF_MS - (Date.now() - Date.parse(recentFailure.at))) / 1000));
+      log(
+        `[accordionRef] WARN: skipping npm install in conductors/ws/${entry.name} — failed recently (${recentFailure.message}); retrying in ~${remainingS}s`,
+      );
+      ok = false;
+      continue;
+    }
+
     const hasLockfile = fs.existsSync(path.join(dir, "package-lock.json"));
     const args = hasLockfile ? ["ci", "--no-audit", "--no-fund", "--ignore-scripts"] : ["install", "--no-audit", "--no-fund", "--ignore-scripts"];
     let result;
     try {
-      result = spawnFn("npm", args, {
+      result = await spawnFn("npm", args, {
         cwd: dir,
         timeout: NPM_INSTALL_TIMEOUT_MS,
         windowsHide: true,
@@ -366,12 +533,15 @@ export function installConductorWsDeps(worktree, log = () => {}, spawnFn = spawn
         stdio: ["ignore", "pipe", "pipe"],
       });
     } catch (e) {
-      log(`[accordionRef] WARN: npm ${args[0]} failed in conductors/ws/${entry.name}: ${e && e.message ? e.message : e}`);
+      const message = e && e.message ? e.message : String(e);
+      log(`[accordionRef] WARN: npm ${args[0]} failed in conductors/ws/${entry.name}: ${message}`);
+      recordInstallFailure(dir, message);
       ok = false;
       continue;
     }
     if (result.error) {
       log(`[accordionRef] WARN: npm ${args[0]} failed in conductors/ws/${entry.name}: ${result.error.message}`);
+      recordInstallFailure(dir, result.error.message);
       ok = false;
       continue;
     }
@@ -382,9 +552,11 @@ export function installConductorWsDeps(worktree, log = () => {}, spawnFn = spawn
         .filter(Boolean);
       const reason = stderrLines.length ? stderrLines[stderrLines.length - 1] : `exited ${result.status}`;
       log(`[accordionRef] WARN: npm ${args[0]} failed in conductors/ws/${entry.name} (exit ${result.status}): ${reason}`);
+      recordInstallFailure(dir, reason);
       ok = false;
       continue;
     }
+    clearInstallFailure(dir);
     log(`[accordionRef] installed deps in conductors/ws/${entry.name}`);
   }
   return ok;
@@ -443,10 +615,23 @@ function removeWorktree(accordionRepo, wt, log) {
 
 /**
  * Acquire an exclusive lockfile, waiting for a concurrent holder to release.
- * Returns a release() function. Steals a stale lock (older than STALE_MS) so a
+ * Returns a release() function. Steals a stale lock (older than staleMs) so a
  * crashed run can't wedge every future run.
+ *
+ * timeoutMs/staleMs default to LOCK_TIMEOUT_MS/LOCK_STALE_MS (both bounded
+ * below by NPM_INSTALL_TIMEOUT_MS plus margin — see their definitions above
+ * installConductorWsDeps) rather than fixed literals, so this lock's patience
+ * can never fall behind however long a legitimate install is allowed to take.
+ *
+ * The wait itself is non-blocking (bellows #39 follow-up, 2026-09-30 Fable
+ * re-review of #44's "cross-process variant": a second bellows process
+ * sharing runsDir can wait here while the first is mid-install, and that wait
+ * runs on the SAME event loop as loop.mjs's heartbeat — a synchronous
+ * Atomics.wait busy-sleep would starve it exactly like the blocking npm spawn
+ * this follow-up also fixes). ensureWorktree (the only caller) is async, so
+ * this can just await a real timer between polls instead.
  */
-function acquireLock(lockPath, log, { timeoutMs = 120_000, pollMs = 100, staleMs = 300_000 } = {}) {
+async function acquireLock(lockPath, log, { timeoutMs = LOCK_TIMEOUT_MS, pollMs = 100, staleMs = LOCK_STALE_MS } = {}) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     try {
@@ -480,16 +665,17 @@ function acquireLock(lockPath, log, { timeoutMs = 120_000, pollMs = 100, staleMs
       if (Date.now() >= deadline) {
         throw new Error(`accordionRef: timed out after ${timeoutMs}ms waiting for lock ${lockPath}`);
       }
-      // Busy-wait via a short synchronous sleep (this whole module is sync so the
-      // caller — a per-run setup step — can stay synchronous).
-      sleepSync(pollMs);
+      await sleep(pollMs);
     }
   }
 }
 
-/** Synchronous sleep (Atomics.wait on a throwaway buffer). */
-function sleepSync(ms) {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+/** Non-blocking sleep (setTimeout-based — see acquireLock for why this must not busy-block the event loop). */
+function sleep(ms) {
+  return new Promise((resolve) => {
+    const t = setTimeout(resolve, ms);
+    t.unref?.();
+  });
 }
 
 /**
@@ -503,15 +689,15 @@ function sleepSync(ms) {
  * @param {string|undefined} args.accordionRef  the trial's optional ref
  * @param {string} args.runsDir        absolute runs root (worktrees live under it)
  * @param {(m:string)=>void} [args.log]
- * @returns {{repo:string, ref:string|null, sha:string|null}}
+ * @returns {Promise<{repo:string, ref:string|null, sha:string|null}>}
  */
-export function resolveEffectiveAccordionRepo({ accordionRepo, accordionRef, runsDir, log = () => {} }) {
+export async function resolveEffectiveAccordionRepo({ accordionRepo, accordionRef, runsDir, log = () => {} }) {
   if (accordionRef === undefined || accordionRef === null || accordionRef === "") {
     return { repo: accordionRepo, ref: null, sha: null };
   }
   validateAccordionRef(accordionRef);
   const sha = resolveRefToSha(accordionRepo, accordionRef, log);
-  const repo = ensureWorktree({ accordionRepo, sha, runsDir, log });
+  const repo = await ensureWorktree({ accordionRepo, sha, runsDir, log });
   log(`[accordionRef] ref "${accordionRef}" -> ${sha} -> worktree ${repo}`);
   return { repo, ref: accordionRef, sha };
 }
