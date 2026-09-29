@@ -20,14 +20,20 @@
  * + node builtins. The pi `extension/accordion.ts` path is loaded by PI (which
  * provides ws/typebox/@earendil-works at runtime), never by bellows. So NO
  * `npm install` in the worktree is required for enumeration or an in-process host
- * run. (External-conductor `.mjs` files that import `ws` are NOT part of this and
- * would need their own deps — out of scope; ref benching targets in-process
- * conductors + the extension.)
+ * run.
+ *
+ * External-conductor `conductors/ws/*` packages are a DIFFERENT story: they run
+ * out-of-process (spawned directly, not imported by the host) and DO need their
+ * own node_modules — e.g. `conductors/ws/triptych` needs `web-tree-sitter` +
+ * `tree-sitter-wasms` for code skeletonization. provisionWorktree installs those
+ * (see installConductorWsDeps below) so a trial pinning an accordionRef can
+ * still dispatch to an out-of-process conductor without a manual `npm ci`.
  */
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
+import { spawnSafeSync } from "./proc.mjs";
 
 /** git rev must be a plausible branch/tag/SHA and must not look like a flag. */
 export const ACCORDION_REF_RE = /^[A-Za-z0-9._/-]{1,200}$/;
@@ -204,21 +210,34 @@ export function ensureWorktree({ accordionRepo, sha, runsDir, log = () => {} }) 
 
 /**
  * Minimal provisioning a fresh worktree needs so the bellows host (vite-node)
- * can transform the accordion `app/src/lib/**` modules it imports.
+ * can transform the accordion `app/src/lib/**` modules it imports, PLUS the npm
+ * deps any out-of-process `conductors/ws/*` conductor needs (see
+ * installConductorWsDeps below — those are NOT covered by the "no npm install
+ * needed" reasoning in this file's header, which is scoped to the in-process
+ * host path only).
  *
- * The ONLY missing artifact is `app/.svelte-kit/tsconfig.json`: `app/tsconfig.json`
- * does `extends: "./.svelte-kit/tsconfig.json"`, a file svelte-kit generates during
- * `npm install`/build. A fresh worktree has no node_modules and no `.svelte-kit/`,
- * so esbuild's transform fails to resolve that `extends`. We do NOT run `npm install`
- * (proven unnecessary: the host imports only pure TS/rune modules whose `svelte`
- * runtime comes from bellows' node_modules and whose `$conductors` alias is provided
- * by vite-node.config.ts — see this file's header). Instead we satisfy the one
- * missing file: copy the base checkout's generated `.svelte-kit/tsconfig.json` (its
- * compilerOptions are ref-independent and its paths are relative, so they resolve
- * inside any same-layout worktree); if the base checkout never built one, write a
- * minimal stub. Marker `.bellows-provisioned` skips this on reuse.
+ * The ONLY missing artifact for the host path is `app/.svelte-kit/tsconfig.json`:
+ * `app/tsconfig.json` does `extends: "./.svelte-kit/tsconfig.json"`, a file
+ * svelte-kit generates during `npm install`/build. A fresh worktree has no
+ * node_modules and no `.svelte-kit/`, so esbuild's transform fails to resolve that
+ * `extends`. We do NOT run `npm install` for THAT (proven unnecessary: the host
+ * imports only pure TS/rune modules whose `svelte` runtime comes from bellows'
+ * node_modules and whose `$conductors` alias is provided by vite-node.config.ts —
+ * see this file's header). Instead we satisfy the one missing file: copy the base
+ * checkout's generated `.svelte-kit/tsconfig.json` (its compilerOptions are
+ * ref-independent and its paths are relative, so they resolve inside any
+ * same-layout worktree); if the base checkout never built one, write a minimal
+ * stub. Marker `.bellows-provisioned` skips ALL of this (stub + conductor deps) on
+ * reuse.
+ *
+ * @param {object} args
+ * @param {string} args.accordionRepo
+ * @param {string} args.worktree
+ * @param {(m:string)=>void} [args.log]
+ * @param {(worktree:string, log:(m:string)=>void)=>void} [args.installDeps]
+ *   test seam — replaces installConductorWsDeps
  */
-export function provisionWorktree({ accordionRepo, worktree, log = () => {} }) {
+export function provisionWorktree({ accordionRepo, worktree, log = () => {}, installDeps = installConductorWsDeps }) {
   const marker = path.join(worktree, ".bellows-provisioned");
   if (fs.existsSync(marker)) return;
   const dstDir = path.join(worktree, "app", ".svelte-kit");
@@ -236,10 +255,84 @@ export function provisionWorktree({ accordionRepo, worktree, log = () => {} }) {
       log(`[accordionRef] provisioned ${dst} (minimal stub — base checkout had none)`);
     }
   }
+  installDeps(worktree, log);
   try {
     fs.writeFileSync(marker, new Date().toISOString());
   } catch {
     /* best-effort marker */
+  }
+}
+
+/** Bounded like selfUpdate.mjs's NPM_CI_TIMEOUT_MS — npm installs can be slow on a cold cache. */
+const NPM_INSTALL_TIMEOUT_MS = 5 * 60_000;
+
+/**
+ * Install npm dependencies for every out-of-process conductor under
+ * `<worktree>/conductors/ws/*` that has a `package.json` but no `node_modules`
+ * yet (the presence check IS the idempotency guard — re-provisioning a worktree
+ * whose deps are already installed is a fast no-op; provisionWorktree's own
+ * `.bellows-provisioned` marker additionally skips calling this at all on reuse).
+ *
+ * Runs `npm ci --no-audit --no-fund` when a `package-lock.json` is present
+ * (reproducible, matches CI); falls back to `npm install --no-audit --no-fund`
+ * otherwise (e.g. a conductor with dependencies but no committed lockfile).
+ * A conductor dir with a `package.json` but no `dependencies` and no lockfile
+ * (e.g. thermocline) still gets a harmless `npm install` — cheap and correct.
+ *
+ * Best-effort: this runs inside ensureWorktree's cross-process lock (called
+ * from provisionWorktree, itself only reached under that lock — see
+ * ensureWorktree), so concurrent runs pinning the same sha never race each
+ * other's installs. A failure here is logged as a WARN and does NOT throw —
+ * the conductor's own attach-time error ("Tree-sitter dependencies required
+ * for code skeletonization are not installed...") remains the loud signal for
+ * an operator; this function only tries to avoid ever producing it.
+ *
+ * @param {string} worktree
+ * @param {(m:string)=>void} [log]
+ * @param {typeof spawnSafeSync} [spawnFn]  test seam: substitute a fake sync spawn
+ */
+export function installConductorWsDeps(worktree, log = () => {}, spawnFn = spawnSafeSync) {
+  const wsDir = path.join(worktree, "conductors", "ws");
+  let entries;
+  try {
+    entries = fs.readdirSync(wsDir, { withFileTypes: true });
+  } catch {
+    return; // no conductors/ws dir in this checkout (older ref, or none) — nothing to do
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const dir = path.join(wsDir, entry.name);
+    if (!fs.existsSync(path.join(dir, "package.json"))) continue;
+    if (fs.existsSync(path.join(dir, "node_modules"))) continue; // already installed
+    const hasLockfile = fs.existsSync(path.join(dir, "package-lock.json"));
+    const args = hasLockfile ? ["ci", "--no-audit", "--no-fund"] : ["install", "--no-audit", "--no-fund"];
+    let result;
+    try {
+      result = spawnFn("npm", args, {
+        cwd: dir,
+        timeout: NPM_INSTALL_TIMEOUT_MS,
+        windowsHide: true,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (e) {
+      log(`[accordionRef] WARN: npm ${args[0]} failed in conductors/ws/${entry.name}: ${e && e.message ? e.message : e}`);
+      continue;
+    }
+    if (result.error) {
+      log(`[accordionRef] WARN: npm ${args[0]} failed in conductors/ws/${entry.name}: ${result.error.message}`);
+      continue;
+    }
+    if (result.status !== 0) {
+      const stderrLines = String(result.stderr || "")
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter(Boolean);
+      const reason = stderrLines.length ? stderrLines[stderrLines.length - 1] : `exited ${result.status}`;
+      log(`[accordionRef] WARN: npm ${args[0]} failed in conductors/ws/${entry.name} (exit ${result.status}): ${reason}`);
+      continue;
+    }
+    log(`[accordionRef] installed deps in conductors/ws/${entry.name}`);
   }
 }
 
